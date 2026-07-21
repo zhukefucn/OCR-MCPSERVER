@@ -68,7 +68,7 @@ def test_required_repository_skeleton_and_documentation_exist() -> None:
         "src/ocr_mcp_server/infra/__init__.py",
         "src/ocr_mcp_server/services/__init__.py",
         "src/ocr_mcp_server/api/__init__.py",
-        "docker/.gitkeep",
+        "docker/ocr-gateway.Dockerfile",
     )
     assert all((ROOT / path).exists() for path in required_paths)
 

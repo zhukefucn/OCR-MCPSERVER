@@ -1,0 +1,16 @@
+services:
+  ocr-gateway:
+    build:
+      context: .
+      dockerfile: docker/ocr-gateway.Dockerfile
+    image: ocr-mcp-server:0.1.0-dev
+    ports:
+      - "${OCR_GATEWAY_PORT:-8000}:8000"
+    volumes:
+      - ocr-data:/data
+      - ./config/example.yaml:/app/config/example.yaml:ro
+    init: true
+    restart: unless-stopped
+
+volumes:
+  ocr-data:

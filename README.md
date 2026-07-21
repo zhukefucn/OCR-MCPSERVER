@@ -29,3 +29,18 @@ ocr-mcp-server
 ```
 
 当前 FastAPI `api` 包是 REST 路由承载层。后续 REST API 与 MCP 接口会共用 `services` 服务层，避免把业务逻辑绑定到任一传输协议；本任务只提供存活探针。
+
+## 远程 Ubuntu 容器验证
+
+当前容器镜像仅包含 FastAPI 网关，不包含 MinerU 或 Paddle 推理依赖。本机只运行测试，不执行 Docker 镜像构建；尚未在远程 Ubuntu 完成构建和启动验证。
+
+代码同步到 Ubuntu Server 后，在仓库根目录执行：
+
+```bash
+docker compose build ocr-gateway
+docker compose up -d ocr-gateway
+docker compose ps
+curl -fsS http://127.0.0.1:8000/health/live
+```
+
+确认 `docker compose ps` 显示容器健康，且存活探针返回成功响应后，再记录远程实际构建得到的镜像 ID 和 digest。
