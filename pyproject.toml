@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ocr-mcp-server"
+version = "0.1.0"
+description = "OCR MCP service skeleton"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "fastapi>=0.115.6,<0.116",
+  "uvicorn>=0.34,<0.35",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<0.26",
+  "httpx>=0.28,<0.29",
+]
+
+[project.scripts]
+ocr-mcp-server = "ocr_mcp_server.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ocr_mcp_server"]
+
+[tool.pytest.ini_options]
+addopts = "-q --basetemp=.pytest-tmp"
+testpaths = ["tests"]
+filterwarnings = ["error"]

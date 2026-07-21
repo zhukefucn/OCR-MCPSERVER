@@ -1,0 +1,25 @@
+server:
+  host: 127.0.0.1
+  port: 8000
+
+data_root: data
+
+limits:
+  max_files: 20
+  max_file_size_bytes: 31457280
+  max_pages: 500
+  max_batch_size_bytes: 1073741824
+
+retention:
+  input_hours: 24
+  intermediate_hours: 24
+  result_hours: 24
+  audit_metadata_days: 30
+
+mineru:
+  api_url: http://127.0.0.1:8001
+  vlm_server_url: http://127.0.0.1:30000
+  backend: vlm-http-client
+
+secondary_ocr:
+  engine: pp_structure_v3

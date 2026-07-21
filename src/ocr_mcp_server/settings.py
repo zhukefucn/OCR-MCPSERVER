@@ -1,0 +1,111 @@
+"""Validated deployment settings loaded from YAML and environment variables."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any, Literal
+
+import yaml
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, ValidationError
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
+
+from .domain.constants import (
+    DEFAULT_AUDIT_METADATA_RETENTION_DAYS,
+    DEFAULT_INPUT_RETENTION_HOURS,
+    DEFAULT_INTERMEDIATE_RETENTION_HOURS,
+    DEFAULT_MAX_BATCH_SIZE_BYTES,
+    DEFAULT_MAX_FILES,
+    DEFAULT_MAX_FILE_SIZE_BYTES,
+    DEFAULT_MAX_PAGES,
+    DEFAULT_RESULT_RETENTION_HOURS,
+)
+from .domain.errors import ConfigurationError
+from .domain.models import SecondaryOCREngine
+
+
+class _SettingsSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class ServerSettings(_SettingsSection):
+    host: str = "127.0.0.1"
+    port: int = Field(default=8000, ge=1, le=65535)
+
+
+class LimitsSettings(_SettingsSection):
+    max_files: int = Field(default=DEFAULT_MAX_FILES, ge=1)
+    max_file_size_bytes: int = Field(default=DEFAULT_MAX_FILE_SIZE_BYTES, ge=1)
+    max_pages: int = Field(default=DEFAULT_MAX_PAGES, ge=1)
+    max_batch_size_bytes: int = Field(default=DEFAULT_MAX_BATCH_SIZE_BYTES, ge=1)
+
+
+class RetentionSettings(_SettingsSection):
+    input_hours: int = Field(default=DEFAULT_INPUT_RETENTION_HOURS, ge=1)
+    intermediate_hours: int = Field(
+        default=DEFAULT_INTERMEDIATE_RETENTION_HOURS, ge=1
+    )
+    result_hours: int = Field(default=DEFAULT_RESULT_RETENTION_HOURS, ge=1)
+    audit_metadata_days: int = Field(
+        default=DEFAULT_AUDIT_METADATA_RETENTION_DAYS, ge=1
+    )
+
+
+class MinerUSettings(_SettingsSection):
+    api_url: AnyHttpUrl = AnyHttpUrl("http://127.0.0.1:8001")
+    vlm_server_url: AnyHttpUrl = AnyHttpUrl("http://127.0.0.1:30000")
+    backend: Literal["vlm-http-client"] = "vlm-http-client"
+
+
+class SecondaryOCRSettings(_SettingsSection):
+    engine: SecondaryOCREngine = SecondaryOCREngine.PP_STRUCTURE_V3
+
+
+class AppSettings(BaseSettings):
+    """Complete process-level configuration for the service."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="OCR_",
+        env_nested_delimiter="__",
+        extra="forbid",
+    )
+
+    server: ServerSettings = Field(default_factory=ServerSettings)
+    data_root: Path = Path("data")
+    limits: LimitsSettings = Field(default_factory=LimitsSettings)
+    retention: RetentionSettings = Field(default_factory=RetentionSettings)
+    mineru: MinerUSettings = Field(default_factory=MinerUSettings)
+    secondary_ocr: SecondaryOCRSettings = Field(default_factory=SecondaryOCRSettings)
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        del settings_cls
+        return env_settings, init_settings, dotenv_settings, file_secret_settings
+
+
+def load_settings(config_file: str | Path | None = None) -> AppSettings:
+    """Load YAML settings, with ``OCR_`` environment values taking precedence."""
+
+    selected_file = config_file or os.environ.get("OCR_CONFIG_FILE")
+    yaml_values: dict[str, Any] = {}
+
+    try:
+        if selected_file is not None:
+            raw_values = yaml.safe_load(Path(selected_file).read_text(encoding="utf-8"))
+            if raw_values is not None and not isinstance(raw_values, dict):
+                raise TypeError("the YAML document must be a mapping")
+            yaml_values = raw_values or {}
+        return AppSettings(**yaml_values)
+    except (OSError, TypeError, yaml.YAMLError, ValidationError) as exc:
+        raise ConfigurationError(cause=exc) from None

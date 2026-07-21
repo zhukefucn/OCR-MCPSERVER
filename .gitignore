@@ -1,0 +1,30 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-tmp/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local runtime data and task artifacts
+data/
+.superpowers/
+
+# Local configuration and credentials
+.env
+.env.*
+config/*.yaml
+!config/example.yaml
+*.key
+*.pem
