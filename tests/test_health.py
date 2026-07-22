@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 import gc
 import time
+import weakref
 
 import pytest
 
@@ -446,6 +447,139 @@ async def test_detached_probe_exception_after_caller_cancellation_is_consumed() 
     finally:
         release.set()
         loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
+async def test_repeated_checks_keep_one_outstanding_probe_per_dependency() -> None:
+    sqlite_calls = 0
+    sqlite_active = 0
+    release = asyncio.Event()
+
+    async def resistant_sqlite() -> ProbeResult:
+        nonlocal sqlite_calls, sqlite_active
+        sqlite_calls += 1
+        sqlite_active += 1
+        try:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+                return result(DependencyName.SQLITE)
+        finally:
+            sqlite_active -= 1
+
+    async def ready(dependency: DependencyName) -> ProbeResult:
+        return result(dependency)
+
+    readiness = service(
+        Probe(DependencyName.SQLITE, resistant_sqlite),
+        Probe(DependencyName.MINERU, lambda: ready(DependencyName.MINERU)),
+        Probe(DependencyName.PADDLE, lambda: ready(DependencyName.PADDLE)),
+        timeout=0.001,
+    )
+    try:
+        snapshots = [await readiness.check() for _ in range(20)]
+        assert sqlite_calls == 1
+        assert sqlite_active == 1
+        assert all(
+            snapshot.dependencies[0].code is ProbeCode.TIMEOUT
+            for snapshot in snapshots
+        )
+    finally:
+        release.set()
+        for _ in range(10):
+            if sqlite_active == 0:
+                break
+            await asyncio.sleep(0)
+    assert sqlite_active == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_repeated_checks_are_bounded_and_restart_after_finish() -> None:
+    calls = {dependency: 0 for dependency in DependencyName}
+    active = {dependency: 0 for dependency in DependencyName}
+    release = asyncio.Event()
+    recovered = False
+
+    def resistant(dependency: DependencyName) -> Probe:
+        async def check() -> ProbeResult:
+            calls[dependency] += 1
+            if recovered:
+                return result(dependency)
+            active[dependency] += 1
+            try:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await release.wait()
+                    return result(dependency)
+            finally:
+                active[dependency] -= 1
+
+        return Probe(dependency, check)
+
+    readiness = service(
+        *(resistant(dependency) for dependency in DependencyName), timeout=0.005
+    )
+    try:
+        snapshots = await asyncio.gather(*(readiness.check() for _ in range(20)))
+        assert sum(calls.values()) == 3
+        assert sum(active.values()) == 3
+        assert all(
+            all(item.code is ProbeCode.TIMEOUT for item in snapshot.dependencies)
+            for snapshot in snapshots
+        )
+    finally:
+        release.set()
+        for _ in range(10):
+            if sum(active.values()) == 0:
+                break
+            await asyncio.sleep(0)
+    assert sum(active.values()) == 0
+
+    recovered = True
+    fresh = await readiness.check()
+    assert fresh.status is DependencyStatus.READY
+    assert calls == {dependency: 2 for dependency in DependencyName}
+
+
+@pytest.mark.asyncio
+async def test_pending_probe_does_not_retain_service_or_metrics_sink() -> None:
+    release = asyncio.Event()
+
+    async def resistant_sqlite() -> ProbeResult:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+            return result(DependencyName.SQLITE)
+
+    async def ready(dependency: DependencyName) -> ProbeResult:
+        return result(dependency)
+
+    class Sink:
+        def set_dependency_ready(self, dependency: DependencyName, ready: bool) -> None:
+            del dependency, ready
+
+    sink = Sink()
+    readiness = service(
+        Probe(DependencyName.SQLITE, resistant_sqlite),
+        Probe(DependencyName.MINERU, lambda: ready(DependencyName.MINERU)),
+        Probe(DependencyName.PADDLE, lambda: ready(DependencyName.PADDLE)),
+        timeout=0.001,
+        observability=sink,
+    )
+    await readiness.check()
+    readiness_reference = weakref.ref(readiness)
+    sink_reference = weakref.ref(sink)
+    del readiness, sink
+    gc.collect()
+    try:
+        assert readiness_reference() is None
+        assert sink_reference() is None
+    finally:
+        release.set()
+        await asyncio.sleep(0)
 
 
 def test_probe_constructor_masks_raising_iterators_and_descriptors() -> None:

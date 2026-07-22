@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import math
+import weakref
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import partial
 from typing import Protocol
 
 from .observability import (
@@ -138,6 +140,9 @@ class ReadinessService:
         self._observability = (
             observability if observability is not None else NullObservability()
         )
+        self._outstanding_probes: dict[
+            DependencyName, asyncio.Task[object]
+        ] = {}
 
     async def check(self) -> ReadinessSnapshot:
         tasks = tuple(
@@ -163,12 +168,21 @@ class ReadinessService:
     async def _check_one(
         self, probe: DependencyProbe, dependency: DependencyName
     ) -> ProbeResult:
+        existing = self._outstanding_probes.get(dependency)
+        if existing is not None:
+            if not existing.done():
+                return _unavailable(dependency, ProbeCode.TIMEOUT)
+            _release_registered_probe(weakref.ref(self), dependency, existing)
         try:
             probe_task = asyncio.create_task(probe.check())
         except asyncio.CancelledError:
             raise
         except Exception:
             return _unavailable(dependency, ProbeCode.INVALID_RESPONSE)
+        self._outstanding_probes[dependency] = probe_task
+        probe_task.add_done_callback(
+            partial(_release_registered_probe, weakref.ref(self), dependency)
+        )
         try:
             completed, _ = await asyncio.wait(
                 {probe_task}, timeout=self._timeout_seconds
@@ -191,9 +205,6 @@ class ReadinessService:
         return canonical
 
 
-_DETACHED_PROBES: set[asyncio.Task[object]] = set()
-
-
 async def _cancel_or_detach(task: asyncio.Task[object]) -> None:
     """Bound cancellation cleanup without trusting a coroutine to cooperate."""
 
@@ -201,13 +212,23 @@ async def _cancel_or_detach(task: asyncio.Task[object]) -> None:
     await asyncio.sleep(0)
     if task.done():
         _consume_probe_task(task)
-        return
-    _DETACHED_PROBES.add(task)
-    task.add_done_callback(_consume_probe_task)
+
+
+def _release_registered_probe(
+    service_reference: weakref.ReferenceType[ReadinessService],
+    dependency: DependencyName,
+    task: asyncio.Task[object],
+) -> None:
+    service = service_reference()
+    if (
+        service is not None
+        and service._outstanding_probes.get(dependency) is task
+    ):
+        del service._outstanding_probes[dependency]
+    _consume_probe_task(task)
 
 
 def _consume_probe_task(task: asyncio.Task[object]) -> None:
-    _DETACHED_PROBES.discard(task)
     try:
         task.result()
     except BaseException:
