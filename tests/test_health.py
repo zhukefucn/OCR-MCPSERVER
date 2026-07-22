@@ -641,10 +641,12 @@ async def test_metrics_are_updated_from_normalized_snapshot_and_fail_best_effort
         return result(dependency)
 
     sink = Sink()
-    snapshot = await service(
+    readiness = service(
         *(Probe(dependency, lambda dependency=dependency: check(dependency)) for dependency in DependencyName),
         observability=sink,
-    ).check()
+    )
+    snapshot = await readiness.check()
+    assert readiness.drain_observations()
 
     assert snapshot.status is DependencyStatus.READY
     assert sink.calls == [(dependency, True) for dependency in DependencyName]

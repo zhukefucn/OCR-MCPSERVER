@@ -150,6 +150,7 @@ async def test_cancel_during_initial_notification_still_closes_claim_observation
     execution.cancel()
     with pytest.raises(asyncio.CancelledError):
         await execution
+    assert service.drain_observations()
     persisted = await repository.get_file("file-a")
     assert persisted.status is FileStatus.PROCESSING
     assert observations.tasks == [(TaskOutcome.CANCELLED, pytest.approx(0.0))]
@@ -182,6 +183,7 @@ async def test_cancel_while_waiting_for_duplicate_active_claim_is_observed_once(
     execution.cancel()
     with pytest.raises(asyncio.CancelledError):
         await execution
+    assert service.drain_observations()
     assert (await repository.get_file("file-a")).status is FileStatus.PROCESSING
     assert observations.tasks == [(TaskOutcome.CANCELLED, 0.0)]
     assert len(observations.stages) == 1
@@ -234,6 +236,7 @@ async def test_terminal_repository_faults_are_never_misclassified_as_cancelled(
     )
     with pytest.raises(type(error)):
         await service._execute_claim(claim)
+    assert service.drain_observations()
     assert observations.tasks == [(expected, 0.0)]
     assert observations.tasks[0][0] is not TaskOutcome.CANCELLED
 
@@ -858,6 +861,7 @@ async def test_heartbeat_persistence_failure_is_unexpected_not_cancellation(
     await entered.wait()
     clock.advance(2)
     await execution
+    assert service.drain_observations()
     assert (await repository.get_file("file-a")).status is FileStatus.PROCESSING
     assert observations.tasks == [(TaskOutcome.UNEXPECTED_FAILURE, 2.0)]
 

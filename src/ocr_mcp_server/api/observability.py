@@ -53,7 +53,10 @@ class HttpObservabilityMiddleware:
             await self.app(scope, receive, send)
             return
 
-        started_at = self._clock()
+        try:
+            started_at = self._clock()
+        except Exception:
+            started_at = None
         status: int | None = None
 
         async def observe_send(message: dict[str, Any]) -> None:
@@ -66,8 +69,27 @@ class HttpObservabilityMiddleware:
 
         try:
             await self.app(scope, receive, observe_send)
+        except Exception:
+            if status is None:
+                status = 500
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 500,
+                        "headers": [(b"content-type", b"application/json")],
+                    }
+                )
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": (
+                            b'{"error":{"code":"internal_error","message":'
+                            b'"The request could not be completed."}}'
+                        ),
+                    }
+                )
         finally:
-            if status is not None:
+            if status is not None and started_at is not None:
                 self._observe(scope, status, started_at)
 
     def _observe(self, scope: dict[str, Any], status: int, started_at: float) -> None:

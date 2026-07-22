@@ -16,6 +16,9 @@ def main() -> None:
         create_app(settings),
         host=settings.server.host,
         port=settings.server.port,
+        access_log=False,
+        log_config=None,
+        log_level="critical",
     )
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 
 import pytest
@@ -15,6 +16,7 @@ from ocr_mcp_server.services.observability import (
     DependencyName,
     HttpObservation,
     NullObservability,
+    ObservationDispatcher,
     RecoveryOutcome,
     StageOutcome,
     TaskOutcome,
@@ -23,6 +25,41 @@ from ocr_mcp_server.services.observability import (
 
 
 ROUTES = frozenset({"/health/live", "/tasks/{task_id}"})
+
+
+def test_best_effort_contains_sink_cancelled_error_but_not_process_exit():
+    best_effort(lambda: (_ for _ in ()).throw(asyncio.CancelledError("sink")))
+    with pytest.raises(KeyboardInterrupt):
+        best_effort(lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(SystemExit):
+        best_effort(lambda: (_ for _ in ()).throw(SystemExit()))
+
+
+def test_dispatcher_is_bounded_nonblocking_and_close_never_waits_for_blocked_sink():
+    import threading
+    import time
+
+    blocked = threading.Event()
+
+    class Sink(NullObservability):
+        def observe_task(self, outcome, duration_seconds):
+            blocked.wait()
+
+    dispatcher = ObservationDispatcher(Sink(), capacity=2, worker_count=1)
+    started = time.monotonic()
+    for _ in range(20):
+        dispatcher.observe_task(TaskOutcome.COMPLETED, 0.1)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.2
+    assert dispatcher.pending <= 2
+    assert dispatcher.worker_count == 1
+    close_started = time.monotonic()
+    dispatcher.close(timeout=0.01)
+    assert time.monotonic() - close_started < 0.2
+    assert dispatcher.dropped > 0
+    blocked.set()
+    assert dispatcher.wait_closed(0.2)
+    assert dispatcher.alive_workers == 0
 
 
 def _http(

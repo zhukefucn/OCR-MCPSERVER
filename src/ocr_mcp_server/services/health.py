@@ -15,6 +15,7 @@ from .observability import (
     NullObservability,
     ObservabilitySink,
     best_effort,
+    nonblocking_observability,
 )
 
 
@@ -137,12 +138,22 @@ class ReadinessService:
             raise ValueError("invalid readiness probes")
         self._probes = validated
         self._timeout_seconds = float(timeout_seconds)
-        self._observability = (
-            observability if observability is not None else NullObservability()
+        self._observability, self._owned_observability = nonblocking_observability(
+            observability
         )
+        self._observability_target = observability
         self._outstanding_probes: dict[
             DependencyName, asyncio.Task[object]
         ] = {}
+
+    def drain_observations(self, timeout: float = 1.0) -> bool:
+        if self._owned_observability is None:
+            return True
+        return self._owned_observability.drain(timeout)
+
+    def close_observability(self) -> None:
+        if self._owned_observability is not None:
+            self._owned_observability.close()
 
     async def check(self) -> ReadinessSnapshot:
         tasks = tuple(

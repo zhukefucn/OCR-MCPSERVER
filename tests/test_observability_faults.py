@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -73,6 +74,29 @@ class CostlySink:
         raise AttributeError(name)
 
 
+class BlockingSink:
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def __getattr__(self, name):
+        if name.startswith(("observe_", "set_")):
+            def block(*args):
+                self.entered.set()
+                self.release.wait()
+            return block
+        raise AttributeError(name)
+
+
+class CancelledErrorSink:
+    def __getattr__(self, name):
+        if name.startswith(("observe_", "set_")):
+            def cancel(*args):
+                raise asyncio.CancelledError("sink-originated")
+            return cancel
+        raise AttributeError(name)
+
+
 NOW = datetime(2026, 7, 23, tzinfo=UTC)
 
 
@@ -126,7 +150,9 @@ class ProgressPipeline:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sink", [RaisingSink(), CostlySink()])
+@pytest.mark.parametrize(
+    "sink", [RaisingSink(), CancelledErrorSink(), CostlySink(), BlockingSink()]
+)
 async def test_claimed_task_and_stage_sink_faults_preserve_terminal_state(sink):
     canary = "OCR text private.pdf https://private.test C:\\private Authorization token"
     claim = _claim(canary)
@@ -138,9 +164,14 @@ async def test_claimed_task_and_stage_sink_faults_preserve_terminal_state(sink):
         worker_identity="worker",
         observability=sink,
     )
+    started = time.monotonic()
     await service._execute_claim(claim)
+    assert time.monotonic() - started < 0.2
     assert repository.current.status is FileStatus.COMPLETED
     assert canary not in repr(getattr(sink, "calls", ()))
+    await service.close()
+    if isinstance(sink, BlockingSink):
+        sink.release.set()
 
 
 @pytest.mark.asyncio
@@ -212,8 +243,9 @@ async def test_paddle_fault_sink_preserves_fifo_cancel_saturation_backend_failur
         def close(self):
             order.append("close")
 
+    observation_sink = BlockingSink()
     worker = SingleOwnerSecondaryOcrWorker(
-        Backend, queue_capacity=1, observability=RaisingSink()
+        Backend, queue_capacity=1, observability=observation_sink
     )
     await worker.start()
     first = asyncio.create_task(worker.recognize(_candidate(tmp_path, "one")))
@@ -234,6 +266,7 @@ async def test_paddle_fault_sink_preserves_fifo_cancel_saturation_backend_failur
         await worker.recognize(_candidate(tmp_path, "four"))
     ).kind is SecondaryResultKind.OTHER
     await worker.close()
+    observation_sink.release.set()
     assert order == ["one", "two", "bad", "four", "close"]
     assert worker.queue_depth == 0
 
@@ -331,7 +364,7 @@ class RecoveryGuards:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sink", [RaisingSink(), CostlySink()])
+@pytest.mark.parametrize("sink", [RaisingSink(), CostlySink(), BlockingSink()])
 async def test_recovery_terminal_sink_fault_is_once_only_and_replay_stable(sink):
     repository = UncertainRecoveryRepository()
 
@@ -360,6 +393,8 @@ async def test_recovery_terminal_sink_fault_is_once_only_and_replay_stable(sink)
     for service in (coordinator(), coordinator()):
         with pytest.raises(RecoveryServiceFailure):
             await service.reparse(command)
+        service.drain_observations()
+        service.close_observability()
     assert repository.failures == 1
     assert repository.marker is True
     calls = getattr(sink, "calls", ())
@@ -369,12 +404,19 @@ async def test_recovery_terminal_sink_fault_is_once_only_and_replay_stable(sink)
     else:
         assert observed == []
     assert "raw-token-private.pdf" not in repr(calls)
+    if isinstance(sink, BlockingSink):
+        sink.release.set()
 
 
 def test_raising_http_sink_preserves_rest_and_mcp_auth_responses():
     settings = AppSettings(auth={"api_keys": ["a-secure-api-key-0000000000000001"]})
     outputs = []
-    for sink in (NullObservability(), RaisingSink(), CostlySink()):
+    for sink in (
+        NullObservability(),
+        RaisingSink(),
+        CancelledErrorSink(),
+        CostlySink(),
+    ):
         with TestClient(create_app(settings, observability=sink)) as client:
             live = client.get("/health/live")
             mcp = client.post(
@@ -383,7 +425,23 @@ def test_raising_http_sink_preserves_rest_and_mcp_auth_responses():
                 json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
             )
         outputs.append((live.status_code, live.json(), mcp.status_code, mcp.json()))
-    assert outputs[0] == outputs[1] == outputs[2]
+    assert outputs[0] == outputs[1] == outputs[2] == outputs[3]
+
+
+def test_forever_blocking_sink_does_not_delay_live_rest_or_readiness():
+    sink = BlockingSink()
+    settings = AppSettings(auth={"api_keys": []})
+    with TestClient(create_app(settings, observability=sink)) as client:
+        started = time.monotonic()
+        live = client.get("/health/live")
+        ready = client.get("/health/ready")
+        missing = client.get("/v1/tasks/00000000-0000-4000-8000-000000000000")
+        elapsed = time.monotonic() - started
+    sink.release.set()
+    assert elapsed < 0.2
+    assert live.status_code == 200
+    assert ready.status_code == 503
+    assert missing.status_code in {404, 503}
 
 
 @pytest.mark.asyncio

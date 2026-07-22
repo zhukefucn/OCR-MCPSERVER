@@ -6,6 +6,7 @@ import logging
 import re
 import time
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -26,7 +27,12 @@ from .services.health import (
     ReadinessService,
     ReadinessSnapshot,
 )
-from .services.observability import DependencyName, ObservabilitySink
+from .services.observability import (
+    DependencyName,
+    ObservationDispatcher,
+    ObservabilitySink,
+    nonblocking_observability,
+)
 from .settings import AppSettings, load_settings
 
 
@@ -58,27 +64,46 @@ def create_app(
     """Create the HTTP application without starting external services."""
 
     resolved_settings = settings if settings is not None else load_settings()
+    resolved_registry = registry if registry is not None else CollectorRegistry()
+    raw_observability = (
+        observability
+        if observability is not None
+        else PrometheusObservability(resolved_registry)
+    )
+    resolved_observability, owned_dispatcher = nonblocking_observability(
+        raw_observability
+    )
     mcp_server = create_mcp_server(gateway)
     mcp_app = mcp_server.http_app(path="/mcp")
+
+    @asynccontextmanager
+    async def lifespan(application):
+        try:
+            async with mcp_app.lifespan(application):
+                yield
+        finally:
+            if owned_dispatcher is not None:
+                owned_dispatcher.close()
+
     app = _ObservedFastAPI(
         title="OCR MCP Server",
         routes=[*mcp_app.routes],
-        lifespan=mcp_app.lifespan,
+        lifespan=lifespan,
     )
     app.state.settings = resolved_settings
     app.state.gateway = gateway
     app.state.mcp_server = mcp_server
     app.include_router(router)
 
-    resolved_registry = registry if registry is not None else CollectorRegistry()
-    resolved_observability = (
-        observability
-        if observability is not None
-        else PrometheusObservability(resolved_registry)
-    )
     resolved_logger = event_logger if event_logger is not None else _event_logger()
     app.state.observability_registry = resolved_registry
     app.state.observability = resolved_observability
+    app.state.observability_target = raw_observability
+    app.state.observability_dispatcher = (
+        resolved_observability
+        if isinstance(resolved_observability, ObservationDispatcher)
+        else None
+    )
     app.state.readiness = (
         readiness
         if readiness is not None
@@ -88,6 +113,8 @@ def create_app(
     @app.get("/metrics", include_in_schema=False)
     async def metrics() -> Response:
         try:
+            if isinstance(resolved_observability, ObservationDispatcher):
+                resolved_observability.drain(0.1)
             body = generate_latest(resolved_registry)
         except Exception:
             return Response(status_code=503, content=b"")

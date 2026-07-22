@@ -17,7 +17,11 @@ from ..domain import (
     SecondaryOcrFailure,
     SecondaryOcrResult,
 )
-from ..services.observability import NullObservability, ObservabilitySink, best_effort
+from ..services.observability import (
+    ObservabilitySink,
+    best_effort,
+    nonblocking_observability,
+)
 
 
 class SynchronousSecondaryOcrBackend(Protocol):
@@ -61,9 +65,10 @@ class SingleOwnerSecondaryOcrWorker:
         if isinstance(queue_capacity, bool) or queue_capacity < 1:
             raise ValueError("queue capacity must be positive")
         self._factory = backend_factory
-        self._observability = (
-            observability if observability is not None else NullObservability()
+        self._observability, self._owned_observability = nonblocking_observability(
+            observability
         )
+        self._observability_target = observability
         self._queue: Queue[_Job | object] = Queue(maxsize=queue_capacity)
         self._lock = threading.RLock()
         self._lifecycle = SecondaryOcrWorkerLifecycle.CREATED
@@ -122,6 +127,8 @@ class SingleOwnerSecondaryOcrWorker:
             start_failure = exc
         if start_failure is not None:
             await self._join_owner_thread()
+            if self._owned_observability is not None:
+                self._owned_observability.close()
             raise start_failure
 
     async def recognize(self, candidate: ImageCandidate) -> SecondaryOcrResult:
@@ -160,15 +167,16 @@ class SingleOwnerSecondaryOcrWorker:
                 pass
 
     async def close(self) -> None:
+        immediate = False
         with self._lock:
             if self._lifecycle is SecondaryOcrWorkerLifecycle.CLOSED:
-                self._observe_queue_depth()
-                return
-            if self._lifecycle is SecondaryOcrWorkerLifecycle.CREATED:
+                immediate = True
+                done = None
+            elif self._lifecycle is SecondaryOcrWorkerLifecycle.CREATED:
                 self._lifecycle = SecondaryOcrWorkerLifecycle.CLOSED
-                self._observe_queue_depth()
-                return
-            if self._lifecycle is SecondaryOcrWorkerLifecycle.CLOSING:
+                immediate = True
+                done = None
+            elif self._lifecycle is SecondaryOcrWorkerLifecycle.CLOSING:
                 done = self._done
             elif self._lifecycle is SecondaryOcrWorkerLifecycle.FAILED:
                 self._lifecycle = SecondaryOcrWorkerLifecycle.CLOSED
@@ -178,6 +186,11 @@ class SingleOwnerSecondaryOcrWorker:
                 self._reject_queued_locked()
                 self._queue.put_nowait(_STOP)
                 done = self._done
+        if immediate:
+            self._observe_queue_depth()
+            if self._owned_observability is not None:
+                self._owned_observability.close()
+            return
         if done is not None:
             close_error: BaseException | None = None
             try:
@@ -185,8 +198,15 @@ class SingleOwnerSecondaryOcrWorker:
             except BaseException as exc:
                 close_error = exc
             await self._join_owner_thread()
-            if close_error is not None:
-                raise close_error
+        if self._owned_observability is not None:
+            self._owned_observability.close()
+        if done is not None and close_error is not None:
+            raise close_error
+
+    def drain_observations(self, timeout: float = 1.0) -> bool:
+        if self._owned_observability is None:
+            return True
+        return self._owned_observability.drain(timeout)
 
     async def _join_owner_thread(self) -> None:
         with self._lock:

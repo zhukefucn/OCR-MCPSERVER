@@ -212,6 +212,26 @@ def test_unhandled_exception_final_500_is_observed_once_by_outer_boundary() -> N
     assert "TOP_SECRET_EXCEPTION_CANARY" not in outputs
 
 
+@pytest.mark.parametrize("fail_at", ["start", "end"])
+def test_observation_clock_failure_never_changes_live_response(fail_at: str) -> None:
+    calls = 0
+
+    def clock():
+        nonlocal calls
+        calls += 1
+        if fail_at == "start" or calls == 2:
+            raise RuntimeError("CLOCK_EXCEPTION_PRIVATE_PATH_CANARY")
+        return 1.0
+
+    with TestClient(
+        create_app(AppSettings(auth={"api_keys": []}), clock=clock),
+        raise_server_exceptions=False,
+    ) as client:
+        response = client.get("/health/live")
+    assert response.status_code == 200
+    assert "CLOCK_EXCEPTION_PRIVATE_PATH_CANARY" not in response.text
+
+
 @pytest.mark.asyncio
 async def test_middleware_does_not_buffer_streaming_request_or_response() -> None:
     request_chunks = [

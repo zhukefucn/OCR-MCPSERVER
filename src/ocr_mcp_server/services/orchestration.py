@@ -26,6 +26,7 @@ from .observability import (
     StageOutcome,
     TaskOutcome,
     best_effort,
+    nonblocking_observability,
 )
 
 
@@ -393,9 +394,10 @@ class OrchestrationService:
         self._settings = settings
         self._clock = clock or _SystemClock()
         self._worker_identity = worker_identity
-        self._observability = (
-            observability if observability is not None else NullObservability()
+        self._observability, self._owned_observability = nonblocking_observability(
+            observability
         )
+        self._observability_target = observability
         self._wake_queue: asyncio.Queue[None] = asyncio.Queue(
             maxsize=settings.wake_queue_capacity
         )
@@ -442,6 +444,11 @@ class OrchestrationService:
         self._observe_queue_depth()
         return True
 
+    def drain_observations(self, timeout: float = 1.0) -> bool:
+        if self._owned_observability is None:
+            return True
+        return self._owned_observability.drain(timeout)
+
     async def close(self) -> None:
         if self._closed:
             return
@@ -464,6 +471,8 @@ class OrchestrationService:
                 break
             self._wake_queue.task_done()
         self._observe_queue_depth()
+        if self._owned_observability is not None:
+            self._owned_observability.close()
 
     def _observe_queue_depth(self) -> None:
         depth = self._wake_queue.qsize()

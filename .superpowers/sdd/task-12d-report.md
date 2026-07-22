@@ -167,3 +167,81 @@ handled in strict additional RED/GREEN cycles.
   green results above. No test-process hang reproduced.
 
 No production fault control, push, sync, image build, or deployment was performed.
+
+## Final whole-feature review remediation
+
+The final whole-feature review found four additional Important trust-boundary
+issues. They were addressed as one coordinated TDD wave.
+
+### Uvicorn and unhandled ASGI failures
+
+- RED: the entrypoint supplied neither `access_log=False` nor a safe logging
+  configuration; an injected clock failure before app invocation also returned a
+  500 instead of the live business response.
+- GREEN: Uvicorn access logging is disabled, its built-in logging configuration is
+  disabled, and log level is `critical`, suppressing unsafe request/access/error
+  lines. The outer ASGI boundary contains ordinary application exceptions after a
+  safe 500 (or sends a fixed content-free 500 if none began). It does not catch
+  ASGI cancellation, `KeyboardInterrupt`, or `SystemExit`.
+- The existing unhandled exception canary remains a fixed JSON 500 and is absent
+  from observation/logger representations. Clock start/end failure tests preserve
+  `/health/live` 200 and suppress the exception canary.
+
+### CancelledError containment
+
+- RED: a synchronous sink raising `asyncio.CancelledError` escaped
+  `best_effort`.
+- GREEN: sink-originated `CancelledError` is contained explicitly while
+  `KeyboardInterrupt` and `SystemExit` are re-raised. Real caller task cancellation
+  still propagates at await points because dispatcher admission is synchronous and
+  does not catch cancellation from application awaits.
+- Direct tests and claimed-task/HTTP call-site tests use a synchronous
+  `CancelledError` sink and preserve business results.
+
+### Bounded non-blocking dispatch
+
+- RED: no dispatcher type existed; synchronous sinks executed on caller/event-loop
+  or Paddle-lock paths.
+- GREEN: `ObservationDispatcher` validates finite observation arguments before
+  bounded `put_nowait` admission. Defaults are capacity 256 and one daemon worker;
+  worker count is validated from 1 through 4. Full queues and closed dispatchers
+  increment a drop counter without blocking business work.
+- Sink execution occurs only on fixed worker threads. Ordinary errors and
+  sink-originated `CancelledError` are contained. Queue payloads contain only the
+  validated finite method arguments, never closures over request/task state.
+- `drain(timeout)` supports deterministic fast-sink accounting. `close(timeout)`
+  uses one total deadline (default 100 ms), stops admission, and never waits
+  indefinitely for a blocked sink. `wait_closed(timeout)` and `alive_workers`
+  provide deterministic worker-exit verification after a blocked sink is released.
+  App lifespan, orchestration close, and Paddle
+  close/startup-failure close owned dispatchers. Readiness and recovery expose
+  explicit drain/close hooks. Existing injected dispatchers are reused rather than
+  nested, and every app owns an independent queue/registry target.
+- Weak dispatcher target references plus owner-lifetime strong references avoid
+  retaining readiness services/sinks after their owner is collected.
+- Forever-blocking tests prove live/REST/readiness calls, claimed cleanup, Paddle
+  FIFO/backend-failure/close, and recovery replay remain bounded. The direct test
+  proves pending depth never exceeds capacity, drops occur, worker count remains
+  fixed, and close remains bounded. Paddle locks cover only O(1) queue admission,
+  never user sink execution.
+
+### Deterministic test updates and final evidence
+
+- Legacy synchronous metric assertions now explicitly drain their owning
+  dispatcher where needed; no sleeps were introduced for accounting.
+- Component dispatch/fault set: `194 passed`.
+- Final Task 12 focused set (including entrypoint and durable orientation
+  repository): `267 passed in 11.07s`.
+- Full isolated suite before the final entrypoint/Paddle close-order cleanup:
+  `990 passed, 20 skipped in 21.06s`; a final post-cleanup full run follows below.
+- Final post-cleanup isolated full suite:
+  `990 passed, 20 skipped in 20.65s` using basetemp
+  `.pytest-tmp/final-review-full-final`.
+- Ultimate isolated full suite after deterministic worker-exit verification:
+  `990 passed, 20 skipped in 20.47s` using basetemp
+  `.pytest-tmp/final-review-full-ultimate`.
+- `pip check` reports no broken requirements, `compileall` exits 0, and
+  `git diff --check` exits 0 with informational Windows LF/CRLF notices only.
+
+No push, sync, image build, deployment, production fault control, heavy dependency,
+or new telemetry backend was added.

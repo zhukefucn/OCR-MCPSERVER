@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
+from queue import Full, Queue
 import re
+import threading
+import time
+import weakref
 from collections.abc import Callable
 from dataclasses import InitVar, dataclass
 from enum import StrEnum
@@ -186,17 +191,207 @@ def best_effort(observation: Callable[[], None]) -> None:
         raise _invalid()
     try:
         observation()
+    except asyncio.CancelledError:
+        return
     except Exception:
         return
+
+
+_DISPATCH_STOP = object()
+
+
+class ObservationDispatcher(NullObservability):
+    """Bounded asynchronous adapter for synchronous observation sinks."""
+
+    def __init__(
+        self,
+        sink: ObservabilitySink,
+        *,
+        capacity: int = 256,
+        worker_count: int = 1,
+    ) -> None:
+        if (
+            sink is self
+            or isinstance(capacity, bool)
+            or not isinstance(capacity, int)
+            or capacity < 1
+            or isinstance(worker_count, bool)
+            or not isinstance(worker_count, int)
+            or not 1 <= worker_count <= 4
+        ):
+            raise _invalid()
+        try:
+            self._sink_reference = weakref.ref(sink)
+            self._sink_strong = None
+        except TypeError:
+            self._sink_reference = None
+            self._sink_strong = sink
+        self._queue: Queue[tuple[str, tuple[object, ...]] | object] = Queue(
+            maxsize=capacity
+        )
+        self._closed = False
+        self._lock = threading.Lock()
+        self._dropped = 0
+        self._threads = tuple(
+            threading.Thread(
+                target=self._run,
+                name=f"ocr-observation-{number}",
+                daemon=True,
+            )
+            for number in range(worker_count)
+        )
+        for thread in self._threads:
+            thread.start()
+
+    @property
+    def pending(self) -> int:
+        return self._queue.qsize()
+
+    @property
+    def dropped(self) -> int:
+        with self._lock:
+            return self._dropped
+
+    @property
+    def worker_count(self) -> int:
+        return len(self._threads)
+
+    @property
+    def alive_workers(self) -> int:
+        return sum(thread.is_alive() for thread in self._threads)
+
+    def observe_http(self, observation: HttpObservation) -> None:
+        super().observe_http(observation)
+        self._submit("observe_http", observation)
+
+    def observe_task(self, outcome: TaskOutcome, duration_seconds: float) -> None:
+        super().observe_task(outcome, duration_seconds)
+        self._submit("observe_task", outcome, float(duration_seconds))
+
+    def observe_stage(
+        self,
+        stage: ProcessingStage,
+        outcome: StageOutcome,
+        duration_seconds: float,
+    ) -> None:
+        super().observe_stage(stage, outcome, duration_seconds)
+        self._submit("observe_stage", stage, outcome, float(duration_seconds))
+
+    def observe_recovery(self, outcome: RecoveryOutcome) -> None:
+        super().observe_recovery(outcome)
+        self._submit("observe_recovery", outcome)
+
+    def set_orchestration_queue_depth(self, depth: int) -> None:
+        super().set_orchestration_queue_depth(depth)
+        self._submit("set_orchestration_queue_depth", depth)
+
+    def set_secondary_ocr_queue_depth(self, depth: int) -> None:
+        super().set_secondary_ocr_queue_depth(depth)
+        self._submit("set_secondary_ocr_queue_depth", depth)
+
+    def set_dependency_ready(self, dependency: DependencyName, ready: bool) -> None:
+        super().set_dependency_ready(dependency, ready)
+        self._submit("set_dependency_ready", dependency, ready)
+
+    def _submit(self, method: str, *args: object) -> None:
+        with self._lock:
+            if self._closed:
+                self._dropped += 1
+                return
+            try:
+                self._queue.put_nowait((method, args))
+            except Full:
+                self._dropped += 1
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is _DISPATCH_STOP:
+                    return
+                method, args = item
+                sink = (
+                    self._sink_strong
+                    if self._sink_reference is None
+                    else self._sink_reference()
+                )
+                if sink is not None:
+                    best_effort(lambda: getattr(sink, method)(*args))
+            finally:
+                self._queue.task_done()
+            with self._lock:
+                if self._closed and self._queue.empty():
+                    return
+
+    def drain(self, timeout: float = 1.0) -> bool:
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or timeout < 0
+        ):
+            raise _invalid()
+        deadline = time.monotonic() + float(timeout)
+        while self._queue.unfinished_tasks:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.001)
+        return True
+
+    def close(self, *, timeout: float = 0.1) -> None:
+        deadline = time.monotonic() + timeout
+        self.drain(timeout)
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        for _ in self._threads:
+            try:
+                self._queue.put_nowait(_DISPATCH_STOP)
+            except Full:
+                break
+        for thread in self._threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(remaining)
+
+    def wait_closed(self, timeout: float = 1.0) -> bool:
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or timeout < 0
+        ):
+            raise _invalid()
+        deadline = time.monotonic() + float(timeout)
+        for thread in self._threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(remaining)
+        return self.alive_workers == 0
+
+
+def nonblocking_observability(
+    sink: ObservabilitySink | None,
+) -> tuple[ObservabilitySink, ObservationDispatcher | None]:
+    """Return a safe call-site sink and an owned dispatcher, if one was created."""
+
+    resolved: ObservabilitySink = sink if sink is not None else NullObservability()
+    if isinstance(resolved, ObservationDispatcher) or type(resolved) is NullObservability:
+        return resolved, None
+    dispatcher = ObservationDispatcher(resolved)
+    return dispatcher, dispatcher
 
 
 __all__ = [
     "DependencyName",
     "HttpObservation",
     "NullObservability",
+    "ObservationDispatcher",
     "ObservabilitySink",
     "RecoveryOutcome",
     "StageOutcome",
     "TaskOutcome",
     "best_effort",
+    "nonblocking_observability",
 ]

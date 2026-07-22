@@ -360,6 +360,7 @@ async def test_recovery_observes_new_completion_once_but_not_completed_replay():
     command = OrientationRecoveryCommand(recovery_token="or_" + "x" * 32)
     await service.reparse(command)
     await service.reparse(command)
+    assert service.drain_observations()
     assert observations.outcomes == [RecoveryOutcome.COMPLETED]
 
 

@@ -35,6 +35,7 @@ from .observability import (
     ObservabilitySink,
     RecoveryOutcome,
     best_effort,
+    nonblocking_observability,
 )
 
 
@@ -418,9 +419,19 @@ class OrientationRecoveryCoordinator:
         self._content_write_guards = content_write_guards
         self._now_factory = now_factory
         self._write_lease_seconds = write_lease_seconds
-        self._observability = (
-            observability if observability is not None else NullObservability()
+        self._observability, self._owned_observability = nonblocking_observability(
+            observability
         )
+        self._observability_target = observability
+
+    def drain_observations(self, timeout: float = 1.0) -> bool:
+        if self._owned_observability is None:
+            return True
+        return self._owned_observability.drain(timeout)
+
+    def close_observability(self) -> None:
+        if self._owned_observability is not None:
+            self._owned_observability.close()
 
     async def reparse(
         self,
