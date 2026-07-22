@@ -1,5 +1,7 @@
 FROM python:3.11-slim-bookworm
 
+ARG PIP_INDEX_URL=https://pypi.org/simple
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \

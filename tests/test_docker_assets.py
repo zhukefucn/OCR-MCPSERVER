@@ -102,6 +102,39 @@ def test_gateway_dockerfile_builds_the_installed_package_as_non_root() -> None:
     assert user_directives[-1] == "10001:10001"
 
 
+def test_gateway_dockerfile_defaults_pip_index_to_official_https_pypi() -> None:
+    dockerfile = _read_text("docker/ocr-gateway.Dockerfile")
+
+    pip_index_args = re.findall(
+        r"^ARG\s+PIP_INDEX_URL(?:=(\S+))?\s*$",
+        dockerfile,
+        re.MULTILINE,
+    )
+
+    assert pip_index_args == ["https://pypi.org/simple"]
+    assert "pypi.tuna.tsinghua.edu.cn" not in dockerfile
+    assert "--index-url" not in dockerfile
+
+
+def test_gateway_dockerfile_exposes_pip_index_arg_to_pip_install_run() -> None:
+    dockerfile = _read_text("docker/ocr-gateway.Dockerfile")
+
+    pip_index_arg = re.search(
+        r"^ARG\s+PIP_INDEX_URL=https://pypi\.org/simple\s*$",
+        dockerfile,
+        re.MULTILINE,
+    )
+    pip_install_run = re.search(
+        r"^RUN\s+python -m pip install --no-cache-dir \.\s+\\$",
+        dockerfile,
+        re.MULTILINE,
+    )
+
+    assert pip_index_arg is not None
+    assert pip_install_run is not None
+    assert pip_index_arg.start() < pip_install_run.start()
+
+
 def test_gateway_dockerfile_has_only_gateway_runtime_configuration() -> None:
     dockerfile = _read_text("docker/ocr-gateway.Dockerfile")
     normalized = dockerfile.lower()
