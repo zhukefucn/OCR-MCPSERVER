@@ -4,8 +4,11 @@
 
 - Status: complete
 - Base commit: `d7a7d857a6b28ed66419aae68a01a73d45465c97`
-- Verified implementation head: `1df2a50e46fd3da52d088c29a189daf26facb2c3`
+- Initial verified implementation head: `1df2a50e46fd3da52d088c29a189daf26facb2c3`
 - Implementation commit: `1df2a50 feat: collect secondary OCR image candidates`
+- Controller-fix base: `a20e494e4d2571138cdc7831239aa2af402b46fb`
+- Hardened implementation head: `b5b62ebdbf35c4d627bdacaf99751313520a1efd`
+- Focused fix commit: `b5b62eb fix: harden secondary OCR candidate contracts`
 - This report is committed separately after the verified implementation so it can cite the immutable implementation hash.
 
 ## Files changed
@@ -123,3 +126,56 @@ The repository virtual environment was activated so the exact brief commands use
 - Windows confinement was exercised natively, including final-handle path validation and intermediate directory-symlink escape rejection. Symlink tests skip only on hosts where link creation privilege is unavailable.
 - The five full-suite skips are existing platform-specific tests. No Task 5 functional failure remains.
 - Multi-frame images are intentionally bounded by the same configured pixel budget in aggregate as well as per frame. This is conservative and prevents GIF/TIFF decode amplification.
+
+## Controller-review follow-up
+
+An independent controller review after the initial Task 5 delivery found three Important issues. They were repaired in the focused range `a20e494e4d2571138cdc7831239aa2af402b46fb..b5b62ebdbf35c4d627bdacaf99751313520a1efd`.
+
+### Files changed in the focused fix
+
+- `src/ocr_mcp_server/services/candidate_collection.py`
+- `src/ocr_mcp_server/domain/secondary_ocr.py`
+- `tests/test_candidate_collection.py`
+- `tests/test_secondary_ocr_domain.py`
+
+### Issue closure and security boundaries
+
+1. JSON and Pillow ordinary-exception normalization — closed.
+   - Real 1,200-level JSON nesting reproduces `RecursionError` and a 5,000-digit JSON integer reproduces Python 3.11's integer-limit `ValueError`; both now become context-free `candidate_manifest_invalid` failures.
+   - Non-standard Pillow `RuntimeError` with planted path/text now becomes a context-free `candidate_image_invalid_or_unsupported` failure.
+   - Both boundaries explicitly re-raise `CandidateCollectionFailure`, then catch only ordinary `Exception`; they do not catch `BaseException`.
+2. Windows 8.3 short-root alias — closed.
+   - The expected candidate path is expanded with `GetLongPathNameW`.
+   - The confinement root is canonicalized from a trusted directory handle with reparse-point rejection and `GetFinalPathNameByHandleW`.
+   - The final candidate file handle must still match the canonical expected path and remain below the canonical root, preserving final-handle escape and reparse defenses.
+3. `SecondaryOcrResult` valid-state semantics — closed.
+   - `VALID + UNCERTAIN` is forbidden.
+   - Valid tables require non-empty HTML; valid formulas require non-empty LaTeX.
+   - Valid `OTHER` results cannot carry replacement content, making original-node preservation explicit.
+
+### Follow-up RED/GREEN evidence
+
+- RED focused run: 10 failures — six invalid valid-state combinations were accepted; deep JSON leaked `RecursionError`; the oversized integer leaked `ValueError`; Pillow leaked planted `RuntimeError`; and a simulated Windows 8.3 alias was rejected.
+- GREEN focused command: `.venv\Scripts\python.exe -m pytest tests\test_secondary_ocr_domain.py tests\test_candidate_collection.py -q`
+- GREEN focused result: 80 passed.
+- Focused read-only re-review: all three controller findings correct, no blocker, `READY`.
+
+### Follow-up full verification
+
+1. `python -m pytest`
+   - Exit code: 0
+   - Result: `335 passed, 5 skipped in 2.97s`
+2. `python -m pip check`
+   - Exit code: 0
+   - Result: `No broken requirements found.`
+3. `python -m compileall -q src tests`
+   - Exit code: 0
+   - Result: no output.
+4. `git diff --check`
+   - Exit code: 0
+   - Result: no whitespace errors; Git printed only Windows LF-to-CRLF working-copy notices for the four focused files.
+
+### Follow-up concerns
+
+- The 8.3 alias regression is deterministic through mocked canonical Win32 path results. Normal Windows handle containment and real symlink escape tests continue to run natively.
+- No remaining controller-review blocker was identified.
