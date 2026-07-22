@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import tomllib
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,26 @@ def _compose_config() -> dict[str, Any]:
     loaded = yaml.safe_load(_read_text("compose.yaml"))
     assert isinstance(loaded, dict)
     return loaded
+
+
+def _dockerignore_patterns() -> list[str]:
+    return [
+        line.strip()
+        for line in _read_text(".dockerignore").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def _dockerignore_excludes(path: str, patterns: list[str]) -> bool:
+    """Evaluate the ordered last-match behavior used by our ignore patterns."""
+
+    excluded = False
+    for pattern in patterns:
+        negated = pattern.startswith("!")
+        candidate = pattern[1:] if negated else pattern
+        if fnmatchcase(path, candidate):
+            excluded = not negated
+    return excluded
 
 
 def test_compose_defines_only_the_minimal_gateway_service() -> None:
@@ -77,7 +99,7 @@ def test_gateway_dockerfile_builds_the_installed_package_as_non_root() -> None:
     assert re.search(r"\bmkdir\s+-p\s+/data\b", normalized)
     user_directives = re.findall(r"^user\s+(.+?)\s*$", normalized, re.MULTILINE)
     assert user_directives
-    assert user_directives[-1] not in {"root", "0", "0:0"}
+    assert user_directives[-1] == "10001:10001"
 
 
 def test_gateway_dockerfile_has_only_gateway_runtime_configuration() -> None:
@@ -107,6 +129,50 @@ def test_gateway_dockerfile_has_only_gateway_runtime_configuration() -> None:
         assert forbidden_dependency not in normalized
 
 
+def test_runtime_dependencies_exclude_ocr_engines_and_external_services() -> None:
+    with (REPOSITORY_ROOT / "pyproject.toml").open("rb") as pyproject_file:
+        pyproject = tomllib.load(pyproject_file)
+    dependencies = pyproject["project"]["dependencies"]
+    dependency_names = {
+        re.sub(
+            r"[-_.]+",
+            "-",
+            re.split(r"[<>=!~;@\s\[]", dependency, maxsplit=1)[0].lower(),
+        )
+        for dependency in dependencies
+    }
+
+    forbidden_exact_names = {
+        "magic-pdf",
+        "asyncpg",
+        "pg8000",
+        "rq",
+        "arq",
+        "huey",
+        "faststream",
+        "taskiq",
+    }
+    forbidden_name_prefixes = (
+        "mineru",
+        "paddle",
+        "torch",
+        "redis",
+        "postgres",
+        "psycopg",
+        "celery",
+        "dramatiq",
+        "kombu",
+        "pika",
+        "aio-pika",
+        "rabbitmq",
+    )
+    assert dependency_names.isdisjoint(forbidden_exact_names)
+    assert not any(
+        dependency_name.startswith(forbidden_name_prefixes)
+        for dependency_name in dependency_names
+    )
+
+
 def test_gateway_healthcheck_uses_only_the_python_standard_library() -> None:
     dockerfile = _read_text("docker/ocr-gateway.Dockerfile")
     normalized = dockerfile.lower()
@@ -120,11 +186,7 @@ def test_gateway_healthcheck_uses_only_the_python_standard_library() -> None:
 
 
 def test_dockerignore_excludes_local_state_and_keeps_build_inputs() -> None:
-    patterns = {
-        line.strip()
-        for line in _read_text(".dockerignore").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    }
+    patterns = _dockerignore_patterns()
 
     for excluded in (
         ".git",
@@ -152,6 +214,42 @@ def test_dockerignore_excludes_local_state_and_keeps_build_inputs() -> None:
         "!src/**",
     ):
         assert included in patterns
+
+
+def test_dockerignore_keeps_nested_secrets_excluded_after_source_exceptions() -> None:
+    patterns = _dockerignore_patterns()
+    last_source_exception = patterns.index("!src/**")
+    recursive_sensitive_patterns = (
+        "**/.env*",
+        "**/*.key",
+        "**/*.pem",
+        "**/*.crt",
+        "**/*.cer",
+        "**/*.p12",
+        "**/*.pfx",
+    )
+
+    assert all(
+        patterns.index(pattern) > last_source_exception
+        for pattern in recursive_sensitive_patterns
+    )
+    for sensitive_path in (
+        "src/.env.production",
+        "src/secrets/client.key",
+        "src/secrets/client.pem",
+        "src/certificates/client.crt",
+        "src/certificates/client.cer",
+        "src/certificates/client.p12",
+        "src/certificates/client.pfx",
+    ):
+        assert _dockerignore_excludes(sensitive_path, patterns)
+    for required_build_input in (
+        "config/example.yaml",
+        "pyproject.toml",
+        "README.md",
+        "src/ocr_mcp_server/app.py",
+    ):
+        assert not _dockerignore_excludes(required_build_input, patterns)
 
 
 def test_readme_documents_remote_ubuntu_container_verification() -> None:
