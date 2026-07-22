@@ -224,4 +224,10 @@ TDD RED 与突变验证：
 - compileall：退出码 0
 - diff-check：退出码 0，仅 Git LF/CRLF 提示
 
-Linux GREEN 与 Linux 全套结果等待 controller 同步上述提交后复验。
+Controller 在 Ubuntu 同步 `e4c05d3` 后的最终验证结果：
+
+- 三项定向回归：`3 passed`
+- Full：`532 passed, 4 skipped`
+- pip check：`No broken requirements found.`
+- compileall：退出码 0
+- remote diff-check：退出码 0
