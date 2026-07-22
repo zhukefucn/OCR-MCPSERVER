@@ -283,6 +283,30 @@ def test_rejects_malformed_manifest_schema_without_leaking_content(
 
 
 @pytest.mark.parametrize(
+    "raw_manifest",
+    [
+        "[" * 1_200 + '"planted-deep-json"' + "]" * 1_200,
+        (
+            '[[{"type":"image","content":{"image_source":{"path":"images/a.png"}},'
+            '"bbox":[0,' + "9" * 5_000 + ",1,2]}]]"
+        ),
+    ],
+)
+def test_json_parser_resource_errors_are_safe_manifest_failures(
+    tmp_path: Path, raw_manifest: str
+) -> None:
+    result = _published_result(tmp_path, raw_manifest)
+
+    with pytest.raises(CandidateCollectionFailure) as exc_info:
+        _collect(result)
+
+    assert exc_info.value.code == "candidate_manifest_invalid"
+    assert "planted" not in repr(exc_info.value)
+    assert exc_info.value.__context__ is None
+    assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
     "unsafe_path",
     [
         "/absolute.png",
@@ -560,6 +584,57 @@ def test_rejects_invalid_unsupported_or_excessive_images(
     assert "planted" not in repr(exc_info.value)
     assert exc_info.value.__context__ is None
     assert exc_info.value.__cause__ is None
+
+
+def test_nonstandard_pillow_runtime_error_is_normalized_without_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ocr_mcp_server.services.candidate_collection as module
+
+    result = _published_result(tmp_path, [[
+        {"type": "image", "content": {"image_source": {"path": "images/runtime.png"}}}
+    ]])
+    _write_image(result.images_directory / "runtime.png")
+    secret = "planted Pillow path and recognized content"
+
+    def fail_open(*args, **kwargs):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(module.Image, "open", fail_open)
+
+    with pytest.raises(CandidateCollectionFailure) as exc_info:
+        _collect(result)
+
+    assert exc_info.value.code == "candidate_image_invalid_or_unsupported"
+    assert secret not in repr(exc_info.value)
+    assert exc_info.value.__context__ is None
+    assert exc_info.value.__cause__ is None
+
+
+def test_windows_containment_accepts_short_path_alias_of_canonical_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ocr_mcp_server.services.candidate_collection as module
+
+    short_root = Path(r"C:\Users\JIANG_~1\AppData\Local\Temp\safe-root")
+    short_path = short_root / "images" / "candidate.png"
+    long_root = Path(r"C:\Users\Jiang Ren\AppData\Local\Temp\safe-root")
+    long_path = long_root / "images" / "candidate.png"
+    monkeypatch.setattr(module, "_windows_final_path", lambda descriptor: str(long_path))
+    monkeypatch.setattr(
+        module,
+        "_windows_final_directory_path",
+        lambda path: str(long_root),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module,
+        "_windows_long_path",
+        lambda path: str(long_path if Path(path) == short_path else long_root),
+        raising=False,
+    )
+
+    module._assert_windows_descriptor_path(42, short_path, short_root)
 
 
 def test_detects_file_identity_change_during_inspection(

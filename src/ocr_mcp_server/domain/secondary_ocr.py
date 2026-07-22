@@ -208,6 +208,21 @@ class SecondaryOcrResult:
             raise ValueError("content and content format must be present together")
         if self.content is not None and not self.content:
             raise ValueError("recognized content cannot be empty")
+        if self.state is SecondaryResultState.VALID:
+            if self.kind is SecondaryResultKind.UNCERTAIN:
+                raise ValueError("valid results cannot be uncertain")
+            if self.kind is SecondaryResultKind.TABLE and (
+                self.content is None
+                or self.content_format is not SecondaryContentFormat.HTML
+            ):
+                raise ValueError("valid table results require HTML content")
+            if self.kind is SecondaryResultKind.FORMULA and (
+                self.content is None
+                or self.content_format is not SecondaryContentFormat.LATEX
+            ):
+                raise ValueError("valid formula results require LaTeX content")
+            if self.kind is SecondaryResultKind.OTHER and self.content is not None:
+                raise ValueError("valid other results cannot replace content")
         versions = dict(self.model_versions)
         if any(
             not isinstance(key, str)

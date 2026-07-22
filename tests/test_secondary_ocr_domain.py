@@ -301,3 +301,68 @@ def test_contracts_reject_invalid_runtime_enums_and_boolean_metadata(
         invalid[field] = value
         with pytest.raises(ValueError):
             SecondaryOcrResult(**invalid)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("kind", "content", "content_format"),
+    [
+        ("uncertain", None, None),
+        ("table", None, None),
+        ("table", "x", "latex"),
+        ("formula", None, None),
+        ("formula", "<table></table>", "html"),
+        ("other", "recognized replacement", "html"),
+    ],
+)
+def test_valid_secondary_result_enforces_kind_content_semantics(
+    kind: str,
+    content: str | None,
+    content_format: str | None,
+) -> None:
+    from ocr_mcp_server.domain import (
+        OrthogonalAngle,
+        SecondaryContentFormat,
+        SecondaryOCREngine,
+        SecondaryOcrResult,
+        SecondaryResultKind,
+        SecondaryResultState,
+    )
+
+    with pytest.raises(ValueError):
+        SecondaryOcrResult(
+            kind=SecondaryResultKind(kind),
+            angle=OrthogonalAngle.DEG_0,
+            content=content,
+            content_format=(
+                SecondaryContentFormat(content_format)
+                if content_format is not None
+                else None
+            ),
+            confidence=0.5,
+            engine=SecondaryOCREngine.PP_STRUCTURE_V3,
+            model_versions={"model": "v1"},
+            state=SecondaryResultState.VALID,
+        )
+
+
+def test_valid_other_result_explicitly_preserves_original_node() -> None:
+    from ocr_mcp_server.domain import (
+        OrthogonalAngle,
+        SecondaryOCREngine,
+        SecondaryOcrResult,
+        SecondaryResultKind,
+        SecondaryResultState,
+    )
+
+    result = SecondaryOcrResult(
+        kind=SecondaryResultKind.OTHER,
+        angle=OrthogonalAngle.DEG_0,
+        content=None,
+        content_format=None,
+        confidence=0.5,
+        engine=SecondaryOCREngine.PP_STRUCTURE_V3,
+        model_versions={"model": "v1"},
+        state=SecondaryResultState.VALID,
+    )
+
+    assert result.content is None

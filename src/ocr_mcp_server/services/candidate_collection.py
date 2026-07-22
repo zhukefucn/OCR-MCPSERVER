@@ -190,7 +190,9 @@ def _read_manifest(path: Path) -> object:
     failed = False
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except CandidateCollectionFailure:
+        raise
+    except Exception:
         failed = True
         manifest = None
     if failed:
@@ -377,7 +379,7 @@ def _open_posix_confined(path: Path, root: Path) -> _OpenedCandidate:
             try:
                 if not stat.S_ISDIR(os.fstat(child).st_mode):
                     raise OSError("component is not a directory")
-            except BaseException:
+            except Exception:
                 _close_descriptor_ignoring_errors(child)
                 raise
             current = _transfer_directory_ownership(current, child)
@@ -393,7 +395,7 @@ def _open_posix_confined(path: Path, root: Path) -> _OpenedCandidate:
             initial_name_stat = os.stat(
                 final_name, dir_fd=current, follow_symlinks=False
             )
-        except BaseException:
+        except Exception:
             _close_descriptor_ignoring_errors(descriptor)
             raise
         return _OpenedCandidate(
@@ -403,7 +405,7 @@ def _open_posix_confined(path: Path, root: Path) -> _OpenedCandidate:
             parent_descriptor=current,
             final_name=final_name,
         )
-    except BaseException:
+    except Exception:
         _close_descriptor_ignoring_errors(current)
         raise
 
@@ -474,7 +476,7 @@ def _windows_open_no_reparse(path: Path) -> int:
         return msvcrt.open_osfhandle(
             int(handle), os.O_RDONLY | getattr(os, "O_BINARY", 0)
         )
-    except BaseException:
+    except Exception:
         kernel32.CloseHandle(handle)
         raise
 
@@ -483,8 +485,8 @@ def _assert_windows_descriptor_path(
     descriptor: int, path: Path, confined_root: Path
 ) -> None:
     actual = _windows_final_path(descriptor)
-    expected = str(path.absolute())
-    root = str(confined_root.absolute()).rstrip("\\/")
+    expected = _windows_long_path(path)
+    root = _windows_final_directory_path(confined_root).rstrip("\\/")
     normalized_actual = os.path.normcase(os.path.normpath(actual))
     normalized_expected = os.path.normcase(os.path.normpath(expected))
     normalized_root = os.path.normcase(os.path.normpath(root))
@@ -494,10 +496,99 @@ def _assert_windows_descriptor_path(
         raise OSError("descriptor escaped root")
 
 
-def _windows_final_path(descriptor: int) -> str:
+def _windows_final_directory_path(path: Path) -> str:
     import ctypes
     from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path),
+        0x80 | 0x0001,
+        0x1 | 0x2 | 0x4,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        if _windows_handle_is_reparse(int(handle)):
+            raise OSError("invalid reparse root")
+        return _windows_final_path_from_handle(int(handle))
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _windows_long_path(path: Path) -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_long_path = kernel32.GetLongPathNameW
+    get_long_path.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    )
+    get_long_path.restype = wintypes.DWORD
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = get_long_path(str(path.absolute()), buffer, len(buffer))
+    if length == 0 or length >= len(buffer):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return buffer.value
+
+
+def _windows_handle_is_reparse(handle: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    class _AttributeTagInfo(ctypes.Structure):
+        _fields_ = (
+            ("FileAttributes", wintypes.DWORD),
+            ("ReparseTag", wintypes.DWORD),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_attributes = kernel32.GetFileInformationByHandleEx
+    get_attributes.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    get_attributes.restype = wintypes.BOOL
+    attribute_info = _AttributeTagInfo()
+    if not get_attributes(
+        handle,
+        9,
+        ctypes.byref(attribute_info),
+        ctypes.sizeof(attribute_info),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return bool(attribute_info.FileAttributes & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _windows_final_path(descriptor: int) -> str:
     import msvcrt
+
+    return _windows_final_path_from_handle(msvcrt.get_osfhandle(descriptor))
+
+
+def _windows_final_path_from_handle(handle: int) -> str:
+    import ctypes
+    from ctypes import wintypes
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     get_final_path = kernel32.GetFinalPathNameByHandleW
@@ -509,9 +600,7 @@ def _windows_final_path(descriptor: int) -> str:
     )
     get_final_path.restype = wintypes.DWORD
     buffer = ctypes.create_unicode_buffer(32768)
-    length = get_final_path(
-        msvcrt.get_osfhandle(descriptor), buffer, len(buffer), 0
-    )
+    length = get_final_path(handle, buffer, len(buffer), 0)
     if length == 0 or length >= len(buffer):
         raise ctypes.WinError(ctypes.get_last_error())
     value = buffer.value
@@ -640,14 +729,9 @@ def _decode_image(
                     if aggregate_pixels > max_image_pixels:
                         _fail(CandidateCollectionErrorCode.INVALID_IMAGE)
                     frame.load()
-    except (
-        Image.DecompressionBombError,
-        Image.DecompressionBombWarning,
-        OSError,
-        SyntaxError,
-        ValueError,
-        UnidentifiedImageError,
-    ):
+    except CandidateCollectionFailure:
+        raise
+    except Exception:
         decode_failed = True
     if decode_failed:
         _fail(CandidateCollectionErrorCode.INVALID_IMAGE)
