@@ -79,3 +79,29 @@ exit 0（仅 Git 的 LF/CRLF 工作区提示，无 whitespace error）
 - 本机没有安装 Paddle/GPU runtime；本任务用 fake import boundary 验证 API 和并发契约。真实 Paddle CPU/GPU 镜像构建与 RTX 5090 启动验证属于 Task 13。
 - PaddleX V2 JSON shape 已依据本地 3.x 源码覆盖，但生产镜像仍需固定 Paddle/PaddleX 版本，并在 Task 13 加真实模型 smoke test。
 - HTML/LaTeX 深层有效性、结果持久化、替换资格和原节点回滚属于 Task 7，当前只做 shallow response-contract validation。
+
+## 控制层复审修复（最终补充）
+
+控制层在提交 `0f9a54a` 后给出 `NOT READY`，指出 1 个 Critical 和 2 个 Important。修复提交为：
+
+- `cb287c8`（`fix: harden Paddle result and cancellation handling`）
+
+再次严格按 TDD 完成：
+
+1. 新增继承 `dict`/`Mapping` 且提供 `.json` property 的真实 PaddleX 等价对象。修复前 normalizer 错误读取 raw mapping，回归测试为 RED；修复后优先读取 `.json["res"]`，仅在没有 `.json` contract 时回退到 plain mapping。
+2. 新增 active backend failure 与 queued close rejection 两条调用取消路径，并安装 event-loop exception handler。修复前均捕获到 `Future exception was never retrieved`；修复后 worker 显式保留被取消调用对应的 wrapped future，并在后台完成时消费最终异常，不记录或泄露异常内容。
+3. 新增 `angle=90.0` 回归。修复前被枚举相等性错误接受；修复后仅接受严格的非 bool `int`：`0/90/180/270`。
+
+本轮 RED 证据：定向测试 `4 failed, 12 passed`，四个失败分别覆盖 Mapping `.json`、浮点角度和两条未消费 Future 异常路径。
+
+本轮最终验证（取代上文较早的最终数字）：
+
+```text
+focused Task 6 tests: 100 passed in 0.68s
+full suite: 396 passed, 5 skipped in 3.57s
+pip check: No broken requirements found.
+compileall: exit 0
+git diff --check: exit 0（仅 LF/CRLF 提示）
+```
+
+本补充不改变剩余关注点：真实 Paddle/GPU smoke 仍属于 Task 13，深层 HTML/LaTeX 校验、持久化与替换仍属于 Task 7。
