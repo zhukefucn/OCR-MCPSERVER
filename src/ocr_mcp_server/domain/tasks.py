@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from .models import BatchStatus, FileStatus, ProcessingStage
+from .progress import ProgressCounters, ProgressUnit
 
 
 def _require_utc(value: datetime | None) -> None:
@@ -28,6 +29,9 @@ class BatchSnapshot:
     created_at: datetime
     updated_at: datetime
     version: int
+    processing_files: int = 0
+    queued_files: int = 0
+    current_file_id: str | None = None
 
     def __post_init__(self) -> None:
         _require_utc(self.created_at)
@@ -51,11 +55,49 @@ class FileTaskSnapshot:
     created_at: datetime
     updated_at: datetime
     version: int
+    completed_units: int | None = None
+    total_units: int | None = None
+    progress_unit: ProgressUnit | None = None
 
     def __post_init__(self) -> None:
         _require_utc(self.created_at)
         _require_utc(self.updated_at)
         _require_utc(self.lease_expires_at)
+
+    @property
+    def counters(self) -> ProgressCounters | None:
+        if self.completed_units is None or self.progress_unit is None:
+            return None
+        return ProgressCounters(
+            self.completed_units,
+            self.total_units,
+            self.progress_unit,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class StageEventSnapshot:
+    id: int
+    file_id: str
+    batch_id: str
+    old_status: FileStatus
+    new_status: FileStatus
+    old_stage: ProcessingStage
+    new_stage: ProcessingStage
+    old_progress: int
+    new_progress: int
+    old_completed_units: int | None
+    new_completed_units: int | None
+    old_total_units: int | None
+    new_total_units: int | None
+    old_progress_unit: ProgressUnit | None
+    new_progress_unit: ProgressUnit | None
+    error_code: str | None
+    version: int
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        _require_utc(self.created_at)
 
 
 @dataclass(frozen=True, slots=True)

@@ -58,7 +58,9 @@ async def test_schema_and_sqlite_pragmas_are_explicit(repository) -> None:
     assert busy_timeout == 1777
     assert table_columns["stage_events"] == {
         "id", "file_id", "old_status", "new_status", "old_stage", "new_stage",
-        "old_progress", "new_progress", "error_code", "created_at",
+        "old_progress", "new_progress", "old_completed_units", "new_completed_units",
+        "old_total_units", "new_total_units", "old_progress_unit", "new_progress_unit",
+        "version", "error_code", "created_at",
     }
     forbidden = {"message", "text", "content", "filename", "original_filename"}
     assert not any(forbidden & columns for columns in table_columns.values())
@@ -223,7 +225,7 @@ async def test_transitions_write_safe_events_and_refresh_batch(repository) -> No
     assert (batch.completed_files, batch.failed_files, batch.progress) == (1, 1, 100)
     async with engine.connect() as connection:
         events = (await connection.execute(text("SELECT error_code FROM stage_events ORDER BY id"))).all()
-    assert events == [(None,), (None,), ("ocr_failed",)]
+    assert events == [(None,), (None,), (None,), (None,), ("ocr_failed",)]
     with pytest.raises(StateTransitionError):
         await repo.transition_file(
             completed.id, good.lease_token, status=FileStatus.FAILED,

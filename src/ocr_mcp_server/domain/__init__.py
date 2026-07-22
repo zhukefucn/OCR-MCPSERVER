@@ -27,6 +27,7 @@ from .models import (
     new_id,
     utc_now,
 )
+from .progress import ProgressCounters, ProgressUnit, map_stage_progress
 from .merge import (
     MergePublicationResult,
     ReplacementAuditRecord,
@@ -41,7 +42,13 @@ from .mineru import (
     MinerUProgressStatus,
     MinerUSubmission,
 )
-from .tasks import BatchSnapshot, CreateBatchResult, FileTaskSnapshot, LeaseClaim
+from .tasks import (
+    BatchSnapshot,
+    CreateBatchResult,
+    FileTaskSnapshot,
+    LeaseClaim,
+    StageEventSnapshot,
+)
 from .secondary_ocr import (
     CandidateCollection,
     CandidateReference,
@@ -90,6 +97,8 @@ __all__ = [
     "OrthogonalAngle",
     "PersistenceError",
     "ProcessingStage",
+    "ProgressCounters",
+    "ProgressUnit",
     "ReplacementAuditRecord",
     "ReplacementDecision",
     "ReplacementReason",
@@ -105,10 +114,12 @@ __all__ = [
     "SecondaryResultKind",
     "SecondaryResultState",
     "StateTransitionError",
+    "StageEventSnapshot",
     "StoredFile",
     "SupportedMediaType",
     "CreateBatchResult",
     "FileTaskSnapshot",
     "new_id",
+    "map_stage_progress",
     "utc_now",
 ]

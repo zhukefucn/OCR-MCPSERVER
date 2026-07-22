@@ -24,8 +24,15 @@ from ..domain.models import (
     new_id,
     utc_now,
 )
+from ..domain.progress import ProgressCounters, ProgressUnit, map_stage_progress
 from ..domain.state_machine import aggregate_batch_status, validate_file_transition
-from ..domain.tasks import BatchSnapshot, CreateBatchResult, FileTaskSnapshot, LeaseClaim
+from ..domain.tasks import (
+    BatchSnapshot,
+    CreateBatchResult,
+    FileTaskSnapshot,
+    LeaseClaim,
+    StageEventSnapshot,
+)
 from .database import SessionFactory
 from .task_models import BatchRecord, FileTaskRecord, StageEventRecord
 
@@ -74,6 +81,7 @@ class TaskRepository:
             or not ids
             or any(not item.strip() for item in ids)
             or len(set(ids)) != len(ids)
+            or isinstance(max_attempts, bool)
             or max_attempts < 1
         ):
             raise InputValidationError()
@@ -89,7 +97,10 @@ class TaskRepository:
             completed_files=0,
             failed_files=0,
             cancelled_files=0,
-            progress=0,
+            processing_files=0,
+            queued_files=len(ids),
+            current_file_id=None,
+            progress=12,
             created_at=now,
             updated_at=now,
             version=1,
@@ -101,7 +112,7 @@ class TaskRepository:
                 position=position,
                 status=FileStatus.QUEUED.value,
                 stage=ProcessingStage.QUEUED.value,
-                progress=0,
+                progress=12,
                 attempt_count=0,
                 max_attempts=max_attempts,
                 created_at=now,
@@ -167,6 +178,38 @@ class TaskRepository:
         except SQLAlchemyError as exc:
             raise PersistenceError(cause=exc) from None
 
+    async def list_batch_files(self, batch_id: str) -> tuple[FileTaskSnapshot, ...]:
+        try:
+            async with self._sessions() as session:
+                records = (
+                    await session.scalars(
+                        select(FileTaskRecord)
+                        .where(FileTaskRecord.batch_id == batch_id)
+                        .order_by(FileTaskRecord.position)
+                    )
+                ).all()
+                return tuple(self._file_snapshot(record) for record in records)
+        except SQLAlchemyError as exc:
+            raise PersistenceError(cause=exc) from None
+
+    async def list_batch_events(self, batch_id: str) -> tuple[StageEventSnapshot, ...]:
+        try:
+            async with self._sessions() as session:
+                rows = (
+                    await session.execute(
+                        select(StageEventRecord, FileTaskRecord.batch_id)
+                        .join(FileTaskRecord, StageEventRecord.file_id == FileTaskRecord.id)
+                        .where(FileTaskRecord.batch_id == batch_id)
+                        .order_by(StageEventRecord.id)
+                    )
+                ).all()
+                return tuple(
+                    self._event_snapshot(record, event_batch_id)
+                    for record, event_batch_id in rows
+                )
+        except SQLAlchemyError as exc:
+            raise PersistenceError(cause=exc) from None
+
     async def claim_next(
         self, worker_id: str, *, now: datetime, lease_seconds: int
     ) -> LeaseClaim | None:
@@ -191,6 +234,16 @@ class TaskRepository:
                     await session.commit()
                     return None
                 token = str(uuid4())
+                self._add_event(
+                    session,
+                    record,
+                    FileStatus.PROCESSING,
+                    ProcessingStage.QUEUED,
+                    record.progress,
+                    None,
+                    now,
+                    counters=None,
+                )
                 record.status = FileStatus.PROCESSING.value
                 record.attempt_count += 1
                 record.lease_owner = worker_id
@@ -239,10 +292,19 @@ class TaskRepository:
         status: FileStatus,
         stage: ProcessingStage,
         progress: int,
+        counters: ProgressCounters | None = None,
         error_code: str | None = None,
         now: datetime,
     ) -> FileTaskSnapshot:
         now = _require_time(now)
+        if (
+            not isinstance(status, FileStatus)
+            or not isinstance(stage, ProcessingStage)
+            or isinstance(progress, bool)
+            or not isinstance(progress, int)
+            or (counters is not None and not isinstance(counters, ProgressCounters))
+        ):
+            raise InputValidationError()
         _validate_error_code(error_code)
         try:
             async with self._sessions() as session:
@@ -267,12 +329,23 @@ class TaskRepository:
                     stage,
                     progress,
                 )
+                self._validate_counter_transition(record, stage, counters)
+                if counters is not None and map_stage_progress(stage, counters) != progress:
+                    raise StateTransitionError()
                 self._add_event(
-                    session, record, status, stage, progress, error_code, now
+                    session,
+                    record,
+                    status,
+                    stage,
+                    progress,
+                    error_code,
+                    now,
+                    counters=counters,
                 )
                 record.status = status.value
                 record.stage = stage.value
                 record.progress = progress
+                self._set_counters(record, counters)
                 record.last_error_code = error_code
                 if status in _TERMINAL:
                     self._clear_lease(record)
@@ -285,6 +358,75 @@ class TaskRepository:
             raise
         except SQLAlchemyError as exc:
             raise PersistenceError(cause=exc) from None
+
+    async def update_progress(
+        self,
+        file_id: str,
+        lease_token: str,
+        *,
+        stage: ProcessingStage,
+        counters: ProgressCounters | None = None,
+        now: datetime,
+    ) -> FileTaskSnapshot:
+        if not isinstance(stage, ProcessingStage):
+            raise InputValidationError()
+        progress = map_stage_progress(stage, counters)
+        return await self.transition_file(
+            file_id,
+            lease_token,
+            status=FileStatus.PROCESSING,
+            stage=stage,
+            progress=progress,
+            counters=counters,
+            now=now,
+        )
+
+    async def complete_file(
+        self,
+        file_id: str,
+        lease_token: str,
+        *,
+        with_warnings: bool,
+        now: datetime,
+    ) -> FileTaskSnapshot:
+        if not isinstance(with_warnings, bool):
+            raise InputValidationError()
+        status = (
+            FileStatus.COMPLETED_WITH_WARNINGS
+            if with_warnings
+            else FileStatus.COMPLETED
+        )
+        stage = (
+            ProcessingStage.COMPLETED_WITH_WARNINGS
+            if with_warnings
+            else ProcessingStage.COMPLETED
+        )
+        return await self.transition_file(
+            file_id,
+            lease_token,
+            status=status,
+            stage=stage,
+            progress=100,
+            now=now,
+        )
+
+    async def fail_file(
+        self,
+        file_id: str,
+        lease_token: str,
+        *,
+        error_code: str,
+        now: datetime,
+    ) -> FileTaskSnapshot:
+        return await self.transition_file(
+            file_id,
+            lease_token,
+            status=FileStatus.FAILED,
+            stage=ProcessingStage.FAILED,
+            progress=100,
+            error_code=error_code,
+            now=now,
+        )
 
     async def retry_or_fail(
         self,
@@ -314,11 +456,19 @@ class TaskRepository:
                         100,
                     )
                 self._add_event(
-                    session, record, status, stage, progress, error_code, now
+                    session,
+                    record,
+                    status,
+                    stage,
+                    progress,
+                    error_code,
+                    now,
+                    counters=None,
                 )
                 record.status = status.value
                 record.stage = stage.value
                 record.progress = progress
+                self._set_counters(record, None)
                 record.last_error_code = error_code
                 self._clear_lease(record)
                 record.updated_at = now
@@ -359,11 +509,19 @@ class TaskRepository:
                             100,
                         )
                     self._add_event(
-                        session, record, status, stage, progress, "lease_expired", now
+                        session,
+                        record,
+                        status,
+                        stage,
+                        progress,
+                        "lease_expired",
+                        now,
+                        counters=None,
                     )
                     record.status = status.value
                     record.stage = stage.value
                     record.progress = progress
+                    self._set_counters(record, None)
                     record.last_error_code = "lease_expired"
                     self._clear_lease(record)
                     record.updated_at = now
@@ -405,6 +563,8 @@ class TaskRepository:
         progress: int,
         error_code: str | None,
         now: datetime,
+        *,
+        counters: ProgressCounters | None,
     ) -> None:
         session.add(
             StageEventRecord(
@@ -415,10 +575,49 @@ class TaskRepository:
                 new_stage=stage.value,
                 old_progress=record.progress,
                 new_progress=progress,
+                old_completed_units=record.completed_units,
+                new_completed_units=(
+                    None if counters is None else counters.completed_units
+                ),
+                old_total_units=record.total_units,
+                new_total_units=None if counters is None else counters.total_units,
+                old_progress_unit=record.progress_unit,
+                new_progress_unit=None if counters is None else counters.unit.value,
                 error_code=error_code,
+                version=record.version + 1,
                 created_at=now,
             )
         )
+
+    @staticmethod
+    def _set_counters(
+        record: FileTaskRecord, counters: ProgressCounters | None
+    ) -> None:
+        record.completed_units = None if counters is None else counters.completed_units
+        record.total_units = None if counters is None else counters.total_units
+        record.progress_unit = None if counters is None else counters.unit.value
+
+    @staticmethod
+    def _validate_counter_transition(
+        record: FileTaskRecord,
+        stage: ProcessingStage,
+        counters: ProgressCounters | None,
+    ) -> None:
+        old_stage = ProcessingStage(record.stage)
+        if counters is None or stage is not old_stage or record.completed_units is None:
+            return
+        old_unit = (
+            None if record.progress_unit is None else ProgressUnit(record.progress_unit)
+        )
+        if (
+            counters.unit is not old_unit
+            or counters.completed_units < record.completed_units
+            or (
+                counters.completed_units == record.completed_units
+                and counters.total_units == record.total_units
+            )
+        ):
+            raise StateTransitionError()
 
     async def _refresh_batch(self, session, batch_id: str, now: datetime) -> None:
         batch = await session.get(BatchRecord, batch_id)
@@ -432,7 +631,20 @@ class TaskRepository:
         batch.completed_files = sum(status in {FileStatus.COMPLETED, FileStatus.COMPLETED_WITH_WARNINGS} for status in statuses)
         batch.failed_files = sum(status is FileStatus.FAILED for status in statuses)
         batch.cancelled_files = sum(status is FileStatus.CANCELLED for status in statuses)
-        batch.progress = sum(item.progress for item in files) // len(files)
+        batch.processing_files = sum(status is FileStatus.PROCESSING for status in statuses)
+        batch.queued_files = sum(status is FileStatus.QUEUED for status in statuses)
+        batch.current_file_id = next(
+            (
+                item.id
+                for item in sorted(files, key=lambda candidate: candidate.position)
+                if FileStatus(item.status) is FileStatus.PROCESSING
+            ),
+            None,
+        )
+        average = sum(item.progress for item in files) // len(files)
+        if any(status not in _TERMINAL for status in statuses):
+            average = min(99, average)
+        batch.progress = max(batch.progress, average)
         batch.updated_at = now
         batch.version += 1
 
@@ -446,6 +658,9 @@ class TaskRepository:
             completed_files=record.completed_files,
             failed_files=record.failed_files,
             cancelled_files=record.cancelled_files,
+            processing_files=record.processing_files,
+            queued_files=record.queued_files,
+            current_file_id=record.current_file_id,
             progress=record.progress,
             created_at=_utc(record.created_at),
             updated_at=_utc(record.updated_at),
@@ -470,4 +685,44 @@ class TaskRepository:
             created_at=_utc(record.created_at),
             updated_at=_utc(record.updated_at),
             version=record.version,
+            completed_units=record.completed_units,
+            total_units=record.total_units,
+            progress_unit=(
+                None
+                if record.progress_unit is None
+                else ProgressUnit(record.progress_unit)
+            ),
+        )
+
+    @staticmethod
+    def _event_snapshot(
+        record: StageEventRecord, batch_id: str
+    ) -> StageEventSnapshot:
+        return StageEventSnapshot(
+            id=record.id,
+            file_id=record.file_id,
+            batch_id=batch_id,
+            old_status=FileStatus(record.old_status),
+            new_status=FileStatus(record.new_status),
+            old_stage=ProcessingStage(record.old_stage),
+            new_stage=ProcessingStage(record.new_stage),
+            old_progress=record.old_progress,
+            new_progress=record.new_progress,
+            old_completed_units=record.old_completed_units,
+            new_completed_units=record.new_completed_units,
+            old_total_units=record.old_total_units,
+            new_total_units=record.new_total_units,
+            old_progress_unit=(
+                None
+                if record.old_progress_unit is None
+                else ProgressUnit(record.old_progress_unit)
+            ),
+            new_progress_unit=(
+                None
+                if record.new_progress_unit is None
+                else ProgressUnit(record.new_progress_unit)
+            ),
+            error_code=record.error_code,
+            version=record.version,
+            created_at=_utc(record.created_at),
         )
