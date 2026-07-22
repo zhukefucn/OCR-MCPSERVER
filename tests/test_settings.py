@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tomllib
 
 import pytest
 from pydantic import ValidationError
@@ -28,6 +29,62 @@ def test_settings_defaults_match_domain_constraints() -> None:
     assert settings.secondary_ocr.engine is SecondaryOCREngine.PP_STRUCTURE_V3
     assert settings.database.url == "sqlite+aiosqlite:///data/ocr.sqlite3"
     assert settings.database.busy_timeout_ms == 5000
+    assert settings.remote_import.allowed_hosts == []
+    assert settings.remote_import.max_redirects == 3
+    assert settings.remote_import.timeout_seconds == 30
+    assert settings.remote_import.max_image_pixels == 100_000_000
+
+
+def test_remote_import_hosts_are_canonicalized_and_deduplicated() -> None:
+    settings = AppSettings(
+        remote_import={"allowed_hosts": ["FILES.Example.COM.", "files.example.com"]}
+    )
+
+    assert settings.remote_import.allowed_hosts == ["files.example.com"]
+
+
+@pytest.mark.parametrize(
+    "host", ["*.example.com", "127.0.0.1", "::1", "bad host", ""]
+)
+def test_remote_import_rejects_wildcards_ip_literals_and_invalid_hosts(
+    host: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(remote_import={"allowed_hosts": [host]})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_redirects", -1),
+        ("max_redirects", 11),
+        ("timeout_seconds", 0),
+        ("max_image_pixels", 0),
+    ],
+)
+def test_remote_import_rejects_out_of_range_limits(field: str, value: object) -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(remote_import={field: value})
+
+
+def test_project_metadata_declares_file_intake_dependencies() -> None:
+    metadata = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    runtime = metadata["project"]["dependencies"]
+    development = metadata["project"]["optional-dependencies"]["dev"]
+
+    assert "httpx>=0.28,<0.29" in runtime
+    assert "Pillow>=11,<12" in runtime
+    assert "pypdf>=5,<6" in runtime
+    assert "respx>=0.22,<0.23" in development
+
+
+def test_example_yaml_documents_remote_import_defaults() -> None:
+    settings = load_settings(config_file=Path("config/example.yaml"))
+
+    assert settings.remote_import.allowed_hosts == []
+    assert settings.remote_import.max_redirects == 3
+    assert settings.remote_import.timeout_seconds == 30
+    assert settings.remote_import.max_image_pixels == 100_000_000
 
 
 @pytest.mark.parametrize(

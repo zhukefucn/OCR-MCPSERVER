@@ -14,6 +14,12 @@ limits:
   max_pages: 500
   max_batch_size_bytes: 1073741824
 
+remote_import:
+  allowed_hosts: []
+  max_redirects: 3
+  timeout_seconds: 30
+  max_image_pixels: 100000000
+
 retention:
   input_hours: 24
   intermediate_hours: 24

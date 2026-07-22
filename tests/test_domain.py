@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from datetime import UTC
+from pathlib import Path
 from uuid import UUID
+
+import pytest
 
 from ocr_mcp_server.domain.constants import (
     DEFAULT_AUDIT_METADATA_RETENTION_DAYS,
@@ -16,11 +19,14 @@ from ocr_mcp_server.domain.constants import (
 )
 from ocr_mcp_server.domain.errors import (
     ConfigurationError,
+    FileIntakeErrorCode,
+    FileIntakeFailure,
     InputValidationError,
     LeaseConflictError,
     PersistenceError,
     StateTransitionError,
 )
+from ocr_mcp_server.domain.files import IncomingFile, StoredFile, SupportedMediaType
 from ocr_mcp_server.domain.models import (
     BatchStatus,
     FileStatus,
@@ -108,9 +114,59 @@ def test_domain_errors_expose_stable_code_and_safe_message_only() -> None:
     assert str(input_error) == "Input validation failed."
     assert "recognized private business text" not in str(config_error)
     assert "recognized private business text" not in str(input_error)
+    assert "recognized private business text" not in repr(vars(config_error))
+    assert "recognized private business text" not in repr(vars(input_error))
     assert state_error.code == "state_transition_invalid"
     assert str(state_error) == "Task state transition is invalid."
     assert lease_error.code == "lease_conflict"
     assert str(lease_error) == "Task lease is invalid or expired."
     assert persistence_error.code == "persistence_error"
     assert str(persistence_error) == "Task persistence operation failed."
+
+
+async def _empty_chunks():
+    if False:
+        yield b""
+
+
+def test_file_domain_contracts_are_minimal_and_immutable() -> None:
+    incoming = IncomingFile(
+        display_name="customer.pdf",
+        declared_mime="application/pdf",
+        content=_empty_chunks(),
+    )
+    stored = StoredFile(
+        file_id="1bf917b8-6630-43c1-8ee8-510ad7efe819",
+        path=Path("data/1bf917b8-6630-43c1-8ee8-510ad7efe819.pdf"),
+        sha256="0" * 64,
+        size_bytes=123,
+        media_type=SupportedMediaType.PDF,
+        extension=".pdf",
+        page_count=1,
+        width=None,
+        height=None,
+    )
+
+    assert incoming.display_name == "customer.pdf"
+    assert {item.value for item in SupportedMediaType} == {
+        "application/pdf",
+        "image/png",
+        "image/jpeg",
+    }
+    assert not hasattr(stored, "display_name")
+    with pytest.raises((AttributeError, TypeError)):
+        stored.size_bytes = 124  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("code", list(FileIntakeErrorCode))
+def test_file_intake_failures_expose_only_fixed_safe_fields(
+    code: FileIntakeErrorCode,
+) -> None:
+    secret = "https://user:password@example.test/customer-secret.pdf"
+    failure = FileIntakeFailure(code, cause=RuntimeError(secret))
+
+    assert failure.code == code.value
+    assert failure.safe_message
+    assert secret not in str(failure)
+    assert secret not in repr(failure)
+    assert secret not in repr(vars(failure))

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import ipaddress
 from pathlib import Path
+import re
 from typing import Any, Literal
 
 import yaml
@@ -51,6 +53,41 @@ class LimitsSettings(_SettingsSection):
     max_batch_size_bytes: int = Field(default=DEFAULT_MAX_BATCH_SIZE_BYTES, ge=1)
 
 
+class RemoteImportSettings(_SettingsSection):
+    allowed_hosts: list[str] = Field(default_factory=list)
+    max_redirects: int = Field(default=3, ge=0, le=10)
+    timeout_seconds: float = Field(default=30, gt=0)
+    max_image_pixels: int = Field(default=100_000_000, ge=1)
+
+    @field_validator("allowed_hosts")
+    @classmethod
+    def canonicalize_allowed_hosts(cls, values: list[str]) -> list[str]:
+        canonical: list[str] = []
+        for value in values:
+            candidate = value.strip().rstrip(".").lower()
+            try:
+                ipaddress.ip_address(candidate)
+            except ValueError:
+                pass
+            else:
+                raise ValueError("IP literals are not allowed")
+            try:
+                candidate = candidate.encode("idna").decode("ascii")
+            except UnicodeError as exc:
+                raise ValueError("invalid hostname") from exc
+            if len(candidate) > 253 or not candidate:
+                raise ValueError("invalid hostname")
+            labels = candidate.split(".")
+            if any(
+                not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                for label in labels
+            ):
+                raise ValueError("invalid hostname")
+            if candidate not in canonical:
+                canonical.append(candidate)
+        return canonical
+
+
 class RetentionSettings(_SettingsSection):
     input_hours: int = Field(default=DEFAULT_INPUT_RETENTION_HOURS, ge=1)
     intermediate_hours: int = Field(
@@ -96,6 +133,7 @@ class AppSettings(BaseSettings):
     server: ServerSettings = Field(default_factory=ServerSettings)
     data_root: Path = Path("data")
     limits: LimitsSettings = Field(default_factory=LimitsSettings)
+    remote_import: RemoteImportSettings = Field(default_factory=RemoteImportSettings)
     retention: RetentionSettings = Field(default_factory=RetentionSettings)
     mineru: MinerUSettings = Field(default_factory=MinerUSettings)
     secondary_ocr: SecondaryOCRSettings = Field(default_factory=SecondaryOCRSettings)

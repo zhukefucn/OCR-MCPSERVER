@@ -29,12 +29,15 @@ def test_project_metadata_declares_python_dependencies_and_entrypoint() -> None:
         "pyyaml",
         "sqlalchemy",
         "aiosqlite",
+        "httpx",
+        "pillow",
+        "pypdf",
     }
     development_names = {
         dependency.split("<", 1)[0].split(">", 1)[0].split("=", 1)[0].lower()
         for dependency in project["optional-dependencies"]["dev"]
     }
-    assert development_names >= {"pytest", "pytest-asyncio", "httpx"}
+    assert development_names >= {"pytest", "pytest-asyncio", "respx"}
 
     metadata_text = pyproject_path.read_text(encoding="utf-8").lower()
     for prohibited in (
