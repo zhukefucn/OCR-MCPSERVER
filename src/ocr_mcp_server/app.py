@@ -29,6 +29,15 @@ _SAFE_ROUTE_TEMPLATE = re.compile(
 )
 
 
+class _ObservedFastAPI(FastAPI):
+    def build_middleware_stack(self):
+        stack = super().build_middleware_stack()
+        configuration = getattr(self, "_http_observability", None)
+        if configuration is None:
+            return stack
+        return HttpObservabilityMiddleware(stack, **configuration)
+
+
 def create_app(
     settings: AppSettings | None = None,
     *,
@@ -43,7 +52,7 @@ def create_app(
     resolved_settings = settings if settings is not None else load_settings()
     mcp_server = create_mcp_server(gateway)
     mcp_app = mcp_server.http_app(path="/mcp")
-    app = FastAPI(
+    app = _ObservedFastAPI(
         title="OCR MCP Server",
         routes=[*mcp_app.routes],
         lifespan=mcp_app.lifespan,
@@ -110,13 +119,12 @@ def create_app(
         and _SAFE_ROUTE_TEMPLATE.fullmatch(route.path) is not None
     )
     app.add_middleware(ApiKeyAuthMiddleware, settings=resolved_settings.auth)
-    app.add_middleware(
-        HttpObservabilityMiddleware,
-        sink=resolved_observability,
-        logger=resolved_logger,
-        route_templates=route_templates,
-        clock=clock,
-    )
+    app._http_observability = {
+        "sink": resolved_observability,
+        "logger": resolved_logger,
+        "route_templates": route_templates,
+        "clock": clock,
+    }
     return app
 
 

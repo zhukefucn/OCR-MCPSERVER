@@ -177,6 +177,41 @@ def test_observability_outputs_exclude_request_canaries() -> None:
     assert all(canary not in outputs for canary in canaries)
 
 
+def test_unhandled_exception_final_500_is_observed_once_by_outer_boundary() -> None:
+    sink = RecordingSink()
+    logger = RecordingLogger()
+    app = create_app(
+        AppSettings(auth={"api_keys": ["a-secure-api-key-0000000000000001"]}),
+        registry=CollectorRegistry(),
+        observability=sink,
+        event_logger=logger,
+        clock=iter((1.0, 1.2)).__next__,
+    )
+
+    @app.get("/explode")
+    async def explode() -> None:
+        raise RuntimeError("TOP_SECRET_EXCEPTION_CANARY")
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get(
+            "/explode",
+            headers={"X-API-Key": "a-secure-api-key-0000000000000001"},
+        )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": {
+            "code": "internal_error",
+            "message": "The request could not be completed.",
+        }
+    }
+    assert len(sink.observations) == 1
+    assert sink.observations[0].status_class == "5xx"
+    assert len(logger.events) == 1
+    outputs = response.text + repr(sink.observations) + repr(logger.events)
+    assert "TOP_SECRET_EXCEPTION_CANARY" not in outputs
+
+
 @pytest.mark.asyncio
 async def test_middleware_does_not_buffer_streaming_request_or_response() -> None:
     request_chunks = [

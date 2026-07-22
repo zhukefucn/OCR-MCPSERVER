@@ -66,6 +66,23 @@ def _count(value: object) -> bool:
     )
 
 
+def _snapshot(event: object) -> SafeLogEvent:
+    if type(event) is not SafeLogEvent:
+        raise _invalid()
+    return SafeLogEvent(
+        event=object.__getattribute__(event, "event"),
+        batch_id=object.__getattribute__(event, "batch_id"),
+        file_id=object.__getattribute__(event, "file_id"),
+        recovery_id=object.__getattribute__(event, "recovery_id"),
+        stage=object.__getattribute__(event, "stage"),
+        error_code=object.__getattribute__(event, "error_code"),
+        duration_ms=object.__getattribute__(event, "duration_ms"),
+        item_count=object.__getattribute__(event, "item_count"),
+        success_count=object.__getattribute__(event, "success_count"),
+        failure_count=object.__getattribute__(event, "failure_count"),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SafeLogEvent:
     """A finite event whose fields cannot carry arbitrary business content."""
@@ -114,8 +131,9 @@ class JsonEventFormatter(logging.Formatter):
     """Format only the validated event attached by :class:`SafeEventLogger`."""
 
     def format(self, record: logging.LogRecord) -> str:
-        event = getattr(record, "safe_event", None)
-        if not isinstance(event, SafeLogEvent):
+        try:
+            event = _snapshot(getattr(record, "safe_event", None))
+        except Exception:
             event = SafeLogEvent(event=SafeLogEventName.OBSERVABILITY_FAILURE)
         payload: dict[str, object] = {
             "timestamp": datetime.fromtimestamp(record.created, UTC)
@@ -141,8 +159,7 @@ class SafeEventLogger:
         self._logger = logger
 
     def emit(self, event: SafeLogEvent) -> None:
-        if not isinstance(event, SafeLogEvent):
-            raise _invalid()
+        snapshot = _snapshot(event)
         try:
             record = self._logger.makeRecord(
                 self._logger.name,
@@ -153,7 +170,7 @@ class SafeEventLogger:
                 (),
                 None,
             )
-            record.safe_event = event
+            record.safe_event = snapshot
             self._logger.handle(record)
         except Exception:
             return

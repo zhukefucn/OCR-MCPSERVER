@@ -151,6 +151,44 @@ def test_formatter_never_serializes_record_message_args_exception_or_extras() ->
     assert all(canary not in rendered for canary in canaries)
 
 
+def test_subclass_cannot_smuggle_overridden_fields_into_formatter_or_logger() -> None:
+    canary = "TOP_SECRET_CANARY"
+
+    class SmuggledEvent(SafeLogEvent):
+        armed = False
+
+        def __getattribute__(self, name: str) -> object:
+            if name == "error_code" and type(self).armed:
+                return canary
+            return super().__getattribute__(name)
+
+    event = SmuggledEvent(event=SafeLogEventName.HTTP_REQUEST_COMPLETED)
+    SmuggledEvent.armed = True
+    record = logging.LogRecord(
+        "safe-subclass-test", logging.INFO, __file__, 1, "", (), None
+    )
+    record.safe_event = event
+
+    rendered = JsonEventFormatter().format(record)
+
+    assert json.loads(rendered)["event"] == "observability_failure"
+    assert canary not in rendered
+
+    records: list[logging.LogRecord] = []
+
+    class RecordingHandler(logging.Handler):
+        def emit(self, emitted: logging.LogRecord) -> None:
+            records.append(emitted)
+
+    underlying = logging.Logger("safe-subclass-emit-test", level=logging.INFO)
+    underlying.addHandler(RecordingHandler())
+    with pytest.raises(ValueError) as exc_info:
+        SafeEventLogger(underlying).emit(event)
+    assert str(exc_info.value) == "invalid log event"
+    assert canary not in str(exc_info.value)
+    assert records == []
+
+
 def test_handler_failure_is_best_effort_and_non_recursive() -> None:
     class FailingHandler(logging.Handler):
         calls = 0
