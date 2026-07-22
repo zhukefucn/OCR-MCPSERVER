@@ -68,3 +68,32 @@ exit 0, no output
 - 鉴权不再保存/比较可变长度原始 key。配置 key 与来访凭据先计算固定 32-byte SHA-256 digest，再对每个已配置 digest 执行 `hmac.compare_digest`；冲突的双凭据也使用固定长度 digest 比较。
 - 最终 focused API/MCP/settings/app：`119 passed`。
 - 最终提交后的仓库全套：`715 passed, 13 skipped in 12.01s`；`pip check`、`compileall -q src tests`、`git diff --check 1624c6b..HEAD` 均 exit 0，worktree clean。
+
+## 独立审查 Important 收口
+
+独立审查在 `97af3f8` 返回 NOT READY（5 Important）。所有问题均先以确定性回归复现，再在 `6887183` 修复：
+
+1. FastMCP SDK-level JSON Schema 校验在 middleware 外回显输入值，unknown tool 回显工具名，未验证的 gateway dict 还能把额外业务字段写入 MCP content。RED 原样出现 `SENSITIVE_INPUT_VALUE`、`unknown-SENSITIVE_TOOL_VALUE` 和 `SENSITIVE_OUTPUT_VALUE`。服务现禁用外层 SDK prevalidation，让相同公开 schema 在 FunctionTool/safe middleware 内验证；`_SafeFastMCP` 统一封装 middleware 外错误；每个工具在返回框架前显式用对应严格 DTO 验证 gateway 输出。三类协议错误现在分别稳定为安全 `invalid_request`、`not_found`、`internal_error`，不含原值。
+2. FastAPI `response_model` 在 route wrapper 外验证，恶意 gateway 额外字段触发的 `ResponseValidationError` 包含 `SENSITIVE_GATEWAY_OUTPUT` 并被 ServerErrorMiddleware 重抛。每条 REST gateway 调用现于 route 内显式 `model_validate` 对应响应 DTO，并将任何输出异常转成无 cause `GatewayFailure`；默认 `raise_server_exceptions=True` 回归返回安全 500 而不重抛。
+3. `AuthenticationSettings` 的 before validator 会在 Pydantic `str(exc)`、`errors()` 和 `json()` 中保留完整无效/重复 key。配置模型现在在进入 Pydantic 错误构造前，把合法 key 包装成 `SecretStr`，把任何非法集合替换为无秘密哨兵；三种错误表示均不含原 key。
+4. 方向恢复页码原先会把 Boolean、整值 float 和数字字符串转换为 int。公开 DTO 和 MCP schema 现在使用 `StrictInt`；REST/MCP 回归证明 `true`、`1.0`、`"1"` 均在 gateway 前拒绝。
+5. 上传路由原先通过 `Headers.get()` 合并/隐藏重复元数据。现在直接枚举 ASGI `scope["headers"]`，对重复 `X-Document-Name`、`Idempotency-Key`、`Content-Type`（即使值相同）返回安全 422，且 gateway 调用数为 0。
+
+审查修复后的验证：
+
+```text
+.\.venv\Scripts\python.exe -m pytest tests/test_api_contracts.py tests/test_api_auth.py tests/test_rest_api.py tests/test_mcp_api.py tests/test_settings.py tests/test_app.py -q
+129 passed
+
+.\.venv\Scripts\python.exe -m pytest -rs
+725 passed, 13 skipped in 12.38s
+
+.\.venv\Scripts\python.exe -m pip check
+No broken requirements found.
+
+.\.venv\Scripts\python.exe -m compileall -q src tests
+exit 0
+
+git diff --check 97af3f8..HEAD
+exit 0
+```
