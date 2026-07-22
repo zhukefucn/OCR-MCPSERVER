@@ -120,3 +120,57 @@ These four commands are rerun once more after the report commit so the controlle
 - Existing databases are intentionally MVP-local and receive no Alembic migration, exactly as directed. A pre-Task-8 local database must be recreated before using the expanded schema.
 - Pipeline implementations must honor the injected cancellation context between their own internal steps. The service also cancels the task and the repository independently rejects stale lease writes, so durable state remains safe even if injected code is slow to cooperate.
 - Same-stage throttling intentionally does not retain an unbounded delayed notification backlog. Suppressed intermediate updates remain fully visible through authoritative polling; the next material update after the interval or the next stage/terminal transition is emitted.
+
+## Independent review closure
+
+Independent review initially returned NOT READY with three Important findings. Commit `2ece9ea` closes all three.
+
+### Review finding 1: retry resume after meaningful progress
+
+- Root cause: `retry_or_fail` correctly retained the achieved percentage while resetting the durable stage to `QUEUED`, but `update_progress` passed the next attempt's raw early-stage mapping into the general monotonic transition check. A file at `MERGING`/91 therefore rejected attempt 2's valid `MINERU_PARSING`/16 mapping.
+- RED command: `python -m pytest -p no:cacheprovider tests/test_task_progress_repository.py::test_retry_attempt_restarts_stages_without_regressing_achieved_progress -vv`
+- RED result: one failure at `validate_file_transition`; old stage/progress were `QUEUED`/91 and the new stage/raw progress were `MINERU_PARSING`/16, producing `StateTransitionError`.
+- Fix: repository-supported progress updates clamp the mapped percentage to the already achieved percentage only when `attempt_count > 1`. The normal stage-order validator remains unchanged, so a retry attempt may advance from its queued restart marker but cannot report an arbitrary backward stage within that attempt. Exact counters continue advancing independently while the display percentage is held at its durable floor.
+- GREEN command: the same focused command.
+- GREEN result: `1 passed`.
+- Repository regression also proves `MINERU_PARSING` then `COLLECTING_IMAGES` remain at 91 and a backward report to `MINERU_PARSING` is rejected.
+- Orchestration integration command: `python -m pytest -p no:cacheprovider tests/test_orchestration.py::test_retry_unknown_and_nonretryable_failures_are_safe_and_siblings_continue -vv`
+- Integration result: `1 passed`; attempt 1 reaches `MERGING`/91, attempt 2 persists `MINERU_PARSING`/91, and the file completes without becoming `pipeline_unexpected`.
+
+### Review finding 2: recovery notifications
+
+- Root cause: `recover_expired_leases` committed durable transitions/events but returned only an integer count, so startup and periodic service paths could wake workers but could not construct notifications from the exact committed state.
+- Repository RED command: `python -m pytest -p no:cacheprovider tests/test_task_repository.py::test_restart_recovers_only_expired_processing_tasks -vv`
+- Repository RED result: one failure with `TypeError: 'int' object is not iterable` when the test required immutable recovered snapshots.
+- Repository fix: recovery now returns a deterministic ordered tuple of post-commit `FileTaskSnapshot` values for both requeue and exhausted terminal transitions.
+- Repository GREEN result: `1 passed` for the same command.
+- Service RED command: `python -m pytest -p no:cacheprovider tests/test_orchestration.py::test_startup_recovery_emits_committed_requeue_and_terminal_notifications_even_if_sink_fails tests/test_orchestration.py::test_periodic_recovery_emits_requeue_before_the_recovered_file_is_reclaimed -vv`
+- Service RED result: `2 failed`; startup produced no recovery notifications and periodic recovery never exposed a committed `QUEUED` notification.
+- Service fix: startup and periodic recovery emit each returned snapshot through the existing content-free notifier after the repository call commits and before the recovery path enqueues its wake token. Sink exceptions remain swallowed and polling remains authoritative.
+- The periodic regression then exposed a related immediate-transition predicate defect: after recovery `QUEUED`, the next committed `PROCESSING` claim had unchanged percentage/counters and was suppressed as “not material.” The notifier now lets immediate status/stage/terminal changes bypass incremental-material/throttle checks while retaining version and progress monotonic guards.
+- Final GREEN result for the two service tests: `2 passed`.
+- Coverage proves startup requeue plus exhausted `FAILED`/100 notification, periodic requeue before reclaim notification, notification/event version consistency, and nonfatal sink failure without unsafe content retention.
+
+### Review finding 3: transient repository error worker loss
+
+- Root cause: `_worker` had no `DomainError` boundary around `claim_next` or claim execution. Its task callback consumed the safe exception, but the only worker task terminated permanently.
+- RED command: `python -m pytest -p no:cacheprovider tests/test_orchestration.py::test_transient_claim_persistence_error_returns_worker_to_idle_poll_without_leaking -vv`
+- RED result: one failure with `TimeoutError`; after a one-shot `PersistenceError`, the idle poll woke but the pipeline was never entered because the worker no longer existed.
+- Fix: a safe `DomainError` ends the current drain cycle and returns the worker to the outer wake wait. A `PersistenceError` arising during claim execution is propagated to that boundary instead of being converted to `pipeline_unexpected`. The worker performs no retry loop or delay spin; durable idle polling supplies the later wake.
+- GREEN result for the same command: `1 passed`.
+- Coverage confirms the queued file is eventually claimed and completed on the next manual idle wake, the worker remains alive, and adversarial cause text is absent from captured logs.
+
+### Review-fix verification
+
+- Focused Task 8 command: `python -m pytest -p no:cacheprovider tests/test_progress.py tests/test_task_progress_repository.py tests/test_task_repository.py tests/test_state_machine.py tests/test_settings.py tests/test_orchestration.py -q`
+  - Exit 0; all focused tests passed.
+- Full suite before review-fix commit: `python -m pytest -p no:cacheprovider`
+  - Exit 0: `581 passed, 5 skipped in 6.00s`.
+- `python -m pip check`
+  - Exit 0: `No broken requirements found.`
+- `python -m compileall -q src tests`
+  - Exit 0 with no output.
+- `git diff --check`
+  - Exit 0 with no whitespace errors.
+
+The full mandated gate is rerun after this report update so the controller receives final-HEAD verification.
