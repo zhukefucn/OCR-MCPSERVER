@@ -939,10 +939,11 @@ class FileStorage:
     ) -> None:
         import msvcrt
 
-        stable_directory_path = cls._windows_final_path(directory_handle)
-        encoded_name = str(Path(stable_directory_path) / target_name).encode(
-            "utf-16-le"
-        )
+        if Path(target_name).name != target_name or any(
+            separator in target_name for separator in ("/", "\\")
+        ):
+            raise OSError("target must be a simple relative name")
+        encoded_name = target_name.encode("utf-16-le")
 
         class _RenameInfo(ctypes.Structure):
             _fields_ = (
@@ -952,50 +953,52 @@ class FileStorage:
                 ("FileName", wintypes.WCHAR * 1),
             )
 
+        class _IoStatusBlock(ctypes.Structure):
+            _fields_ = (
+                ("Status", ctypes.c_void_p),
+                ("Information", ctypes.c_size_t),
+            )
+
         name_offset = _RenameInfo.FileName.offset
-        buffer = ctypes.create_string_buffer(name_offset + len(encoded_name) + 2)
+        buffer = ctypes.create_string_buffer(
+            ctypes.sizeof(_RenameInfo) + len(encoded_name)
+        )
         info = ctypes.cast(buffer, ctypes.POINTER(_RenameInfo)).contents
         info.ReplaceIfExists = False
-        info.RootDirectory = None
+        info.RootDirectory = directory_handle
         info.FileNameLength = len(encoded_name)
         ctypes.memmove(
             ctypes.addressof(buffer) + name_offset,
             encoded_name,
             len(encoded_name),
         )
-        function = cls._windows_kernel32().SetFileInformationByHandle
+        function = ctypes.WinDLL("ntdll", use_last_error=True).NtSetInformationFile
         function.argtypes = (
             wintypes.HANDLE,
-            ctypes.c_int,
+            ctypes.POINTER(_IoStatusBlock),
             wintypes.LPVOID,
-            wintypes.DWORD,
+            wintypes.ULONG,
+            ctypes.c_int,
         )
-        function.restype = wintypes.BOOL
+        function.restype = ctypes.c_long
         handle = msvcrt.get_osfhandle(descriptor)
-        if not function(handle, 3, buffer, len(buffer)):
-            error_number = ctypes.get_last_error()
-            if error_number in (80, 183):
-                raise FileExistsError(error_number, "target exists")
-            raise ctypes.WinError(error_number)
-
-    @classmethod
-    def _windows_final_path(cls, handle: int) -> str:
-        function = cls._windows_kernel32().GetFinalPathNameByHandleW
-        function.argtypes = (
-            wintypes.HANDLE,
-            wintypes.LPWSTR,
-            wintypes.DWORD,
-            wintypes.DWORD,
+        io_status = _IoStatusBlock()
+        status = function(
+            handle,
+            ctypes.byref(io_status),
+            buffer,
+            len(buffer),
+            10,
         )
-        function.restype = wintypes.DWORD
-        required = function(handle, None, 0, 0)
-        if required == 0:
-            raise ctypes.WinError(ctypes.get_last_error())
-        buffer = ctypes.create_unicode_buffer(required + 1)
-        written = function(handle, buffer, len(buffer), 0)
-        if written == 0 or written >= len(buffer):
-            raise ctypes.WinError(ctypes.get_last_error())
-        return buffer.value
+        if status == 0:
+            return
+        unsigned_status = status & 0xFFFFFFFF
+        if unsigned_status == 0xC0000035:
+            raise FileExistsError(183, "target exists")
+        converter = ctypes.WinDLL("ntdll").RtlNtStatusToDosError
+        converter.argtypes = (ctypes.c_long,)
+        converter.restype = wintypes.ULONG
+        raise ctypes.WinError(converter(status))
 
     @classmethod
     def _windows_delete_open_file(cls, descriptor: int) -> None:

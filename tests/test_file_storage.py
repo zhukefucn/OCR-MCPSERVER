@@ -340,6 +340,68 @@ async def test_windows_publication_uses_open_handle_after_staged_name_swap(
     assert not (input_dir / ".held-original").exists()
 
 
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle publication regression")
+async def test_windows_target_path_redirection_cannot_redirect_handle_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root = tmp_path / "data"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    redirected_target = tmp_path / "redirected-target"
+    batch_id = str(uuid4())
+    input_dir = data_root / batch_id / "input"
+    payload = _pdf_bytes()
+    storage = FileStorage(data_root)
+    path_resolution_attempted = False
+
+    def redirect_resolved_target(cls, handle: int) -> str:
+        nonlocal path_resolution_attempted
+        path_resolution_attempted = True
+        first_link = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(redirected_target), str(input_dir)],
+            capture_output=True,
+            check=False,
+        )
+        if first_link.returncode != 0:
+            raise RuntimeError("initial target junction creation unavailable")
+        os.rmdir(redirected_target)
+        redirected_link = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(redirected_target), str(outside)],
+            capture_output=True,
+            check=False,
+        )
+        if redirected_link.returncode != 0:
+            raise RuntimeError("target junction redirection unavailable")
+        return str(redirected_target)
+
+    monkeypatch.setattr(
+        FileStorage,
+        "_windows_final_path",
+        classmethod(redirect_resolved_target),
+        raising=False,
+    )
+
+    try:
+        try:
+            stored = await storage.store(
+                batch_id,
+                IncomingFile("document.pdf", "application/pdf", _chunks(payload)),
+                max_file_size_bytes=10_000,
+                validator=_validator(),
+            )
+        except FileIntakeFailure as failure:
+            assert failure.code == "path_unsafe"
+        else:
+            assert stored.path.read_bytes() == payload
+
+        assert path_resolution_attempted is False
+        assert not list(outside.iterdir())
+    finally:
+        if os.path.lexists(redirected_target):
+            os.rmdir(redirected_target)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX anchored directory scan")
 def test_posix_batch_usage_never_uses_pathname_scandir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -467,13 +529,19 @@ def test_batch_usage_oserror_has_no_sensitive_exception_context(
     batch_id = str(uuid4())
     (data_root / batch_id / "input").mkdir(parents=True)
 
-    def failed_scan(path):
+    storage = FileStorage(data_root)
+    scan_triggered = False
+
+    def failed_scan(directory):
+        nonlocal scan_triggered
+        scan_triggered = True
         raise OSError("sensitive directory scan detail")
 
-    monkeypatch.setattr(os, "scandir", failed_scan)
+    monkeypatch.setattr(storage, "_list_names", failed_scan)
     with pytest.raises(FileIntakeFailure) as exc_info:
-        FileStorage(data_root).batch_usage(batch_id)
+        storage.batch_usage(batch_id)
 
+    assert scan_triggered is True
     assert exc_info.value.code == "path_unsafe"
     assert exc_info.value.__context__ is None
     assert exc_info.value.__cause__ is None
@@ -483,7 +551,18 @@ def test_batch_usage_oserror_has_no_sensitive_exception_context(
 async def test_public_store_sanitizes_atomic_publish_oserror(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def failed_publish(storage, directory, source_name, target_name):
+    publish_triggered = False
+
+    def failed_publish(
+        storage,
+        directory,
+        source_name,
+        target_name,
+        *,
+        descriptor: int | None = None,
+    ):
+        nonlocal publish_triggered
+        publish_triggered = True
         raise OSError("sensitive atomic publish detail")
 
     monkeypatch.setattr(FileStorage, "_publish_no_replace", failed_publish)
@@ -497,6 +576,7 @@ async def test_public_store_sanitizes_atomic_publish_oserror(
             validator=_validator(),
         )
 
+    assert publish_triggered is True
     assert exc_info.value.code == "path_unsafe"
     assert exc_info.value.__context__ is None
     assert exc_info.value.__cause__ is None
