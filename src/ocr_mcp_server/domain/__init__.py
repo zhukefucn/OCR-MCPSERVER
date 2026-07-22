@@ -1,6 +1,8 @@
 """Shared domain contracts for the OCR service."""
 
 from .errors import (
+    CandidateCollectionErrorCode,
+    CandidateCollectionFailure,
     ConfigurationError,
     DomainError,
     FileIntakeErrorCode,
@@ -29,10 +31,30 @@ from .mineru import (
     MinerUSubmission,
 )
 from .tasks import BatchSnapshot, CreateBatchResult, FileTaskSnapshot, LeaseClaim
+from .secondary_ocr import (
+    CandidateCollection,
+    CandidateReference,
+    CandidateSourceKind,
+    ImageCandidate,
+    MinerUImageFormat,
+    OrthogonalAngle,
+    SecondaryContentFormat,
+    SecondaryOcrProvider,
+    SecondaryOcrResult,
+    SecondaryProcessingRecord,
+    SecondaryProcessingStatus,
+    SecondaryResultKind,
+    SecondaryResultState,
+)
 
 __all__ = [
     "BatchStatus",
     "BatchSnapshot",
+    "CandidateCollection",
+    "CandidateCollectionErrorCode",
+    "CandidateCollectionFailure",
+    "CandidateReference",
+    "CandidateSourceKind",
     "ConfigurationError",
     "DomainError",
     "FileIntakeErrorCode",
@@ -40,6 +62,7 @@ __all__ = [
     "FileStatus",
     "InputValidationError",
     "IncomingFile",
+    "ImageCandidate",
     "LeaseClaim",
     "LeaseConflictError",
     "MinerUDocumentResult",
@@ -49,9 +72,18 @@ __all__ = [
     "MinerUProgress",
     "MinerUProgressStatus",
     "MinerUSubmission",
+    "MinerUImageFormat",
+    "OrthogonalAngle",
     "PersistenceError",
     "ProcessingStage",
     "SecondaryOCREngine",
+    "SecondaryContentFormat",
+    "SecondaryOcrProvider",
+    "SecondaryOcrResult",
+    "SecondaryProcessingRecord",
+    "SecondaryProcessingStatus",
+    "SecondaryResultKind",
+    "SecondaryResultState",
     "StateTransitionError",
     "StoredFile",
     "SupportedMediaType",

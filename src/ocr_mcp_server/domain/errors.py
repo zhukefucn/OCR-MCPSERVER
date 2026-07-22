@@ -137,3 +137,37 @@ class MinerUFailure(DomainError):
             else retry_file_task_safe
         )
         Exception.__init__(self, self.safe_message)
+
+
+class CandidateCollectionErrorCode(StrEnum):
+    """Stable machine codes for image-candidate collection failures."""
+
+    INVALID_MANIFEST = "candidate_manifest_invalid"
+    UNSAFE_OR_MISSING_PATH = "candidate_path_unsafe_or_missing"
+    INVALID_IMAGE = "candidate_image_invalid_or_unsupported"
+    CHANGED_DURING_INSPECTION = "candidate_changed_during_inspection"
+    INVARIANT_VIOLATION = "candidate_collection_invariant"
+
+
+_CANDIDATE_COLLECTION_SAFE_MESSAGES = {
+    CandidateCollectionErrorCode.INVALID_MANIFEST: "The structured OCR result is invalid.",
+    CandidateCollectionErrorCode.UNSAFE_OR_MISSING_PATH: "A candidate image path is unsafe or unavailable.",
+    CandidateCollectionErrorCode.INVALID_IMAGE: "A candidate image is invalid or unsupported.",
+    CandidateCollectionErrorCode.CHANGED_DURING_INSPECTION: "A candidate image changed during inspection.",
+    CandidateCollectionErrorCode.INVARIANT_VIOLATION: "The candidate collection is inconsistent.",
+}
+
+
+class CandidateCollectionFailure(DomainError):
+    """A candidate-collection failure that never retains unsafe cause text."""
+
+    def __init__(
+        self,
+        code: CandidateCollectionErrorCode,
+        *,
+        cause: BaseException | None = None,
+    ) -> None:
+        del cause
+        self.code = code.value
+        self.safe_message = _CANDIDATE_COLLECTION_SAFE_MESSAGES[code]
+        Exception.__init__(self, self.safe_message)
