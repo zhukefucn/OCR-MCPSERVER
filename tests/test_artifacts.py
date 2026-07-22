@@ -28,6 +28,8 @@ from ocr_mcp_server.domain import (
 )
 from ocr_mcp_server.infra.artifact_repository import ArtifactRepository
 from ocr_mcp_server.infra.retention_repository import RetentionRepository
+from ocr_mcp_server.domain.errors import RetentionFailure
+from ocr_mcp_server.domain.retention import ContentWriteGuard
 from ocr_mcp_server.infra.database import (
     create_database_engine,
     create_session_factory,
@@ -39,10 +41,12 @@ from ocr_mcp_server.services.artifacts import (
     ArtifactPackagingStep,
     render_markdown,
 )
+from ocr_mcp_server.services.retention import RetentionService
 from ocr_mcp_server.settings import ArtifactSettings
 
 
 NOW = datetime(2026, 7, 22, 8, 0, tzinfo=UTC)
+BATCH_ID = "00000000-0000-4000-8000-000000000009"
 
 
 def _canonical(value: object) -> bytes:
@@ -367,17 +371,20 @@ def test_zip_is_deterministic_safe_and_contains_only_verified_explicit_inputs(tm
     limits = ArtifactLimits(max_artifact_bytes=1_000_000, max_entry_bytes=100_000, max_entry_count=20, max_markdown_bytes=100_000)
     first = ArtifactBundler(limits).publish(
         result, publication,
-        artifact_root=(tmp_path / "artifacts-a").absolute(), batch_id="batch-a",
+        artifact_root=(tmp_path / "artifacts-a").absolute(), batch_id=BATCH_ID,
         created_at=NOW, expires_at=NOW + timedelta(hours=24),
     )
     second = ArtifactBundler(limits).publish(
         result, publication,
-        artifact_root=(tmp_path / "artifacts-b").absolute(), batch_id="batch-a",
+        artifact_root=(tmp_path / "artifacts-b").absolute(), batch_id=BATCH_ID,
         created_at=NOW, expires_at=NOW + timedelta(hours=24),
     )
     assert first.sha256 == second.sha256
     assert first.path.read_bytes() == second.path.read_bytes()
     assert first.storage_key == second.storage_key
+    assert first.path.parent == (tmp_path / "artifacts-a" / BATCH_ID).absolute()
+    assert first.storage_key == f"{BATCH_ID}/{first.artifact_id}.zip"
+    assert not list((tmp_path / "artifacts-a").glob("artifact-*.zip"))
     with zipfile.ZipFile(first.path) as archive:
         infos = archive.infolist()
         names = [item.filename for item in infos]
@@ -403,10 +410,30 @@ def test_zip_is_deterministic_safe_and_contains_only_verified_explicit_inputs(tm
         assert [entry["name"] for entry in manifest["entries"]] == names[:-1]
 
 
+def test_zip_rejects_noncanonical_batch_identity_before_creating_artifact_root(
+    tmp_path: Path,
+) -> None:
+    result, publication, _, _ = _inputs(tmp_path)
+    artifact_root = (tmp_path / "artifacts").absolute()
+    with pytest.raises(ArtifactFailure) as caught:
+        ArtifactBundler(
+            ArtifactLimits(1_000_000, 100_000, 20, 100_000)
+        ).publish(
+            result,
+            publication,
+            artifact_root=artifact_root,
+            batch_id="batch-a",
+            created_at=NOW,
+            expires_at=NOW + timedelta(hours=24),
+        )
+    assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
+    assert not artifact_root.exists()
+
+
 def test_zip_retry_reconciles_identical_and_rejects_tamper_and_conflict(tmp_path: Path) -> None:
     result, publication, _, _ = _inputs(tmp_path)
     bundler = ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000))
-    kwargs = dict(artifact_root=(tmp_path / "artifacts").absolute(), batch_id="batch-a", created_at=NOW, expires_at=NOW + timedelta(hours=24))
+    kwargs = dict(artifact_root=(tmp_path / "artifacts").absolute(), batch_id=BATCH_ID, created_at=NOW, expires_at=NOW + timedelta(hours=24))
     first = bundler.publish(result, publication, **kwargs)
     assert bundler.publish(result, publication, **kwargs) == first
     publication.manifest_path.write_bytes(b"planted document content")
@@ -432,7 +459,7 @@ def test_zip_rejects_forged_audit_even_when_caller_updates_hash_binding(tmp_path
     publication = replace(publication, audit_sha256=sha256(forged).hexdigest())
     with pytest.raises(ArtifactFailure) as caught:
         ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
-            result, publication, artifact_root=(tmp_path / "artifacts").absolute(), batch_id="batch-a",
+            result, publication, artifact_root=(tmp_path / "artifacts").absolute(), batch_id=BATCH_ID,
             created_at=NOW, expires_at=NOW + timedelta(hours=24),
         )
     assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
@@ -447,7 +474,7 @@ def test_zip_rejects_unaudited_final_title_mutation_with_recomputed_task7_hashes
     )
     with pytest.raises(ArtifactFailure) as caught:
         ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
-            result, publication, artifact_root=(tmp_path / "artifacts").absolute(), batch_id="batch-a",
+            result, publication, artifact_root=(tmp_path / "artifacts").absolute(), batch_id=BATCH_ID,
             created_at=NOW, expires_at=NOW + timedelta(hours=24),
         )
     assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
@@ -498,7 +525,7 @@ def test_zip_rejects_inconsistent_or_nonexact_audit_coverage(tmp_path: Path, cas
     )
     with pytest.raises(ArtifactFailure) as caught:
         ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
-            result, publication, artifact_root=(tmp_path / "artifacts").absolute(), batch_id="batch-a",
+            result, publication, artifact_root=(tmp_path / "artifacts").absolute(), batch_id=BATCH_ID,
             created_at=NOW, expires_at=NOW + timedelta(hours=24),
         )
     assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
@@ -520,7 +547,7 @@ def test_zip_rejects_replacement_kind_inconsistent_with_task7_reason(
             result,
             publication,
             artifact_root=(tmp_path / "artifacts").absolute(),
-            batch_id="batch-a",
+            batch_id=BATCH_ID,
             created_at=NOW,
             expires_at=NOW + timedelta(hours=24),
         )
@@ -569,7 +596,7 @@ def test_zip_rejects_impossible_retained_task7_reason(
             result,
             publication,
             artifact_root=(tmp_path / "artifacts").absolute(),
-            batch_id="batch-a",
+            batch_id=BATCH_ID,
             created_at=NOW,
             expires_at=NOW + timedelta(hours=24),
         )
@@ -623,7 +650,7 @@ def test_zip_rejects_pointerless_nonstandalone_audit(tmp_path: Path) -> None:
             result,
             publication,
             artifact_root=(tmp_path / "artifacts").absolute(),
-            batch_id="batch-a",
+            batch_id=BATCH_ID,
             created_at=NOW,
             expires_at=NOW + timedelta(hours=24),
         )
@@ -641,7 +668,7 @@ def test_zip_rejects_unsafe_model_identifier_before_manifest_write(tmp_path: Pat
     )
     with pytest.raises(ArtifactFailure) as caught:
         ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
-            result, publication, artifact_root=(tmp_path / "artifacts").absolute(), batch_id="batch-a",
+            result, publication, artifact_root=(tmp_path / "artifacts").absolute(), batch_id=BATCH_ID,
             created_at=NOW, expires_at=NOW + timedelta(hours=24),
         )
     assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
@@ -665,13 +692,13 @@ def test_windows_cleanup_capability_failure_aborts_before_publication(
             result,
             publication,
             artifact_root=artifact_root,
-            batch_id="batch-a",
+            batch_id=BATCH_ID,
             created_at=NOW,
             expires_at=NOW + timedelta(hours=24),
         )
     assert caught.value.code == ArtifactErrorCode.PUBLISH_FAILED.value
-    assert not list(artifact_root.glob("artifact-*.zip"))
-    assert not list(artifact_root.glob(".artifact-stage-*"))
+    assert not list(artifact_root.rglob("artifact-*.zip"))
+    assert not list(artifact_root.rglob(".artifact-stage-*"))
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows stage lifecycle contract")
@@ -691,13 +718,13 @@ def test_windows_native_cleanup_failure_uses_handle_bound_fallback(
             result,
             publication,
             artifact_root=artifact_root,
-            batch_id="batch-a",
+            batch_id=BATCH_ID,
             created_at=NOW,
             expires_at=NOW + timedelta(hours=24),
         )
     assert caught.value.code == ArtifactErrorCode.PUBLISH_FAILED.value
-    assert not list(artifact_root.glob("artifact-*.zip"))
-    assert not list(artifact_root.glob(".artifact-stage-*"))
+    assert not list(artifact_root.rglob("artifact-*.zip"))
+    assert not list(artifact_root.rglob(".artifact-stage-*"))
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows stage lifecycle contract")
@@ -729,13 +756,13 @@ def test_windows_double_cleanup_api_failure_scrubs_unpublished_stage(
             result,
             publication,
             artifact_root=artifact_root,
-            batch_id="batch-a",
+            batch_id=BATCH_ID,
             created_at=NOW,
             expires_at=NOW + timedelta(hours=24),
         )
     assert caught.value.code == ArtifactErrorCode.PUBLISH_FAILED.value
-    assert not list(artifact_root.glob("artifact-*.zip"))
-    stages = list(artifact_root.glob(".artifact-stage-*"))
+    assert not list(artifact_root.rglob("artifact-*.zip"))
+    stages = list((artifact_root / BATCH_ID).glob(".artifact-stage-*"))
     assert len(stages) == 1
     assert stages[0].read_bytes() == b""
     assert replacement.read_bytes() == b"must survive"
@@ -768,7 +795,7 @@ def test_windows_truncate_failure_uses_handle_scrub_and_always_closes(
             result,
             publication,
             artifact_root=artifact_root,
-            batch_id="batch-a",
+            batch_id=BATCH_ID,
             created_at=NOW,
             expires_at=NOW + timedelta(hours=24),
         )
@@ -778,7 +805,7 @@ def test_windows_truncate_failure_uses_handle_scrub_and_always_closes(
     try:
         with pytest.raises(OSError):
             os.fstat(descriptor)
-        stages = list(artifact_root.glob(".artifact-stage-*"))
+        stages = list((artifact_root / BATCH_ID).glob(".artifact-stage-*"))
         assert len(stages) == 1
         assert stages[0].read_bytes() == b""
     finally:
@@ -799,7 +826,7 @@ def test_publish_interruption_leaves_no_visible_target_or_stage(tmp_path: Path, 
     monkeypatch.setattr(module._PinnedArtifactRoot, "link_no_replace", interrupted)
     with pytest.raises(ArtifactFailure) as caught:
         ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
-            result, publication, artifact_root=artifact_root, batch_id="batch-a",
+            result, publication, artifact_root=artifact_root, batch_id=BATCH_ID,
             created_at=NOW, expires_at=NOW + timedelta(hours=24),
         )
     assert caught.value.code == ArtifactErrorCode.PUBLISH_FAILED.value
@@ -825,7 +852,7 @@ def test_post_link_identity_swap_never_returns_success(tmp_path: Path, monkeypat
     monkeypatch.setattr(module._PinnedArtifactRoot, "_named_stat", replaced_identity)
     with pytest.raises(ArtifactFailure) as caught:
         ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
-            result, publication, artifact_root=artifact_root, batch_id="batch-a",
+            result, publication, artifact_root=artifact_root, batch_id=BATCH_ID,
             created_at=NOW, expires_at=NOW + timedelta(hours=24),
         )
     assert caught.value.code == ArtifactErrorCode.PUBLISH_FAILED.value
@@ -838,20 +865,20 @@ def test_zip_rejects_missing_changed_symlinked_image_and_limits(tmp_path: Path) 
     image.unlink()
     with pytest.raises(ArtifactFailure) as missing:
         ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
-            result, publication, artifact_root=root, batch_id="batch-a", created_at=NOW, expires_at=NOW + timedelta(hours=24)
+            result, publication, artifact_root=root, batch_id=BATCH_ID, created_at=NOW, expires_at=NOW + timedelta(hours=24)
         )
     assert missing.value.code == ArtifactErrorCode.UNSAFE_IMAGE.value
     image.symlink_to(result.images_directory / "unrelated.png")
     with pytest.raises(ArtifactFailure) as linked:
         ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
-            result, publication, artifact_root=root, batch_id="batch-a", created_at=NOW, expires_at=NOW + timedelta(hours=24)
+            result, publication, artifact_root=root, batch_id=BATCH_ID, created_at=NOW, expires_at=NOW + timedelta(hours=24)
         )
     assert linked.value.code == ArtifactErrorCode.UNSAFE_IMAGE.value
     image.unlink()
     image.write_bytes(b"used-image")
     with pytest.raises(ArtifactFailure) as limited:
         ArtifactBundler(ArtifactLimits(10, 100_000, 20, 100_000)).publish(
-            result, publication, artifact_root=root, batch_id="batch-a", created_at=NOW, expires_at=NOW + timedelta(hours=24)
+            result, publication, artifact_root=root, batch_id=BATCH_ID, created_at=NOW, expires_at=NOW + timedelta(hours=24)
         )
     assert limited.value.code == ArtifactErrorCode.LIMIT_EXCEEDED.value
 
@@ -861,7 +888,7 @@ def test_zip_rejects_referenced_image_changed_after_task7(tmp_path: Path) -> Non
     (result.images_directory / "used.png").write_bytes(b"changed-after-task7")
     with pytest.raises(ArtifactFailure) as caught:
         ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
-            result, publication, artifact_root=(tmp_path / "artifacts").absolute(), batch_id="batch-a",
+            result, publication, artifact_root=(tmp_path / "artifacts").absolute(), batch_id=BATCH_ID,
             created_at=NOW, expires_at=NOW + timedelta(hours=24),
         )
     assert caught.value.code == ArtifactErrorCode.UNSAFE_IMAGE.value
@@ -895,8 +922,15 @@ async def test_repository_registers_exact_idempotent_content_free_metadata_and_o
         result, publication, artifact_root=(tmp_path / "artifacts").absolute(), batch_id=batch_id,
         created_at=NOW, expires_at=NOW + timedelta(hours=24),
     )
-    first = await repository.register(bundle, publication.records)
-    repeated = await repository.register(bundle, publication.records)
+    guard = await repository.acquire_content_write(
+        batch_id, "file-a", now=NOW, lease_seconds=60
+    )
+    first = await repository.register(
+        bundle, publication.records, write_guard=guard
+    )
+    repeated = await repository.register(
+        bundle, publication.records, write_guard=guard
+    )
     assert first == repeated
     assert first.available is True and first.deleted_at is None and first.version == 1
     assert (await repository.list_for_file("file-a")) == (first,)
@@ -911,7 +945,11 @@ async def test_repository_registers_exact_idempotent_content_free_metadata_and_o
     assert not hasattr(audit, "replacement_node_snapshot")
     assert dict(audit.model_versions) == {"pipeline": "v1"}
     with pytest.raises(ArtifactFailure) as conflict:
-        await repository.register(replace(bundle, sha256="0" * 64), publication.records)
+        await repository.register(
+            replace(bundle, sha256="0" * 64),
+            publication.records,
+            write_guard=guard,
+        )
     assert conflict.value.code == ArtifactErrorCode.INDEX_CONFLICT.value
 
     different = replace(
@@ -921,13 +959,14 @@ async def test_repository_registers_exact_idempotent_content_free_metadata_and_o
         processing_record_id="secondary-" + "e" * 64,
     )
     with pytest.raises(ArtifactFailure) as audit_conflict:
-        await repository.register(bundle, (different,))
+        await repository.register(bundle, (different,), write_guard=guard)
     assert audit_conflict.value.code == ArtifactErrorCode.INDEX_CONFLICT.value
 
     unsafe_model = replace(record, model_versions={"pipeline": "client name.pdf\n/document text"})
     with pytest.raises(ArtifactFailure) as unsafe_metadata:
-        await repository.register(bundle, (unsafe_model,))
+        await repository.register(bundle, (unsafe_model,), write_guard=guard)
     assert unsafe_metadata.value.code == ArtifactErrorCode.INDEX_CONFLICT.value
+    await repository.release_content_write(guard)
 
     async with engine.connect() as connection:
         columns = await connection.run_sync(lambda sync: {
@@ -950,21 +989,121 @@ async def test_repository_extends_batch_content_retention_to_artifact_expiry(
     repository, engine, batch_id = artifact_repository
     result, publication, _, _ = _inputs(tmp_path)
     expires_at = NOW + timedelta(days=365)
+    artifact_root = (tmp_path / "artifacts").absolute()
     bundle = ArtifactBundler(
         ArtifactLimits(1_000_000, 100_000, 20, 100_000)
     ).publish(
         result,
         publication,
-        artifact_root=(tmp_path / "artifacts").absolute(),
+        artifact_root=artifact_root,
         batch_id=batch_id,
         created_at=NOW,
         expires_at=expires_at,
     )
 
-    await repository.register(bundle, publication.records)
+    guard = await repository.acquire_content_write(
+        batch_id, "file-a", now=NOW, lease_seconds=60
+    )
+    await repository.register(bundle, publication.records, write_guard=guard)
+    await repository.release_content_write(guard)
 
     retention = RetentionRepository(create_session_factory(engine))
     assert (await retention.get(batch_id)).content_due_at == expires_at
+
+
+@pytest.mark.asyncio
+async def test_real_publish_register_and_retention_cleanup_share_the_batch_root(
+    tmp_path: Path, artifact_repository
+) -> None:
+    repository, engine, batch_id = artifact_repository
+    sessions = create_session_factory(engine)
+    retention = RetentionRepository(sessions)
+    artifact_root = (tmp_path / "artifacts").absolute()
+    data_root = (tmp_path / "data").absolute()
+    result, publication, _, _ = _inputs(tmp_path)
+    bundle = ArtifactBundler(
+        ArtifactLimits(1_000_000, 100_000, 20, 100_000)
+    ).publish(
+        result,
+        publication,
+        artifact_root=artifact_root,
+        batch_id=batch_id,
+        created_at=NOW,
+        expires_at=NOW + timedelta(hours=24),
+    )
+    guard = await repository.acquire_content_write(
+        batch_id, "file-a", now=NOW, lease_seconds=60
+    )
+    await repository.register(bundle, publication.records, write_guard=guard)
+    await repository.release_content_write(guard)
+    due = (await retention.get(batch_id)).content_due_at
+
+    cleanup = await RetentionService(
+        retention, data_root, artifact_root
+    ).run_once("worker", now=due, lease_seconds=60, limit=1)
+
+    assert (cleanup.content_deleted, cleanup.failed) == (1, 0)
+    assert bundle.path.exists() is False
+    retained_archives = list(artifact_root.rglob("*.zip"))
+    assert len(retained_archives) == 1
+    assert retained_archives[0].read_bytes() == b""
+    assert (await repository.list_for_file("file-a"))[0].available is False
+
+
+@pytest.mark.asyncio
+async def test_early_delete_and_artifact_write_guard_have_atomic_ordering(
+    tmp_path: Path, artifact_repository
+) -> None:
+    repository, engine, batch_id = artifact_repository
+    sessions = create_session_factory(engine)
+    retention = RetentionRepository(sessions)
+    result, publication, _, _ = _inputs(tmp_path)
+    artifact_root = (tmp_path / "artifacts").absolute()
+    bundle = ArtifactBundler(
+        ArtifactLimits(1_000_000, 100_000, 20, 100_000)
+    ).publish(
+        result,
+        publication,
+        artifact_root=artifact_root,
+        batch_id=batch_id,
+        created_at=NOW,
+        expires_at=NOW + timedelta(hours=24),
+    )
+
+    guard = await repository.acquire_content_write(
+        batch_id,
+        "file-a",
+        now=NOW,
+        lease_seconds=60,
+    )
+    assert await retention.request_early_delete(batch_id, now=NOW) is True
+    with pytest.raises(ArtifactFailure) as interrupted_registration:
+        await repository.register(bundle, publication.records, write_guard=guard)
+    assert interrupted_registration.value.code == ArtifactErrorCode.INDEX_CONFLICT.value
+    await repository.release_content_write(guard)
+
+    with pytest.raises(ArtifactFailure) as blocked_registration:
+        await repository.register(bundle, publication.records, write_guard=guard)
+    assert blocked_registration.value.code == ArtifactErrorCode.INDEX_CONFLICT.value
+    with pytest.raises(ArtifactFailure) as blocked_guard:
+        await repository.acquire_content_write(
+            batch_id,
+            "file-a",
+            now=NOW + timedelta(seconds=1),
+            lease_seconds=60,
+        )
+    assert blocked_guard.value.code == ArtifactErrorCode.INDEX_CONFLICT.value
+
+    assert await RetentionService(
+        retention,
+        (tmp_path / "data").absolute(),
+        artifact_root,
+    ).delete_task(
+        batch_id,
+        now=NOW + timedelta(seconds=1),
+        worker_id="cleanup",
+    ) is True
+    assert all(path.read_bytes() == b"" for path in artifact_root.rglob("*.zip"))
 
 
 @pytest.mark.asyncio
@@ -982,7 +1121,25 @@ async def test_packaging_step_reports_exact_packaging_then_publishing_counters(t
         def checkpoint(self):
             return None
 
-    step = ArtifactPackagingStep(bundler, repository)
+    guard_events = []
+
+    class GuardedRepository:
+        async def acquire_content_write(self, *args, **kwargs):
+            guard = await repository.acquire_content_write(*args, **kwargs)
+            guard_events.append(("acquire", guard))
+            return guard
+
+        async def register(self, bundle, records, *, write_guard):
+            guard_events.append(("register", write_guard))
+            return await repository.register(
+                bundle, records, write_guard=write_guard
+            )
+
+        async def release_content_write(self, guard):
+            guard_events.append(("release", guard))
+            await repository.release_content_write(guard)
+
+    step = ArtifactPackagingStep(bundler, GuardedRepository())
     artifact = await step.run(
         result, publication, artifact_root=(tmp_path / "artifacts").absolute(), batch_id=batch_id,
         created_at=NOW, expires_at=NOW + timedelta(hours=24), progress=Progress(), cancellation=Cancellation(),
@@ -993,7 +1150,69 @@ async def test_packaging_step_reports_exact_packaging_then_publishing_counters(t
         ("publishing", 0, 1, "items"),
         ("publishing", 1, 1, "items"),
     ]
+    assert [name for name, _ in guard_events] == ["acquire", "register", "release"]
+    assert len({guard.token for _, guard in guard_events}) == 1
     assert artifact == (await repository.list_for_file("file-a"))[0]
+
+
+@pytest.mark.asyncio
+async def test_packaging_scrubs_published_archive_when_registration_fails(
+    tmp_path: Path,
+) -> None:
+    result, publication, _, _ = _inputs(tmp_path)
+    artifact_root = (tmp_path / "artifacts").absolute()
+
+    class Repository:
+        released = False
+
+        async def acquire_content_write(
+            self, batch_id, file_task_id, *, now, lease_seconds
+        ):
+            return ContentWriteGuard(
+                batch_id=batch_id,
+                file_task_id=file_task_id,
+                token="guard-token",
+                expires_at=now + timedelta(seconds=lease_seconds),
+            )
+
+        async def register(self, _bundle, _records, *, write_guard):
+            assert write_guard.token == "guard-token"
+            raise RuntimeError("planted registration failure")
+
+        async def release_content_write(self, guard):
+            assert guard.token == "guard-token"
+            self.released = True
+
+    repository = Repository()
+
+    class Progress:
+        async def report(self, *_args, **_kwargs):
+            return None
+
+    class Cancellation:
+        def checkpoint(self):
+            return None
+
+    step = ArtifactPackagingStep(
+        ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)),
+        repository,
+    )
+    with pytest.raises(RuntimeError, match="planted registration failure"):
+        await step.run(
+            result,
+            publication,
+            artifact_root=artifact_root,
+            batch_id=BATCH_ID,
+            created_at=NOW,
+            expires_at=NOW + timedelta(hours=24),
+            progress=Progress(),
+            cancellation=Cancellation(),
+        )
+
+    archives = list(artifact_root.rglob("*.zip"))
+    assert len(archives) == 1
+    assert archives[0].read_bytes() == b""
+    assert repository.released is True
 
 
 @pytest.mark.asyncio
@@ -1012,7 +1231,7 @@ async def test_exact_retry_requires_fsync_before_repository_registration(
         fsync_calls += 1
         if fsync_calls == 1:
             raise OSError("planted durability failure")
-        assert not list(artifact_root.glob(".artifact-stage-*"))
+            assert not list(artifact_root.rglob(".artifact-stage-*"))
         return original_fsync(self)
 
     monkeypatch.setattr(module._PinnedArtifactRoot, "fsync", fail_first_fsync)
@@ -1021,10 +1240,26 @@ async def test_exact_retry_requires_fsync_before_repository_registration(
 
     class Repository:
         calls = 0
+        released = 0
 
-        async def register(self, _bundle, _records):
+        async def acquire_content_write(
+            self, batch_id, file_task_id, *, now, lease_seconds
+        ):
+            return ContentWriteGuard(
+                batch_id=batch_id,
+                file_task_id=file_task_id,
+                token="guard-token",
+                expires_at=now + timedelta(seconds=lease_seconds),
+            )
+
+        async def register(self, _bundle, _records, *, write_guard):
+            assert write_guard.token == "guard-token"
             self.calls += 1
             return sentinel
+
+        async def release_content_write(self, guard):
+            assert guard.token == "guard-token"
+            self.released += 1
 
     class Progress:
         async def report(self, _stage, _counters=None):
@@ -1041,7 +1276,7 @@ async def test_exact_retry_requires_fsync_before_repository_registration(
     )
     arguments = dict(
         artifact_root=artifact_root,
-        batch_id="batch-a",
+        batch_id=BATCH_ID,
         created_at=NOW,
         expires_at=NOW + timedelta(hours=24),
         progress=Progress(),
@@ -1052,13 +1287,14 @@ async def test_exact_retry_requires_fsync_before_repository_registration(
     assert caught.value.code == ArtifactErrorCode.PUBLISH_FAILED.value
     assert fsync_calls == 1
     assert repository.calls == 0
-    assert len(list(artifact_root.glob("artifact-*.zip"))) == 1
-    assert not list(artifact_root.glob(".artifact-stage-*"))
+    assert repository.released == 1
+    assert len(list((artifact_root / BATCH_ID).glob("artifact-*.zip"))) == 1
+    assert not list((artifact_root / BATCH_ID).glob(".artifact-stage-*"))
 
     assert await step.run(result, publication, **arguments) is sentinel
     assert fsync_calls == 2
     assert repository.calls == 1
-    assert not list(artifact_root.glob(".artifact-stage-*"))
+    assert not list((artifact_root / BATCH_ID).glob(".artifact-stage-*"))
 
 
 @pytest.mark.asyncio
@@ -1071,9 +1307,15 @@ async def test_repository_rejects_content_planted_in_model_metadata_on_first_ins
     )
     unsafe = replace(record, model_versions={"pipeline": "C:/Clients/acme.pdf"})
     forged_digest = replacement_audit_metadata_sha256(batch_id, "file-a", (unsafe,))
+    guard = await repository.acquire_content_write(
+        batch_id, "file-a", now=NOW, lease_seconds=60
+    )
     with pytest.raises(ArtifactFailure) as caught:
         await repository.register(
-            replace(bundle, audit_metadata_sha256=forged_digest), (unsafe,)
+            replace(bundle, audit_metadata_sha256=forged_digest),
+            (unsafe,),
+            write_guard=guard,
         )
     assert caught.value.code == ArtifactErrorCode.INDEX_CONFLICT.value
+    await repository.release_content_write(guard)
     assert "acme.pdf" not in str(caught.value)

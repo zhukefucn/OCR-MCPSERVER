@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
 import re
+from uuid import uuid4
 
 from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -17,6 +18,7 @@ from ..domain.artifacts import (
     replacement_audit_metadata_sha256,
     validate_content_free_model_versions,
 )
+from ..domain.retention import ContentWriteGuard
 from ..domain.errors import ArtifactErrorCode, ArtifactFailure
 from ..domain.merge import ReplacementAuditRecord, ReplacementDecision, ReplacementReason
 from ..domain.models import SecondaryOCREngine
@@ -68,7 +70,7 @@ def _expected_artifact_id(bundle: ArtifactBundle) -> str:
 
 
 def _expected_storage_key(bundle: ArtifactBundle) -> str:
-    return f"{bundle.artifact_id}.zip"
+    return f"{bundle.batch_id}/{bundle.artifact_id}.zip"
 
 
 def _deterministic_id(value: object, prefix: str) -> bool:
@@ -83,6 +85,8 @@ class ArtifactRepository:
         self,
         bundle: ArtifactBundle,
         records: tuple[ReplacementAuditRecord, ...],
+        *,
+        write_guard: ContentWriteGuard,
     ) -> ArtifactSnapshot:
         """Insert or reconcile one exact artifact and all content-free audits atomically."""
 
@@ -94,7 +98,22 @@ class ArtifactRepository:
                 if file_record is None or file_record.batch_id != bundle.batch_id:
                     _fail(ArtifactErrorCode.INDEX_CONFLICT)
                 retention = await session.get(RetentionRecord, bundle.batch_id)
-                if retention is None or retention.content_deleted_at is not None:
+                guard_matches = (
+                    retention is not None
+                    and self._guard_matches(retention, bundle, write_guard)
+                )
+                preexisting_guard = (
+                    retention is not None
+                    and retention.content_write_token is not None
+                    and guard_matches
+                )
+                if (
+                    retention is None
+                    or retention.early_delete
+                    or retention.content_deleted_at is not None
+                    or (retention.claim_token is not None and not preexisting_guard)
+                    or not guard_matches
+                ):
                     _fail(ArtifactErrorCode.INDEX_CONFLICT)
                 artifact = await session.get(ArtifactRecord, bundle.artifact_id)
                 if artifact is None:
@@ -152,6 +171,80 @@ class ArtifactRepository:
                 return self._artifact_snapshot(artifact)
         except ArtifactFailure:
             raise
+        except SQLAlchemyError:
+            _fail(ArtifactErrorCode.INDEX_FAILED)
+        except BaseException:
+            _fail(ArtifactErrorCode.INDEX_FAILED)
+
+    async def acquire_content_write(
+        self,
+        batch_id: str,
+        file_task_id: str,
+        *,
+        now: datetime,
+        lease_seconds: int,
+    ) -> ContentWriteGuard:
+        now = _utc(now)
+        if (
+            not isinstance(batch_id, str)
+            or not batch_id
+            or not isinstance(file_task_id, str)
+            or not file_task_id
+            or isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int)
+            or lease_seconds < 1
+        ):
+            _fail(ArtifactErrorCode.INDEX_CONFLICT)
+        try:
+            async with self._sessions() as session:
+                await session.execute(text("BEGIN IMMEDIATE"))
+                retention = await session.get(RetentionRecord, batch_id)
+                file_record = await session.get(FileTaskRecord, file_task_id)
+                if (
+                    retention is None
+                    or file_record is None
+                    or file_record.batch_id != batch_id
+                    or retention.early_delete
+                    or retention.content_deleted_at is not None
+                    or retention.claim_token is not None
+                    or (
+                        retention.content_write_token is not None
+                        and _database_utc(retention.content_write_expires_at) > now
+                    )
+                ):
+                    _fail(ArtifactErrorCode.INDEX_CONFLICT)
+                token = str(uuid4())
+                expires_at = now + timedelta(seconds=lease_seconds)
+                retention.content_write_token = token
+                retention.content_write_file_id = file_task_id
+                retention.content_write_expires_at = expires_at
+                retention.updated_at = now
+                retention.version += 1
+                await session.commit()
+                return ContentWriteGuard(
+                    batch_id=batch_id,
+                    file_task_id=file_task_id,
+                    token=token,
+                    expires_at=expires_at,
+                )
+        except ArtifactFailure:
+            raise
+        except SQLAlchemyError:
+            _fail(ArtifactErrorCode.INDEX_FAILED)
+
+    async def release_content_write(self, guard: ContentWriteGuard) -> None:
+        if not isinstance(guard, ContentWriteGuard):
+            _fail(ArtifactErrorCode.INDEX_CONFLICT)
+        try:
+            async with self._sessions() as session:
+                await session.execute(text("BEGIN IMMEDIATE"))
+                retention = await session.get(RetentionRecord, guard.batch_id)
+                if retention is not None and retention.content_write_token == guard.token:
+                    retention.content_write_token = None
+                    retention.content_write_file_id = None
+                    retention.content_write_expires_at = None
+                    retention.version += 1
+                await session.commit()
         except SQLAlchemyError:
             _fail(ArtifactErrorCode.INDEX_FAILED)
         except BaseException:
@@ -345,6 +438,25 @@ class ArtifactRepository:
             and record.available is True
             and record.deleted_at is None
             and record.version == 1
+        )
+
+    @staticmethod
+    def _guard_matches(
+        retention: RetentionRecord,
+        bundle: ArtifactBundle,
+        guard: ContentWriteGuard | None,
+    ) -> bool:
+        if retention.content_write_token is None:
+            return False
+        return (
+            isinstance(guard, ContentWriteGuard)
+            and guard.batch_id == bundle.batch_id
+            and guard.file_task_id == bundle.file_task_id
+            and guard.token == retention.content_write_token
+            and retention.content_write_file_id == bundle.file_task_id
+            and _database_utc(retention.content_write_expires_at)
+            == _utc(guard.expires_at)
+            and _utc(guard.expires_at) > _utc(bundle.created_at)
         )
 
     @staticmethod

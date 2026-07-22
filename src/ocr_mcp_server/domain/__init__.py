@@ -39,7 +39,13 @@ from .artifacts import (
     validate_content_free_model_versions,
 )
 from .progress import ProgressCounters, ProgressUnit, map_stage_progress
-from .retention import RetentionClaim, RetentionPhase, RetentionRunResult, RetentionSnapshot
+from .retention import (
+    ContentWriteGuard,
+    RetentionClaim,
+    RetentionPhase,
+    RetentionRunResult,
+    RetentionSnapshot,
+)
 from .merge import (
     MergePublicationResult,
     ReplacementAuditRecord,
@@ -90,6 +96,7 @@ __all__ = [
     "CandidateReference",
     "CandidateSourceKind",
     "ConfigurationError",
+    "ContentWriteGuard",
     "DomainError",
     "FileIntakeErrorCode",
     "FileIntakeFailure",

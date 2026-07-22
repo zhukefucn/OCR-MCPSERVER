@@ -10,7 +10,12 @@ from sqlalchemy import delete, or_, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from ..domain.errors import RetentionErrorCode, RetentionFailure
-from ..domain.retention import RetentionClaim, RetentionPhase, RetentionSnapshot
+from ..domain.retention import (
+    ContentWriteGuard,
+    RetentionClaim,
+    RetentionPhase,
+    RetentionSnapshot,
+)
 from .database import SessionFactory
 from .task_models import (
     ArtifactRecord,
@@ -58,6 +63,80 @@ class RetentionRepository:
         except SQLAlchemyError:
             raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT) from None
 
+    async def acquire_content_write(
+        self,
+        batch_id: str,
+        writer_id: str,
+        *,
+        now: datetime,
+        lease_seconds: int,
+        allow_missing: bool = False,
+    ) -> ContentWriteGuard | None:
+        now = _utc(now)
+        if (
+            not _valid_batch_id(batch_id)
+            or not isinstance(writer_id, str)
+            or not _OWNER.fullmatch(writer_id)
+            or isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int)
+            or lease_seconds < 1
+            or not isinstance(allow_missing, bool)
+        ):
+            raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT) from None
+        try:
+            async with self._sessions() as session:
+                await session.execute(text("BEGIN IMMEDIATE"))
+                record = await session.get(RetentionRecord, batch_id)
+                if record is None:
+                    await session.commit()
+                    if allow_missing:
+                        return None
+                    raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT)
+                if (
+                    record.early_delete
+                    or record.content_deleted_at is not None
+                    or record.claim_token is not None
+                    or (
+                        record.content_write_token is not None
+                        and _db_utc(record.content_write_expires_at) > now
+                    )
+                ):
+                    raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT)
+                token = str(uuid4())
+                expires_at = now + timedelta(seconds=lease_seconds)
+                record.content_write_token = token
+                record.content_write_file_id = writer_id
+                record.content_write_expires_at = expires_at
+                record.updated_at = now
+                record.version += 1
+                await session.commit()
+                return ContentWriteGuard(
+                    batch_id=batch_id,
+                    file_task_id=writer_id,
+                    token=token,
+                    expires_at=expires_at,
+                )
+        except RetentionFailure:
+            raise
+        except SQLAlchemyError:
+            raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT) from None
+
+    async def release_content_write(self, guard: ContentWriteGuard) -> None:
+        if not isinstance(guard, ContentWriteGuard):
+            raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT) from None
+        try:
+            async with self._sessions() as session:
+                await session.execute(text("BEGIN IMMEDIATE"))
+                record = await session.get(RetentionRecord, guard.batch_id)
+                if record is not None and record.content_write_token == guard.token:
+                    record.content_write_token = None
+                    record.content_write_file_id = None
+                    record.content_write_expires_at = None
+                    record.version += 1
+                await session.commit()
+        except SQLAlchemyError:
+            raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT) from None
+
     async def request_early_delete(self, batch_id: str, *, now: datetime) -> bool:
         now = _utc(now)
         if not _valid_batch_id(batch_id):
@@ -69,6 +148,13 @@ class RetentionRepository:
                 if record is None:
                     await session.commit()
                     return False
+                if (
+                    record.content_write_token is not None
+                    and _db_utc(record.content_write_expires_at) <= now
+                ):
+                    record.content_write_token = None
+                    record.content_write_file_id = None
+                    record.content_write_expires_at = None
                 record.early_delete = True
                 record.content_due_at = min(_db_utc(record.content_due_at), now)
                 record.metadata_due_at = min(_db_utc(record.metadata_due_at), now)
@@ -199,6 +285,63 @@ class RetentionRepository:
             raise
         except SQLAlchemyError:
             raise RetentionFailure(RetentionErrorCode.CLEANUP_FAILED) from None
+
+    async def prepare_tombstone(
+        self,
+        claim: RetentionClaim,
+        *,
+        root_kind: str,
+        now: datetime,
+    ) -> str:
+        now = _utc(now)
+        field = {
+            "data": "data_tombstone",
+            "artifact": "artifact_tombstone",
+        }.get(root_kind)
+        if field is None:
+            raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT) from None
+        try:
+            async with self._sessions() as session:
+                await session.execute(text("BEGIN IMMEDIATE"))
+                record = await self._require_claim(
+                    session, claim, RetentionPhase.CONTENT, now
+                )
+                name = getattr(record, field)
+                if name is None:
+                    name = f".retention-{uuid4()}"
+                    setattr(record, field, name)
+                    record.updated_at = now
+                    record.version += 1
+                await session.commit()
+                return name
+        except RetentionFailure:
+            raise
+        except SQLAlchemyError:
+            raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT) from None
+
+    async def require_content_write_quiescent(
+        self, claim: RetentionClaim, *, now: datetime
+    ) -> None:
+        now = _utc(now)
+        try:
+            async with self._sessions() as session:
+                await session.execute(text("BEGIN IMMEDIATE"))
+                record = await self._require_claim(
+                    session, claim, RetentionPhase.CONTENT, now
+                )
+                if (
+                    record.content_write_token is not None
+                    and _db_utc(record.content_write_expires_at) > now
+                ):
+                    raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT)
+                record.content_write_token = None
+                record.content_write_file_id = None
+                record.content_write_expires_at = None
+                await session.commit()
+        except RetentionFailure:
+            raise
+        except SQLAlchemyError:
+            raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT) from None
 
     async def fail_claim(self, claim: RetentionClaim, *, now: datetime, error_code: str) -> None:
         now = _utc(now)

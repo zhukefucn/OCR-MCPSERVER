@@ -16,6 +16,14 @@ from ocr_mcp_server.services.file_validation import FileValidator
 from ocr_mcp_server.services.remote_fetch import RemoteFileFetcher
 
 
+class _FreshBatchGuards:
+    async def acquire_content_write(self, *_args, **_kwargs):
+        return None
+
+    async def release_content_write(self, _guard):
+        raise AssertionError("a missing-row write has no guard to release")
+
+
 GLOBAL_V4 = "8.8.8.8"
 GLOBAL_V6 = "2606:4700:4700::1111"
 
@@ -54,6 +62,7 @@ async def _consume(incoming) -> bytes:
 def _service(data_root: Path, max_bytes: int) -> FileIntakeService:
     return FileIntakeService(
         storage=FileStorage(data_root),
+        content_write_guards=_FreshBatchGuards(),
         validator=FileValidator(max_pages=500, max_image_pixels=1_000),
         max_files=20,
         max_file_size_bytes=max_bytes,

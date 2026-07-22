@@ -32,6 +32,14 @@ class RetentionClaim:
 
 
 @dataclass(frozen=True, slots=True)
+class ContentWriteGuard:
+    batch_id: str
+    file_task_id: str
+    token: str
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class RetentionRunResult:
     claimed: int
     content_deleted: int

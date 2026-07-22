@@ -18,6 +18,7 @@ import re
 import secrets
 import stat
 import unicodedata
+from uuid import UUID
 import zipfile
 from typing import Protocol
 
@@ -35,10 +36,12 @@ from ..domain.merge import (
     ReplacementReason,
 )
 from ..domain.mineru import MinerUDocumentResult
-from ..domain.models import ProcessingStage
+from ..domain.models import ProcessingStage, utc_now
 from ..domain.progress import ProgressCounters, ProgressUnit
+from ..domain.retention import ContentWriteGuard
 from ..domain.secondary_ocr import SecondaryResultKind
 from .candidate_collection import _open_candidate
+from .file_storage import FileStorage
 from .structured_content import (
     StructuredContentInvalid,
     StructuredContentLimits,
@@ -67,6 +70,21 @@ _KNOWN_NODE_TYPES = _TEXT_TYPES | _TITLE_TYPES | _LIST_TYPES | _CODE_TYPES | fro
 
 def _fail(code: ArtifactErrorCode) -> None:
     raise ArtifactFailure(code) from None
+
+
+def _canonical_uuid(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(UUID(value)) == value
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def _is_reparse(value: os.stat_result) -> bool:
+    return stat.S_ISLNK(value.st_mode) or bool(
+        getattr(value, "st_file_attributes", 0) & 0x400
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1257,7 +1275,7 @@ class ArtifactBundler:
             not isinstance(result, MinerUDocumentResult)
             or not isinstance(publication, MergePublicationResult)
             or not isinstance(batch_id, str)
-            or not batch_id
+            or not _canonical_uuid(batch_id)
             or result.file_task_id != publication.task_id
             or type(publication.source_version) is not int
             or type(publication.output_version) is not int
@@ -1496,11 +1514,29 @@ class ArtifactBundler:
             artifact_root.mkdir(parents=True, exist_ok=True)
         except BaseException:
             _fail(ArtifactErrorCode.PUBLISH_FAILED)
-        root_identity = _validate_directory(artifact_root, ArtifactErrorCode.PUBLISH_FAILED)
-        storage_key = f"{artifact_id}.zip"
-        if not _same_object(root_identity, os.lstat(artifact_root)):
+        global_root = artifact_root
+        global_identity = _validate_directory(
+            global_root, ArtifactErrorCode.PUBLISH_FAILED
+        )
+        batch_root = global_root / batch_id
+        try:
+            batch_root.mkdir(mode=0o700, exist_ok=True)
+        except BaseException:
             _fail(ArtifactErrorCode.PUBLISH_FAILED)
-        target = artifact_root / storage_key
+        if not _same_object(global_identity, os.lstat(global_root)):
+            _fail(ArtifactErrorCode.PUBLISH_FAILED)
+        root_identity = _validate_directory(
+            batch_root, ArtifactErrorCode.PUBLISH_FAILED
+        )
+        artifact_root = batch_root
+        artifact_name = f"{artifact_id}.zip"
+        storage_key = f"{batch_id}/{artifact_name}"
+        if (
+            not _same_object(global_identity, os.lstat(global_root))
+            or not _same_object(root_identity, os.lstat(artifact_root))
+        ):
+            _fail(ArtifactErrorCode.PUBLISH_FAILED)
+        target = artifact_root / artifact_name
         with _PinnedArtifactRoot(artifact_root, root_identity) as pinned:
             try:
                 descriptor, stage_name, _stage_path = pinned.create_stage()
@@ -1555,11 +1591,11 @@ class ArtifactBundler:
                 except BaseException:
                     _fail(ArtifactErrorCode.PUBLISH_FAILED)
                 try:
-                    pinned.link_no_replace(descriptor, stage_name, storage_key)
+                    pinned.link_no_replace(descriptor, stage_name, artifact_name)
                     published = True
                 except FileExistsError:
                     pinned.verify_existing(
-                        storage_key,
+                        artifact_name,
                         expected_size=size,
                         expected_digest=archive_digest,
                         expected_manifest=manifest_bytes,
@@ -1578,7 +1614,7 @@ class ArtifactBundler:
                     _fail(ArtifactErrorCode.PUBLISH_FAILED)
                 if published:
                     try:
-                        published_identity = pinned._named_stat(storage_key)
+                        published_identity = pinned._named_stat(artifact_name)
                         if (
                             not _same_object(stage_identity, published_identity)
                             or published_identity.st_size != size
@@ -1592,7 +1628,10 @@ class ArtifactBundler:
                     pinned.fsync()
                 except BaseException:
                     _fail(ArtifactErrorCode.PUBLISH_FAILED)
-                if not _same_object(root_identity, os.lstat(artifact_root)):
+                if (
+                    not _same_object(global_identity, os.lstat(global_root))
+                    or not _same_object(root_identity, os.lstat(artifact_root))
+                ):
                     _fail(ArtifactErrorCode.PUBLISH_FAILED)
                 return ArtifactBundle(
                     artifact_id=artifact_id,
@@ -1639,19 +1678,96 @@ class ArtifactBundler:
                 if cleanup_error is not None:
                     raise cleanup_error
 
+    def scrub_published(self, bundle: ArtifactBundle) -> None:
+        """Erase archive bytes through a verified open descriptor; keep its name."""
+
+        descriptor: int | None = None
+        try:
+            batch_root = bundle.path.parent
+            name = bundle.path.name
+            batch_info = os.lstat(batch_root)
+            if (
+                Path(name).name != name
+                or _is_reparse(batch_info)
+                or not stat.S_ISDIR(batch_info.st_mode)
+            ):
+                _fail(ArtifactErrorCode.PUBLISH_FAILED)
+            with _PinnedArtifactRoot(batch_root, batch_info) as pinned:
+                expected = (
+                    os.stat(name, dir_fd=pinned.descriptor, follow_symlinks=False)
+                    if pinned.descriptor is not None
+                    else os.lstat(bundle.path)
+                )
+                if _is_reparse(expected) or not stat.S_ISREG(expected.st_mode):
+                    _fail(ArtifactErrorCode.PUBLISH_FAILED)
+                if pinned.descriptor is not None:
+                    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+                    descriptor = os.open(name, flags, dir_fd=pinned.descriptor)
+                else:
+                    descriptor = FileStorage._windows_open_file_descriptor(
+                        bundle.path,
+                        create=False,
+                        delete_access=False,
+                        write_access=True,
+                    )
+                opened = os.fstat(descriptor)
+                if not _same_object(expected, opened):
+                    _fail(ArtifactErrorCode.PUBLISH_FAILED)
+                os.ftruncate(descriptor, 0)
+                os.fsync(descriptor)
+                current = (
+                    os.stat(name, dir_fd=pinned.descriptor, follow_symlinks=False)
+                    if pinned.descriptor is not None
+                    else os.lstat(bundle.path)
+                )
+                if not _same_object(opened, current) or current.st_size != 0:
+                    _fail(ArtifactErrorCode.PUBLISH_FAILED)
+        except ArtifactFailure:
+            raise
+        except BaseException:
+            _fail(ArtifactErrorCode.PUBLISH_FAILED)
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
 
 class ArtifactRepositoryProtocol(Protocol):
+    async def acquire_content_write(
+        self,
+        batch_id: str,
+        file_task_id: str,
+        *,
+        now: datetime,
+        lease_seconds: int,
+    ) -> ContentWriteGuard: ...
+
     async def register(
-        self, bundle: ArtifactBundle, records: tuple[ReplacementAuditRecord, ...]
+        self,
+        bundle: ArtifactBundle,
+        records: tuple[ReplacementAuditRecord, ...],
+        *,
+        write_guard: ContentWriteGuard,
     ) -> ArtifactSnapshot: ...
+
+    async def release_content_write(self, guard: ContentWriteGuard) -> None: ...
 
 
 class ArtifactPackagingStep:
     """Narrow Task 8 adapter: package bytes, then publish one metadata item."""
 
-    def __init__(self, bundler: ArtifactBundler, repository: ArtifactRepositoryProtocol) -> None:
+    def __init__(
+        self,
+        bundler: ArtifactBundler,
+        repository: ArtifactRepositoryProtocol,
+        *,
+        now_factory=utc_now,
+    ) -> None:
         self._bundler = bundler
         self._repository = repository
+        self._now_factory = now_factory
 
     async def run(
         self,
@@ -1665,23 +1781,41 @@ class ArtifactPackagingStep:
         progress,
         cancellation,
     ) -> ArtifactSnapshot:
-        cancellation.checkpoint()
-        await progress.report(ProcessingStage.PACKAGING, ProgressCounters(0, None, ProgressUnit.BYTES))
-        bundle = self._bundler.publish(
-            result,
-            publication,
-            artifact_root=artifact_root,
-            batch_id=batch_id,
-            created_at=created_at,
-            expires_at=expires_at,
+        guard = await self._repository.acquire_content_write(
+            batch_id,
+            result.file_task_id,
+            now=self._now_factory(),
+            lease_seconds=300,
         )
-        cancellation.checkpoint()
-        await progress.report(
-            ProcessingStage.PACKAGING,
-            ProgressCounters(bundle.size_bytes, bundle.size_bytes, ProgressUnit.BYTES),
-        )
-        await progress.report(ProcessingStage.PUBLISHING, ProgressCounters(0, 1, ProgressUnit.ITEMS))
-        snapshot = await self._repository.register(bundle, publication.records)
-        cancellation.checkpoint()
-        await progress.report(ProcessingStage.PUBLISHING, ProgressCounters(1, 1, ProgressUnit.ITEMS))
-        return snapshot
+        bundle: ArtifactBundle | None = None
+        try:
+            cancellation.checkpoint()
+            await progress.report(ProcessingStage.PACKAGING, ProgressCounters(0, None, ProgressUnit.BYTES))
+            bundle = self._bundler.publish(
+                result,
+                publication,
+                artifact_root=artifact_root,
+                batch_id=batch_id,
+                created_at=created_at,
+                expires_at=expires_at,
+            )
+            cancellation.checkpoint()
+            await progress.report(
+                ProcessingStage.PACKAGING,
+                ProgressCounters(bundle.size_bytes, bundle.size_bytes, ProgressUnit.BYTES),
+            )
+            await progress.report(ProcessingStage.PUBLISHING, ProgressCounters(0, 1, ProgressUnit.ITEMS))
+            snapshot = await self._repository.register(
+                bundle,
+                publication.records,
+                write_guard=guard,
+            )
+            cancellation.checkpoint()
+            await progress.report(ProcessingStage.PUBLISHING, ProgressCounters(1, 1, ProgressUnit.ITEMS))
+            return snapshot
+        except BaseException:
+            if bundle is not None:
+                self._bundler.scrub_published(bundle)
+            raise
+        finally:
+            await self._repository.release_content_write(guard)

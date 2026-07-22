@@ -2,14 +2,32 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from datetime import datetime
+from typing import Protocol
 
 from ..domain.constants import DEFAULT_MAX_BATCH_SIZE_BYTES, DEFAULT_MAX_FILES
 from ..domain.errors import FileIntakeErrorCode, FileIntakeFailure
 from ..domain.files import IncomingFile, StoredFile
+from ..domain.models import utc_now
+from ..domain.retention import ContentWriteGuard
 from .file_storage import FileStorage
 from .file_validation import FileValidator
 from .remote_fetch import RemoteFileFetcher
+
+
+class ContentWriteGuards(Protocol):
+    async def acquire_content_write(
+        self,
+        batch_id: str,
+        writer_id: str,
+        *,
+        now: datetime,
+        lease_seconds: int,
+        allow_missing: bool = False,
+    ) -> ContentWriteGuard | None: ...
+
+    async def release_content_write(self, guard: ContentWriteGuard) -> None: ...
 
 
 def validate_batch_capacity(
@@ -40,16 +58,22 @@ class FileIntakeService:
         self,
         *,
         storage: FileStorage,
+        content_write_guards: ContentWriteGuards,
         validator: FileValidator,
         max_files: int,
         max_file_size_bytes: int,
         max_batch_size_bytes: int,
+        now_factory: Callable[[], datetime] = utc_now,
+        write_lease_seconds: int = 300,
     ) -> None:
         self._storage = storage
+        self._content_write_guards = content_write_guards
         self._validator = validator
         self._max_files = max_files
         self._max_file_size_bytes = max_file_size_bytes
         self._max_batch_size_bytes = max_batch_size_bytes
+        self._now_factory = now_factory
+        self._write_lease_seconds = write_lease_seconds
 
     async def ingest_upload(
         self,
@@ -57,22 +81,33 @@ class FileIntakeService:
         incoming: IncomingFile,
     ) -> StoredFile:
         async with self._storage.batch_lock(batch_id):
-            usage = self._storage.batch_usage(batch_id)
-            validate_batch_capacity(
-                usage.file_count,
-                usage.total_bytes,
-                [0],
-                max_files=self._max_files,
-                max_batch_size_bytes=self._max_batch_size_bytes,
-            )
-            remaining_batch_bytes = self._max_batch_size_bytes - usage.total_bytes
-            actual_limit = min(self._max_file_size_bytes, remaining_batch_bytes)
-            return await self._storage.store(
+            guard = await self._content_write_guards.acquire_content_write(
                 batch_id,
-                incoming,
-                max_file_size_bytes=actual_limit,
-                validator=self._validator,
+                "file-intake",
+                now=self._now_factory(),
+                lease_seconds=self._write_lease_seconds,
+                allow_missing=True,
             )
+            try:
+                usage = self._storage.batch_usage(batch_id)
+                validate_batch_capacity(
+                    usage.file_count,
+                    usage.total_bytes,
+                    [0],
+                    max_files=self._max_files,
+                    max_batch_size_bytes=self._max_batch_size_bytes,
+                )
+                remaining_batch_bytes = self._max_batch_size_bytes - usage.total_bytes
+                actual_limit = min(self._max_file_size_bytes, remaining_batch_bytes)
+                return await self._storage.store(
+                    batch_id,
+                    incoming,
+                    max_file_size_bytes=actual_limit,
+                    validator=self._validator,
+                )
+            finally:
+                if guard is not None:
+                    await self._content_write_guards.release_content_write(guard)
 
     async def ingest_remote(
         self,

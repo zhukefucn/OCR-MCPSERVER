@@ -22,6 +22,14 @@ from ocr_mcp_server.services.file_storage import FileStorage
 from ocr_mcp_server.services.file_validation import FileValidator
 
 
+class _FreshBatchGuards:
+    async def acquire_content_write(self, *_args, **_kwargs):
+        return None
+
+    async def release_content_write(self, _guard):
+        raise AssertionError("a missing-row write has no guard to release")
+
+
 def _pdf_bytes() -> bytes:
     writer = PdfWriter()
     writer.add_blank_page(width=72, height=72)
@@ -51,6 +59,7 @@ def _service(
 ) -> FileIntakeService:
     return FileIntakeService(
         storage=FileStorage(data_root),
+        content_write_guards=_FreshBatchGuards(),
         validator=FileValidator(max_pages=500, max_image_pixels=1_000),
         max_files=max_files,
         max_file_size_bytes=max_file_size_bytes,

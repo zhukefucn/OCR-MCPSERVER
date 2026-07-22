@@ -35,6 +35,22 @@ class BatchUsage:
     total_bytes: int
 
 
+@dataclass(slots=True)
+class BatchLockLease:
+    """Held batch lock whose one-byte marker can durably retire the batch."""
+
+    descriptor: int
+    verify_identity: Callable[[], bool]
+
+    def retire(self) -> None:
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
+        os.write(self.descriptor, b"\x01")
+        os.ftruncate(self.descriptor, 1)
+        os.fsync(self.descriptor)
+        if not self.verify_identity():
+            raise OSError("batch lock identity changed")
+
+
 @dataclass(frozen=True, slots=True)
 class _OpenedDirectory:
     path: Path
@@ -56,7 +72,7 @@ class FileStorage:
         self._id_factory = id_factory
 
     @asynccontextmanager
-    async def batch_lock(self, batch_id: str):
+    async def batch_lock(self, batch_id: str, *, allow_retired: bool = False):
         """Hold a process-shared exclusive lock for one canonical batch UUID."""
 
         canonical_batch_id = self._canonical_uuid(batch_id)
@@ -76,6 +92,33 @@ class FileStorage:
             descriptor = self._open_lock_file(
                 lock_dir, f"{canonical_batch_id}.lock"
             )
+            lock_name = f"{canonical_batch_id}.lock"
+            lock_identity = self._identity(os.fstat(descriptor))
+
+            def lock_unchanged() -> bool:
+                try:
+                    if lock_dir is None:
+                        return False
+                    info = (
+                        os.stat(
+                            lock_name,
+                            dir_fd=lock_dir.descriptor,
+                            follow_symlinks=False,
+                        )
+                        if lock_dir.descriptor is not None
+                        else os.lstat(lock_dir.path / lock_name)
+                    )
+                    return (
+                        self._directory_unchanged(lock_dir)
+                        and not self._is_reparse(info)
+                        and stat.S_ISREG(info.st_mode)
+                        and self._identity(info) == lock_identity
+                    )
+                except OSError:
+                    return False
+
+            if not lock_unchanged():
+                raise OSError("unsafe batch lock")
             if os.fstat(descriptor).st_size == 0:
                 self._write_all(descriptor, b"\0")
                 os.fsync(descriptor)
@@ -83,7 +126,21 @@ class FileStorage:
                 acquired = self._try_batch_lock(descriptor)
                 if not acquired:
                     await asyncio.sleep(0.01)
-            yield
+            if not lock_unchanged():
+                raise OSError("unsafe batch lock")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            marker = os.read(descriptor, 1)
+            if marker == b"\x01":
+                if not allow_retired:
+                    raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+            else:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                self._write_all(descriptor, b"\0")
+                os.ftruncate(descriptor, 1)
+                os.fsync(descriptor)
+            yield BatchLockLease(descriptor, lock_unchanged)
+            if not lock_unchanged():
+                raise OSError("unsafe batch lock")
         except FileIntakeFailure as exc:
             primary = exc
         except OSError:
@@ -447,8 +504,23 @@ class FileStorage:
             return os.open(name, flags, 0o600, dir_fd=directory.descriptor)
         if not self._directory_unchanged(directory):
             raise OSError("directory identity changed")
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
-        descriptor = os.open(directory.path / name, flags, 0o600)
+        path = directory.path / name
+        try:
+            descriptor = self._windows_open_file_descriptor(
+                path,
+                create=True,
+                delete_access=False,
+                write_access=True,
+            )
+        except OSError as failure:
+            if getattr(failure, "winerror", None) not in {80, 183}:
+                raise
+            descriptor = self._windows_open_file_descriptor(
+                path,
+                create=False,
+                delete_access=False,
+                write_access=True,
+            )
         if not self._directory_unchanged(directory):
             os.close(descriptor)
             raise OSError("directory identity changed")
@@ -897,6 +969,7 @@ class FileStorage:
         *,
         create: bool,
         delete_access: bool,
+        write_access: bool = False,
     ) -> int:
         import msvcrt
 
@@ -913,7 +986,7 @@ class FileStorage:
         )
         create_file.restype = wintypes.HANDLE
         access = 0x80000000
-        if create:
+        if create or write_access:
             access |= 0x40000000
         if delete_access:
             access |= 0x00010000
@@ -928,7 +1001,7 @@ class FileStorage:
         )
         if handle == wintypes.HANDLE(-1).value:
             raise ctypes.WinError(ctypes.get_last_error())
-        flags = os.O_BINARY | (os.O_RDWR if create else os.O_RDONLY)
+        flags = os.O_BINARY | (os.O_RDWR if create or write_access else os.O_RDONLY)
         try:
             return msvcrt.open_osfhandle(int(handle), flags)
         except BaseException:
