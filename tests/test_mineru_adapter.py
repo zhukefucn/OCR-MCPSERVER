@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Callable
 from email.parser import BytesParser
 from email.policy import default
@@ -7,6 +8,8 @@ from io import BytesIO
 import json
 from pathlib import Path
 import stat
+import threading
+import time
 from typing import Any
 from zipfile import ZipFile, ZipInfo
 
@@ -147,7 +150,7 @@ def _archive_handler(
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
             return httpx.Response(202, json=_submission_payload())
-        if request.url.path.endswith("/results"):
+        if request.url.path.endswith("/result"):
             headers = {"Content-Type": content_type}
             headers.update(result_headers or {})
             if stream is not None:
@@ -184,7 +187,7 @@ def _submission_payload(**changes: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "task_id": "upstream-1",
         "status_url": "https://api.example.test/api/tasks/upstream-1",
-        "result_url": "https://api.example.test/api/tasks/upstream-1/results",
+        "result_url": "https://api.example.test/api/tasks/upstream-1/result",
         "file_names": ["safe.pdf"],
         "queued_ahead": 0,
     }
@@ -236,12 +239,12 @@ async def test_valid_task_flow_forces_protocol_and_preserves_local_context(
                 json={
                     "task_id": "upstream-1",
                     "status_url": "https://api.example.test/api/tasks/upstream-1",
-                    "result_url": "https://api.example.test/api/tasks/upstream-1/results",
+                    "result_url": "https://api.example.test/api/tasks/upstream-1/result",
                     "file_names": ["safe.pdf"],
                     "queued_ahead": 4,
                 },
             )
-        if request.url.path.endswith("/results"):
+        if request.url.path.endswith("/result"):
             return httpx.Response(
                 200,
                 headers={"Content-Type": "application/zip"},
@@ -316,7 +319,7 @@ async def test_connection_establishment_failures_retry_before_one_accepted_submi
                 raise httpx.ConnectError("secret configured URL", request=request)
             calls["accepted"] += 1
             return httpx.Response(202, json=_submission_payload())
-        if request.url.path.endswith("/results"):
+        if request.url.path.endswith("/result"):
             return httpx.Response(
                 200,
                 headers={"Content-Type": "application/zip"},
@@ -396,7 +399,7 @@ async def test_polling_retries_transient_status_and_read_failure(
         nonlocal poll_calls
         if request.method == "POST":
             return httpx.Response(202, json=_submission_payload())
-        if request.url.path.endswith("/results"):
+        if request.url.path.endswith("/result"):
             return httpx.Response(
                 200,
                 headers={"Content-Type": "application/zip"},
@@ -424,7 +427,7 @@ async def test_terminal_failed_task_is_not_retried_or_downloaded(tmp_path: Path)
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
             return httpx.Response(202, json=_submission_payload())
-        if request.url.path.endswith("/results"):
+        if request.url.path.endswith("/result"):
             calls["result"] += 1
             return httpx.Response(200, content=b"unexpected")
         calls["poll"] += 1
@@ -466,6 +469,27 @@ async def test_overall_task_deadline_stops_pending_poll_loop(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_pending_sleep_is_capped_to_remaining_task_deadline(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(202, json=_submission_payload())
+        return httpx.Response(200, json={"status": "pending"})
+
+    clock = FakeClock()
+    with pytest.raises(MinerUFailure) as exc_info:
+        await _parse_with_handler(
+            tmp_path,
+            handler,
+            clock=clock,
+            settings=_settings(task_deadline_seconds=0.1),
+        )
+
+    assert exc_info.value.code == "mineru_deadline_exceeded"
+    assert clock.sleeps == [0.1]
+    assert clock.value == pytest.approx(0.1)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "submission_response",
     [
@@ -481,19 +505,25 @@ async def test_overall_task_deadline_stops_pending_poll_loop(tmp_path: Path) -> 
         httpx.Response(
             202,
             json=_submission_payload(
-                result_url="https://user:password@api.example.test/api/tasks/upstream-1/results"
+                result_url="https://user:password@api.example.test/api/tasks/upstream-1/result"
             ),
         ),
         httpx.Response(
             202,
             json=_submission_payload(
-                result_url="https://api.example.test/api/tasks/upstream-1/results#secret"
+                result_url="https://api.example.test/api/tasks/upstream-1/result#secret"
             ),
         ),
         httpx.Response(
             202,
             json=_submission_payload(
                 result_url="https://api.example.test/api/tasks/upstream-1/unexpected"
+            ),
+        ),
+        httpx.Response(
+            202,
+            json=_submission_payload(
+                result_url="https://api.example.test/api/tasks/upstream-1/results"
             ),
         ),
     ],
@@ -517,6 +547,33 @@ async def test_malformed_or_untrusted_submission_is_ambiguous_and_not_followed(
 
 
 @pytest.mark.asyncio
+async def test_real_singular_result_endpoint_is_accepted(tmp_path: Path) -> None:
+    requested_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        if request.method == "POST":
+            return httpx.Response(
+                202,
+                json=_submission_payload(
+                    result_url="https://api.example.test/api/tasks/upstream-1/result"
+                ),
+            )
+        if request.url.path.endswith("/result"):
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "application/zip"},
+                content=_zip_bytes(),
+            )
+        return httpx.Response(200, json={"status": "completed"})
+
+    result = await _parse_with_handler(tmp_path, handler)
+
+    assert result.content_list_v2_path.is_file()
+    assert requested_paths[-1] == "/api/tasks/upstream-1/result"
+
+
+@pytest.mark.asyncio
 async def test_non_ascii_upstream_task_id_is_rejected_before_followup(
     tmp_path: Path,
 ) -> None:
@@ -530,7 +587,7 @@ async def test_non_ascii_upstream_task_id_is_rejected_before_followup(
             json=_submission_payload(
                 task_id="任务",
                 status_url="https://api.example.test/api/tasks/任务",
-                result_url="https://api.example.test/api/tasks/任务/results",
+                result_url="https://api.example.test/api/tasks/任务/result",
             ),
         )
 
@@ -570,7 +627,7 @@ async def test_result_requires_zip_content_type(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
             return httpx.Response(202, json=_submission_payload())
-        if request.url.path.endswith("/results"):
+        if request.url.path.endswith("/result"):
             return httpx.Response(
                 200,
                 headers={"Content-Type": "application/octet-stream"},
@@ -632,7 +689,7 @@ async def test_download_retries_transient_status_and_midstream_read_error(
         nonlocal result_calls
         if request.method == "POST":
             return httpx.Response(202, json=_submission_payload())
-        if request.url.path.endswith("/results"):
+        if request.url.path.endswith("/result"):
             result_calls += 1
             if result_calls == 1:
                 return httpx.Response(503, content=b"secret body")
@@ -667,7 +724,7 @@ async def test_download_write_failure_is_not_retried_or_safe_for_whole_file_retr
         nonlocal result_calls
         if request.method == "POST":
             return httpx.Response(202, json=_submission_payload())
-        if request.url.path.endswith("/results"):
+        if request.url.path.endswith("/result"):
             result_calls += 1
             raise httpx.WriteTimeout("secret URL", request=request)
         return httpx.Response(200, json={"status": "completed"})
@@ -886,13 +943,44 @@ async def test_existing_published_result_is_never_overwritten(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_destination_created_at_publication_boundary_is_never_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ocr_mcp_server.infra import mineru_adapter as adapter_module
+    from ocr_mcp_server.infra.mineru_archive import publish_directory_no_replace
+
+    boundary_reached = False
+
+    def create_destination_then_publish(source: Path, target: Path) -> None:
+        nonlocal boundary_reached
+        boundary_reached = True
+        target.mkdir()
+        publish_directory_no_replace(source, target)
+
+    monkeypatch.setattr(
+        adapter_module,
+        "publish_directory_no_replace",
+        create_destination_then_publish,
+        raising=False,
+    )
+
+    with pytest.raises(MinerUFailure) as exc_info:
+        await _parse_with_handler(tmp_path, _archive_handler(_zip_bytes()))
+
+    assert boundary_reached
+    assert exc_info.value.code == "mineru_archive_unsafe"
+    destination = tmp_path / "published" / "safe"
+    assert destination.is_dir()
+    assert list(destination.iterdir()) == []
+    assert not list((tmp_path / "published").glob(".mineru-staging-*"))
+
+
+@pytest.mark.asyncio
 async def test_cancellation_cleans_partial_zip_and_staging_output(tmp_path: Path) -> None:
     class CancelledStream(ChunkedStream):
         async def __aiter__(self) -> AsyncIterator[bytes]:
             yield b"partial zip bytes"
             raise asyncio.CancelledError
-
-    import asyncio
 
     stream = CancelledStream([])
     with pytest.raises(asyncio.CancelledError):
@@ -902,6 +990,64 @@ async def test_cancellation_cleans_partial_zip_and_staging_output(tmp_path: Path
 
     output = tmp_path / "published"
     assert stream.closed
+    assert output.is_dir()
+    assert list(output.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_extraction_is_responsive_and_waits_for_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zipfile
+
+    entered_read = threading.Event()
+    release_read = threading.Event()
+    heartbeat = threading.Event()
+    responsive_before_release: list[bool] = []
+    completed_before_release: list[bool] = []
+    read_calls = 0
+    original_read = zipfile.ZipExtFile.read
+
+    def controlled_read(self, size: int = -1) -> bytes:
+        nonlocal read_calls
+        read_calls += 1
+        if read_calls == 1:
+            entered_read.set()
+            if not release_read.wait(timeout=2):
+                raise AssertionError("test extraction release timed out")
+        return original_read(self, size)
+
+    monkeypatch.setattr(zipfile.ZipExtFile, "read", controlled_read)
+    parse_task = asyncio.create_task(
+        _parse_with_handler(tmp_path, _archive_handler(_zip_bytes()))
+    )
+    loop = asyncio.get_running_loop()
+
+    def coordinate_cancellation() -> None:
+        if not entered_read.wait(timeout=2):
+            return
+        loop.call_soon_threadsafe(heartbeat.set)
+        loop.call_soon_threadsafe(parse_task.cancel)
+        time.sleep(0.03)
+        loop.call_soon_threadsafe(parse_task.cancel)
+        time.sleep(0.07)
+        responsive_before_release.append(heartbeat.is_set())
+        completed_before_release.append(parse_task.done())
+        release_read.set()
+
+    coordinator = threading.Thread(target=coordinate_cancellation, daemon=True)
+    coordinator.start()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await parse_task
+    finally:
+        release_read.set()
+        coordinator.join(timeout=2)
+
+    assert responsive_before_release == [True]
+    assert completed_before_release == [False]
+    assert read_calls == 1
+    output = tmp_path / "published"
     assert output.is_dir()
     assert list(output.iterdir()) == []
 

@@ -6,16 +6,13 @@ import asyncio
 from collections.abc import Awaitable, Callable
 import inspect
 import json
-import os
 from pathlib import Path
 import re
 import shutil
-import stat
 import tempfile
+import threading
 import time
 from typing import Any
-import unicodedata
-from zipfile import BadZipFile, ZipFile, ZipInfo
 
 import httpx
 
@@ -29,6 +26,12 @@ from ..domain import (
     MinerUSubmission,
 )
 from ..settings import MinerUSettings
+from .mineru_archive import (
+    ArchiveWorkCancelled,
+    ExtractedArchive,
+    extract_archive,
+    publish_directory_no_replace,
+)
 
 
 ProgressCallback = Callable[[MinerUProgress], Awaitable[None] | None]
@@ -256,7 +259,10 @@ class MinerUAdapter:
                 )
                 if inspect.isawaitable(callback_result):
                     await callback_result
-            await self._sleep(self._settings.poll_interval_seconds)
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise MinerUFailure(MinerUErrorCode.DEADLINE_EXCEEDED) from None
+            await self._sleep(min(self._settings.poll_interval_seconds, remaining))
 
     async def _retry_sleep_before_deadline(
         self, attempt: int, deadline: float
@@ -303,18 +309,18 @@ class MinerUAdapter:
             await self._download_archive(
                 submission.result_url, archive_path, deadline
             )
-            document_name, parse_directory = self._extract_archive(
+            extracted = await self._extract_archive_in_worker(
                 archive_path,
                 extracted_root,
                 expected_stem=Path(request.upload_name).stem,
             )
+            document_name = extracted.document_name
+            parse_directory = extracted.parse_directory
 
             source_root = extracted_root / document_name
             published_root = request.output_directory / document_name
-            if os.path.lexists(published_root):
-                raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
             try:
-                source_root.rename(published_root)
+                publish_directory_no_replace(source_root, published_root)
             except FileExistsError as exc:
                 raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE, cause=exc) from None
             parse_root = published_root / parse_directory
@@ -421,167 +427,45 @@ class MinerUAdapter:
         if declared_size > self._settings.max_compressed_bytes:
             raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
 
-    def _extract_archive(
+    async def _extract_archive_in_worker(
         self, archive_path: Path, extracted_root: Path, *, expected_stem: str
-    ) -> tuple[str, str]:
-        extracted_root.mkdir()
-        try:
-            with ZipFile(archive_path) as archive:
-                entries, document_name, parse_directory = self._validate_entries(
-                    archive, extracted_root, expected_stem
-                )
-                actual_total = 0
-                for info, parts in entries:
-                    destination = extracted_root.joinpath(*parts)
-                    if info.is_dir():
-                        destination.mkdir(parents=True, exist_ok=True)
-                        if not destination.is_dir():
-                            raise MinerUFailure(
-                                MinerUErrorCode.UNSAFE_ARCHIVE
-                            ) from None
-                        continue
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    with archive.open(info) as source, destination.open("xb") as output:
-                        while chunk := source.read(64 * 1024):
-                            actual_total += len(chunk)
-                            if actual_total > self._settings.max_uncompressed_bytes:
-                                raise MinerUFailure(
-                                    MinerUErrorCode.UNSAFE_ARCHIVE
-                                ) from None
-                            output.write(chunk)
-        except MinerUFailure:
-            raise
-        except (BadZipFile, OSError, RuntimeError, UnicodeError) as exc:
-            raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE, cause=exc) from None
-
-        manifest = (
-            extracted_root
-            / document_name
-            / parse_directory
-            / f"{expected_stem}_content_list_v2.json"
+    ) -> ExtractedArchive:
+        cancel_event = threading.Event()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                extract_archive,
+                archive_path,
+                extracted_root,
+                expected_stem=expected_stem,
+                max_entries=self._settings.max_archive_entries,
+                max_uncompressed_bytes=self._settings.max_uncompressed_bytes,
+                cancel_event=cancel_event,
+            )
         )
         try:
-            parsed_manifest = json.loads(manifest.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError as cancellation:
+            cancel_event.set()
+            await self._wait_for_archive_worker(worker)
+            raise cancellation
+        except ArchiveWorkCancelled as exc:
             raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE, cause=exc) from None
-        if not isinstance(parsed_manifest, list):
-            raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
-        return document_name, parse_directory
-
-    def _validate_entries(
-        self, archive: ZipFile, extracted_root: Path, expected_stem: str
-    ) -> tuple[list[tuple[ZipInfo, tuple[str, ...]]], str, str]:
-        infos = archive.infolist()
-        if not infos or len(infos) > self._settings.max_archive_entries:
-            raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
-
-        validated: list[tuple[ZipInfo, tuple[str, ...]]] = []
-        normalized_destinations: set[tuple[str, ...]] = set()
-        declared_total = 0
-        file_paths: list[tuple[str, ...]] = []
-        directory_paths: list[tuple[str, ...]] = []
-        manifest_paths: list[tuple[str, ...]] = []
-        root = extracted_root.resolve()
-        for info in infos:
-            parts = self._safe_zip_parts(
-                info.orig_filename, is_directory=info.is_dir()
-            )
-            normalized = tuple(
-                unicodedata.normalize("NFC", part).casefold().rstrip(" .")
-                for part in parts
-            )
-            if any(not part for part in normalized):
-                raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
-            if normalized in normalized_destinations:
-                raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
-            normalized_destinations.add(normalized)
-
-            file_type = stat.S_IFMT(info.external_attr >> 16)
-            accepted_types = {0, stat.S_IFDIR if info.is_dir() else stat.S_IFREG}
-            if file_type not in accepted_types:
-                raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
-            destination = extracted_root.joinpath(*parts).resolve()
-            if not destination.is_relative_to(root):
-                raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
-            if not info.is_dir():
-                declared_total += info.file_size
-                if declared_total > self._settings.max_uncompressed_bytes:
-                    raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
-                file_paths.append(parts)
-                if parts[-1].endswith("_content_list_v2.json"):
-                    manifest_paths.append(parts)
-            else:
-                directory_paths.append(parts)
-            validated.append((info, parts))
-
-        if not file_paths:
-            raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
-        if any(len(parts) < 3 for parts in file_paths):
-            raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
-        documents = {parts[0] for parts in file_paths}
-        parse_directories = {parts[1] for parts in file_paths}
-        if documents != {expected_stem} or len(parse_directories) != 1:
-            raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
-        parse_directory = next(iter(parse_directories))
-        for parts in directory_paths:
-            if parts in {(expected_stem,), (expected_stem, parse_directory)}:
-                continue
-            if (
-                len(parts) >= 3
-                and parts[:2] == (expected_stem, parse_directory)
-                and parts[2].casefold() == "images"
-            ):
-                continue
-            raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
-        for parts in file_paths:
-            if len(parts) > 3 and parts[2].casefold() != "images":
-                raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
-            image_indexes = [
-                index
-                for index, part in enumerate(parts[2:], start=2)
-                if part.casefold() == "images"
-            ]
-            if image_indexes and image_indexes != [2]:
-                raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
-        expected_manifest = (
-            expected_stem,
-            parse_directory,
-            f"{expected_stem}_content_list_v2.json",
-        )
-        if manifest_paths != [expected_manifest]:
-            raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
-        return validated, expected_stem, parse_directory
 
     @staticmethod
-    def _safe_zip_parts(name: str, *, is_directory: bool) -> tuple[str, ...]:
-        if (
-            not name
-            or "\x00" in name
-            or "\\" in name
-            or name.startswith("/")
-            or re.match(r"^[A-Za-z]:($|/)", name)
-        ):
-            raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
-        selected = name[:-1] if is_directory and name.endswith("/") else name
-        parts = tuple(selected.split("/"))
-        windows_devices = {
-            "CON",
-            "PRN",
-            "AUX",
-            "NUL",
-            *(f"COM{number}" for number in range(1, 10)),
-            *(f"LPT{number}" for number in range(1, 10)),
-        }
-        for part in parts:
-            if (
-                not part
-                or part in {".", ".."}
-                or ":" in part
-                or any(ord(character) < 32 for character in part)
-                or part.rstrip(" .").split(".", 1)[0].upper() in windows_devices
-            ):
-                raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
-        return parts
+    async def _wait_for_archive_worker(worker: asyncio.Task[ExtractedArchive]) -> None:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                return
+        if worker.cancelled():
+            return
+        try:
+            worker.result()
+        except Exception:
+            pass
 
     @staticmethod
     def _required_string(payload: dict[str, Any], key: str) -> str:
@@ -604,7 +488,7 @@ class MinerUAdapter:
     ) -> str:
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", task_id) is None:
             raise ValueError
-        suffix = f"tasks/{task_id}" + ("/results" if result else "")
+        suffix = f"tasks/{task_id}" + ("/result" if result else "")
         expected = httpx.URL(self._with_api_path(suffix))
         reported = httpx.URL(reported_value)
         if (

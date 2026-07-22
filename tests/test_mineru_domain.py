@@ -38,7 +38,7 @@ def test_mineru_public_contracts_bind_local_task_context(tmp_path: Path) -> None
         file_task_id="local-task",
         upstream_task_id="upstream-task",
         status_url="https://api.example.test/tasks/upstream-task",
-        result_url="https://api.example.test/tasks/upstream-task/results",
+        result_url="https://api.example.test/tasks/upstream-task/result",
         queued_ahead=2,
     )
     progress = MinerUProgress(
