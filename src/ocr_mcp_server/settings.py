@@ -98,6 +98,25 @@ class RetentionSettings(_SettingsSection):
     audit_metadata_days: int = Field(
         default=DEFAULT_AUDIT_METADATA_RETENTION_DAYS, ge=1
     )
+    cleanup_batch_size: int = Field(default=25, ge=1, le=1000)
+    cleanup_lease_seconds: int = Field(default=300, ge=1)
+    cleanup_interval_seconds: int = Field(default=300, ge=1)
+
+    @field_validator(
+        "input_hours",
+        "intermediate_hours",
+        "result_hours",
+        "audit_metadata_days",
+        "cleanup_batch_size",
+        "cleanup_lease_seconds",
+        "cleanup_interval_seconds",
+        mode="before",
+    )
+    @classmethod
+    def reject_boolean_values(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("boolean values are not retention settings")
+        return value
 
 
 class MinerUSettings(_SettingsSection):

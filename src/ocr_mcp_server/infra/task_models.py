@@ -162,3 +162,28 @@ class ReplacementAuditMetadataRecord(Base):
     engine: Mapped[str] = mapped_column(String(64), nullable=False)
     model_versions_json: Mapped[str] = mapped_column(String(4096), nullable=False)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class RetentionRecord(Base):
+    __tablename__ = "retention"
+    __table_args__ = (
+        CheckConstraint("attempt_count >= 0"),
+        CheckConstraint("version >= 1"),
+    )
+
+    batch_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("batches.id", ondelete="CASCADE"), primary_key=True
+    )
+    content_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    metadata_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    content_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    early_delete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    claim_phase: Mapped[str | None] = mapped_column(String(16))
+    claim_token: Mapped[str | None] = mapped_column(String(36), unique=True)
+    claim_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error_code: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)

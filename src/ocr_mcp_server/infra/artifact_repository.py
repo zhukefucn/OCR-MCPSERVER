@@ -26,6 +26,7 @@ from .task_models import (
     ArtifactRecord,
     FileTaskRecord,
     ReplacementAuditMetadataRecord,
+    RetentionRecord,
 )
 
 
@@ -92,6 +93,9 @@ class ArtifactRepository:
                 file_record = await session.get(FileTaskRecord, bundle.file_task_id)
                 if file_record is None or file_record.batch_id != bundle.batch_id:
                     _fail(ArtifactErrorCode.INDEX_CONFLICT)
+                retention = await session.get(RetentionRecord, bundle.batch_id)
+                if retention is None or retention.content_deleted_at is not None:
+                    _fail(ArtifactErrorCode.INDEX_CONFLICT)
                 artifact = await session.get(ArtifactRecord, bundle.artifact_id)
                 if artifact is None:
                     artifact = ArtifactRecord(
@@ -137,6 +141,13 @@ class ArtifactRepository:
                         session.add(ReplacementAuditMetadataRecord(**expected))
                     elif not self._audit_matches(existing, expected):
                         _fail(ArtifactErrorCode.INDEX_CONFLICT)
+                if (
+                    not retention.early_delete
+                    and _database_utc(retention.content_due_at) < _utc(bundle.expires_at)
+                ):
+                    retention.content_due_at = _utc(bundle.expires_at)
+                    retention.updated_at = _utc(bundle.created_at)
+                    retention.version += 1
                 await session.commit()
                 return self._artifact_snapshot(artifact)
         except ArtifactFailure:

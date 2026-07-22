@@ -27,6 +27,7 @@ from ocr_mcp_server.domain import (
     validate_content_free_model_versions,
 )
 from ocr_mcp_server.infra.artifact_repository import ArtifactRepository
+from ocr_mcp_server.infra.retention_repository import RetentionRepository
 from ocr_mcp_server.infra.database import (
     create_database_engine,
     create_session_factory,
@@ -940,6 +941,30 @@ async def test_repository_registers_exact_idempotent_content_free_metadata_and_o
     assert not (forbidden & columns["replacement_audit_metadata"])
     assert "not metadata" not in raw
     assert str(tmp_path) not in raw
+
+
+@pytest.mark.asyncio
+async def test_repository_extends_batch_content_retention_to_artifact_expiry(
+    tmp_path: Path, artifact_repository
+) -> None:
+    repository, engine, batch_id = artifact_repository
+    result, publication, _, _ = _inputs(tmp_path)
+    expires_at = NOW + timedelta(days=365)
+    bundle = ArtifactBundler(
+        ArtifactLimits(1_000_000, 100_000, 20, 100_000)
+    ).publish(
+        result,
+        publication,
+        artifact_root=(tmp_path / "artifacts").absolute(),
+        batch_id=batch_id,
+        created_at=NOW,
+        expires_at=expires_at,
+    )
+
+    await repository.register(bundle, publication.records)
+
+    retention = RetentionRepository(create_session_factory(engine))
+    assert (await retention.get(batch_id)).content_due_at == expires_at
 
 
 @pytest.mark.asyncio

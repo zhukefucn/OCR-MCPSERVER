@@ -801,7 +801,9 @@ class FileStorage:
         return ctypes.WinDLL("kernel32", use_last_error=True)
 
     @classmethod
-    def _windows_open_directory_handle(cls, path: Path) -> int:
+    def _windows_open_directory_handle(
+        cls, path: Path, *, delete_access: bool = False
+    ) -> int:
         kernel32 = cls._windows_kernel32()
         create_file = kernel32.CreateFileW
         create_file.argtypes = (
@@ -814,9 +816,12 @@ class FileStorage:
             wintypes.HANDLE,
         )
         create_file.restype = wintypes.HANDLE
+        access = 0x80 | 0x0001
+        if delete_access:
+            access |= 0x00010000
         handle = create_file(
             str(path),
-            0x80 | 0x0001,
+            access,
             0x1 | 0x2 | 0x4,
             None,
             3,

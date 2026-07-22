@@ -33,6 +33,9 @@ retention:
   intermediate_hours: 24
   result_hours: 24
   audit_metadata_days: 30
+  cleanup_batch_size: 25
+  cleanup_lease_seconds: 300
+  cleanup_interval_seconds: 300
 
 artifacts:
   max_artifact_bytes: 1073741824

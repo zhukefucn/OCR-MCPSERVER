@@ -10,6 +10,12 @@ from uuid import uuid4
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from ..domain.constants import (
+    DEFAULT_AUDIT_METADATA_RETENTION_DAYS,
+    DEFAULT_INPUT_RETENTION_HOURS,
+    DEFAULT_INTERMEDIATE_RETENTION_HOURS,
+    DEFAULT_RESULT_RETENTION_HOURS,
+)
 from ..domain.errors import (
     DomainError,
     InputValidationError,
@@ -34,7 +40,7 @@ from ..domain.tasks import (
     StageEventSnapshot,
 )
 from .database import SessionFactory
-from .task_models import BatchRecord, FileTaskRecord, StageEventRecord
+from .task_models import BatchRecord, FileTaskRecord, RetentionRecord, StageEventRecord
 
 _ERROR_CODE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}\Z")
 _TERMINAL = frozenset(
@@ -74,6 +80,10 @@ class TaskRepository:
         file_ids: Sequence[str],
         *,
         max_attempts: int = 3,
+        input_retention_hours: int = DEFAULT_INPUT_RETENTION_HOURS,
+        intermediate_retention_hours: int = DEFAULT_INTERMEDIATE_RETENTION_HOURS,
+        result_retention_hours: int = DEFAULT_RESULT_RETENTION_HOURS,
+        audit_metadata_retention_days: int = DEFAULT_AUDIT_METADATA_RETENTION_DAYS,
     ) -> CreateBatchResult:
         ids = tuple(file_ids)
         if (
@@ -83,6 +93,15 @@ class TaskRepository:
             or len(set(ids)) != len(ids)
             or isinstance(max_attempts, bool)
             or max_attempts < 1
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 1
+                for value in (
+                    input_retention_hours,
+                    intermediate_retention_hours,
+                    result_retention_hours,
+                    audit_metadata_retention_days,
+                )
+            )
         ):
             raise InputValidationError()
         existing = await self._get_by_key(idempotency_key)
@@ -121,10 +140,31 @@ class TaskRepository:
             )
             for position, file_id in enumerate(ids)
         ]
+        retention = RetentionRecord(
+            batch_id=batch.id,
+            content_due_at=now + timedelta(hours=max(
+                input_retention_hours,
+                intermediate_retention_hours,
+                result_retention_hours,
+            )),
+            metadata_due_at=now + timedelta(days=audit_metadata_retention_days),
+            content_deleted_at=None,
+            early_delete=False,
+            claim_phase=None,
+            claim_token=None,
+            claim_owner=None,
+            lease_expires_at=None,
+            attempt_count=0,
+            last_error_code=None,
+            created_at=now,
+            updated_at=now,
+            version=1,
+        )
         try:
             async with self._sessions() as session:
                 session.add(batch)
                 session.add_all(files)
+                session.add(retention)
                 await session.commit()
             return CreateBatchResult(
                 batch=self._batch_snapshot(batch),

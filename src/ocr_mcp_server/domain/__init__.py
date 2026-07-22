@@ -16,6 +16,8 @@ from .errors import (
     MergeErrorCode,
     MergeFailure,
     PersistenceError,
+    RetentionErrorCode,
+    RetentionFailure,
     SecondaryOcrErrorCode,
     SecondaryOcrFailure,
     StateTransitionError,
@@ -37,6 +39,7 @@ from .artifacts import (
     validate_content_free_model_versions,
 )
 from .progress import ProgressCounters, ProgressUnit, map_stage_progress
+from .retention import RetentionClaim, RetentionPhase, RetentionRunResult, RetentionSnapshot
 from .merge import (
     MergePublicationResult,
     ReplacementAuditRecord,
@@ -118,6 +121,12 @@ __all__ = [
     "validate_content_free_model_versions",
     "ReplacementDecision",
     "ReplacementReason",
+    "RetentionClaim",
+    "RetentionErrorCode",
+    "RetentionFailure",
+    "RetentionPhase",
+    "RetentionRunResult",
+    "RetentionSnapshot",
     "RollbackPublicationResult",
     "SecondaryOCREngine",
     "SecondaryOcrErrorCode",

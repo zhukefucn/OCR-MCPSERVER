@@ -8,6 +8,7 @@ from .database import (
 )
 from .task_repository import TaskRepository
 from .artifact_repository import ArtifactRepository
+from .retention_repository import RetentionRepository
 from .mineru_adapter import MinerUAdapter, ProgressCallback
 from .secondary_ocr import (
     SecondaryOcrWorkerLifecycle,
@@ -20,6 +21,7 @@ __all__ = [
     "SessionFactory",
     "MinerUAdapter",
     "ProgressCallback",
+    "RetentionRepository",
     "SecondaryOcrWorkerLifecycle",
     "SingleOwnerSecondaryOcrWorker",
     "SynchronousSecondaryOcrBackend",

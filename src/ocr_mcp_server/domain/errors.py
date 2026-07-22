@@ -279,3 +279,32 @@ class ArtifactFailure(DomainError):
         self.code = code.value
         self.safe_message = _ARTIFACT_SAFE_MESSAGES[code]
         Exception.__init__(self, self.safe_message)
+
+
+class RetentionErrorCode(StrEnum):
+    """Stable content-free codes for cleanup and metadata expiry."""
+
+    CLEANUP_OWNERSHIP = "cleanup_ownership_invalid"
+    CLEANUP_FAILED = "cleanup_failed"
+    CLAIM_CONFLICT = "cleanup_claim_conflict"
+    METADATA_PURGE_FAILED = "metadata_purge_failed"
+
+
+_RETENTION_SAFE_MESSAGES = {
+    RetentionErrorCode.CLEANUP_OWNERSHIP: "The cleanup target is not provably service-owned.",
+    RetentionErrorCode.CLEANUP_FAILED: "Content cleanup could not be completed safely.",
+    RetentionErrorCode.CLAIM_CONFLICT: "The cleanup claim is invalid or expired.",
+    RetentionErrorCode.METADATA_PURGE_FAILED: "Expired metadata could not be purged.",
+}
+
+
+class RetentionFailure(DomainError):
+    """Retention failure that discards paths, content, and unsafe causes."""
+
+    def __init__(
+        self, code: RetentionErrorCode, *, cause: BaseException | None = None
+    ) -> None:
+        del cause
+        self.code = code.value
+        self.safe_message = _RETENTION_SAFE_MESSAGES[code]
+        Exception.__init__(self, self.safe_message)
