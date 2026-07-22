@@ -49,6 +49,13 @@ def test_settings_defaults_match_domain_constraints() -> None:
     assert settings.structured_content.max_artifact_bytes >= settings.structured_content.max_utf8_bytes
     assert settings.database.url == "sqlite+aiosqlite:///data/ocr.sqlite3"
     assert settings.database.busy_timeout_ms == 5000
+    assert settings.orchestration.worker_count == 1
+    assert settings.orchestration.wake_queue_capacity == 64
+    assert settings.orchestration.lease_seconds == 120
+    assert settings.orchestration.heartbeat_seconds == 30
+    assert settings.orchestration.idle_poll_seconds == 1
+    assert settings.orchestration.recovery_scan_seconds == 30
+    assert settings.orchestration.notification_min_interval_seconds == 2
     assert settings.remote_import.allowed_hosts == []
     assert settings.remote_import.max_redirects == 3
     assert settings.remote_import.timeout_seconds == 30
@@ -345,6 +352,48 @@ def test_example_yaml_documents_secondary_ocr_deployment_defaults() -> None:
     assert settings.classification_threshold == 0.8
     assert settings.paddlex_config is None
     assert settings.formula_model_name == "PP-FormulaNet_plus-S"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("worker_count", 0),
+        ("worker_count", 9),
+        ("worker_count", True),
+        ("wake_queue_capacity", 0),
+        ("wake_queue_capacity", 1025),
+        ("wake_queue_capacity", True),
+        ("lease_seconds", 0),
+        ("heartbeat_seconds", 0),
+        ("idle_poll_seconds", 0),
+        ("recovery_scan_seconds", 0),
+        ("notification_min_interval_seconds", 0),
+    ],
+)
+def test_orchestration_settings_reject_invalid_values(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(orchestration={field: value})
+
+
+def test_orchestration_heartbeat_must_be_strictly_shorter_than_lease() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(
+            orchestration={"lease_seconds": 30, "heartbeat_seconds": 30}
+        )
+
+
+def test_example_yaml_documents_orchestration_defaults() -> None:
+    orchestration = load_settings(config_file=Path("config/example.yaml")).orchestration
+
+    assert orchestration.worker_count == 1
+    assert orchestration.wake_queue_capacity == 64
+    assert orchestration.lease_seconds == 120
+    assert orchestration.heartbeat_seconds == 30
+    assert orchestration.idle_poll_seconds == 1
+    assert orchestration.recovery_scan_seconds == 30
+    assert orchestration.notification_min_interval_seconds == 2
 
 
 def test_example_yaml_documents_structured_merge_safety_limits() -> None:

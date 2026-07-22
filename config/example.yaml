@@ -7,6 +7,14 @@ data_root: data
 database:
   url: sqlite+aiosqlite:///data/ocr.sqlite3
   busy_timeout_ms: 5000
+orchestration:
+  worker_count: 1
+  wake_queue_capacity: 64
+  lease_seconds: 120
+  heartbeat_seconds: 30
+  idle_poll_seconds: 1
+  recovery_scan_seconds: 30
+  notification_min_interval_seconds: 2
 
 limits:
   max_files: 20

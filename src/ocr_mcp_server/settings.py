@@ -212,6 +212,38 @@ class DatabaseSettings(_SettingsSection):
         return value
 
 
+class OrchestrationSettings(_SettingsSection):
+    worker_count: int = Field(default=1, ge=1, le=8)
+    wake_queue_capacity: int = Field(default=64, ge=1, le=1024)
+    lease_seconds: int = Field(default=120, ge=1)
+    heartbeat_seconds: int = Field(default=30, ge=1)
+    idle_poll_seconds: int = Field(default=1, ge=1)
+    recovery_scan_seconds: int = Field(default=30, ge=1)
+    notification_min_interval_seconds: int = Field(default=2, ge=1)
+
+    @field_validator(
+        "worker_count",
+        "wake_queue_capacity",
+        "lease_seconds",
+        "heartbeat_seconds",
+        "idle_poll_seconds",
+        "recovery_scan_seconds",
+        "notification_min_interval_seconds",
+        mode="before",
+    )
+    @classmethod
+    def reject_boolean_numeric_values(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("boolean values are not numeric deployment settings")
+        return value
+
+    @model_validator(mode="after")
+    def validate_heartbeat_lease_order(self) -> OrchestrationSettings:
+        if self.heartbeat_seconds >= self.lease_seconds:
+            raise ValueError("heartbeat must be shorter than the lease")
+        return self
+
+
 class AppSettings(BaseSettings):
     """Complete process-level configuration for the service."""
 
@@ -230,6 +262,7 @@ class AppSettings(BaseSettings):
     secondary_ocr: SecondaryOCRSettings = Field(default_factory=SecondaryOCRSettings)
     structured_content: StructuredContentSettings = Field(default_factory=StructuredContentSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
+    orchestration: OrchestrationSettings = Field(default_factory=OrchestrationSettings)
 
     @classmethod
     def settings_customise_sources(
