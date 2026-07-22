@@ -184,3 +184,44 @@ Controller 在 Ubuntu 同步 `424699f` 后的最终验证结果：
 - pip check：`No broken requirements found.`
 - compileall：退出码 0
 - remote diff-check：退出码 0
+
+## 成功返回门禁架构收敛（2026-07-22）
+
+第三次 binding-return 复审不再采用单个返回点补丁，而是先枚举 `_publish` 的五个成功出口：
+
+1. POSIX 已存在目标幂等命中；
+2. Windows 已存在目标幂等命中；
+3. 首次发布 rename、验证和 root fsync 完成；
+4. POSIX `FileExistsError` 竞态解析为幂等命中；
+5. Windows `FileExistsError` 竞态解析为幂等命中。
+
+原结构在四个幂等出口重复局部检查，但首次发布出口没有在 root fsync 后复核 publication root 路径；重复逻辑也无法从结构上证明未来新增出口必经相同门禁。
+
+TDD RED 与突变验证：
+
+- 新增首次发布 root 交换回归。POSIX 在 `_verify_new_publication` 完成后的 root fsync 返回时交换 root；Windows 因目录 fsync 不可靠，在验证完成后的等价最终边界交换。移除统一终结门禁时稳定得到 `DID NOT RAISE MergeFailure`。
+- Windows target-name 回归改为只在 `_assert_target_binding_path` 完成首次 target identity 检查、并取得最后一个文件的 identity 后交换 target。临时移除该函数末尾的 target identity 复核时，测试稳定得到 `DID NOT RAISE MergeFailure`，证明回归确实约束最终复核，而不是首次检查。
+- POSIX target-name 回归继续在最终 target `openat` 返回 fd 后交换名称。
+
+实现提交：
+
+- `b9f3a634cf0a7c5b38bb501513d72e58dad71ac7` — `fix: centralize publication return binding`
+
+架构收敛结果：
+
+- 新增唯一 `_finalize_publication_return` 成功终结器；
+- 五个成功出口全部调用该终结器；
+- 终结器依次复核 root pathname identity、fd/path target 与文件 binding，再次复核 root pathname identity，然后才返回；
+- `_verify_new_publication` 返回经过验证的 `_TargetBinding`，首次发布在 root fsync 后携带该 binding 进入相同终结器；
+- `_publish` 中唯一直接 `return target` 位于成功终结器内部。
+
+本地 Windows GREEN 与门禁：
+
+- 三项定向回归：`3 passed`
+- Task 7 focused：`124 passed`
+- Full：`531 passed, 5 skipped`（`536 tests collected`）
+- pip check：`No broken requirements found.`
+- compileall：退出码 0
+- diff-check：退出码 0，仅 Git LF/CRLF 提示
+
+Linux GREEN 与 Linux 全套结果等待 controller 同步上述提交后复验。
