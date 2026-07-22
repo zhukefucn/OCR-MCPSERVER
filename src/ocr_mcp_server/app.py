@@ -51,6 +51,7 @@ def create_app(
             "service_unavailable": 503,
             "invalid_request": 422,
             "unsupported_media_type": 415,
+            "orientation_uncertain": 409,
         }.get(exc.code, 500)
         return _error_response(status_code, exc.code, exc.safe_message)
 

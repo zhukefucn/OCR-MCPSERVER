@@ -204,6 +204,11 @@ class RetentionRecord(Base):
 class OrientationRecoveryRecord(Base):
     __tablename__ = "orientation_recoveries"
     __table_args__ = (
+        UniqueConstraint(
+            "file_id",
+            "source_result_version",
+            name="uq_orientation_recovery_source_result",
+        ),
         CheckConstraint("length(token_digest) = 64"),
         CheckConstraint("token_digest NOT GLOB '*[^0-9a-f]*'"),
         CheckConstraint(

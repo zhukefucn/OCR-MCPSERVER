@@ -21,6 +21,7 @@ from ocr_mcp_server.api.gateway import (
     GatewayConflict,
     GatewayFailure,
     GatewayNotFound,
+    GatewayOrientationUncertain,
     GatewayUnavailable,
 )
 from ocr_mcp_server.app import create_app
@@ -254,6 +255,9 @@ def test_rest_workflow_uses_strict_contracts_and_explicit_operation_ids() -> Non
         "reparseWithPageOrientation",
         "liveness",
     } <= operation_ids
+    recovery_contract = schema["components"]["schemas"]["OrientationReparseRequest"]
+    assert set(recovery_contract["properties"]) == {"recovery_token", "pages"}
+    assert recovery_contract["additionalProperties"] is False
     serialized_schema = str(schema)
     for forbidden in ("engine", "backend", "device", "angle", "server_url"):
         assert forbidden not in serialized_schema
@@ -290,6 +294,7 @@ def test_gateway_failures_map_to_stable_safe_http_errors() -> None:
     cases = [
         (GatewayNotFound(), 404, "not_found"),
         (GatewayConflict(), 409, "conflict"),
+        (GatewayOrientationUncertain(), 409, "orientation_uncertain"),
         (GatewayCapacityExceeded(), 429, "capacity_exceeded"),
         (GatewayUnavailable(), 503, "service_unavailable"),
         (GatewayFailure(), 500, "internal_error"),

@@ -69,7 +69,32 @@ def _request(batch_id: str, stored, *decisions: OrientationDecision):
         media_type=stored.media_type,
         extension=stored.extension,
         page_count=stored.page_count,
+        expected_source_sha256=stored.sha256,
+        expected_source_size_bytes=stored.size_bytes,
         decisions=decisions,
+    )
+
+
+@pytest.mark.asyncio
+async def test_correction_rejects_valid_same_page_replacement_with_different_bytes(
+    tmp_path: Path,
+) -> None:
+    storage, batch_id, stored = await _stored(
+        tmp_path, _pdf_bytes(), "source.pdf", "application/pdf"
+    )
+    request = _request(batch_id, stored, _decision(1, OrthogonalAngle.DEG_90))
+    replacement = PdfWriter()
+    replacement.add_blank_page(width=73, height=145)
+    replacement.add_blank_page(width=101, height=201)
+    output = BytesIO()
+    replacement.write(output)
+    stored.path.write_bytes(output.getvalue())
+
+    with pytest.raises(OrientationFailure):
+        await ImmutableDocumentCorrector(storage).correct(request)
+    assert not any(
+        path.name.startswith(stored.file_id) is False and path.suffix == ".pdf"
+        for path in stored.path.parent.iterdir()
     )
 
 
@@ -180,6 +205,8 @@ async def test_correction_request_has_no_path_angle_or_engine_control(tmp_path: 
             media_type=SupportedMediaType.PDF,
             extension=".pdf",
             page_count=2,
+            expected_source_sha256=stored.sha256,
+            expected_source_size_bytes=stored.size_bytes,
             decisions=(_decision(1, OrthogonalAngle.DEG_90),),
             output_path=tmp_path / "chosen.pdf",
         )
@@ -196,6 +223,8 @@ async def test_pdf_page_count_binding_mismatch_creates_no_derivative(tmp_path: P
         media_type=stored.media_type,
         extension=stored.extension,
         page_count=1,
+        expected_source_sha256=stored.sha256,
+        expected_source_size_bytes=stored.size_bytes,
         decisions=(_decision(1, OrthogonalAngle.DEG_90),),
     )
 
@@ -455,6 +484,8 @@ async def test_transform_baseexception_preserves_control_flow_and_cleans_stage(
             batch_id,
             stored.file_id,
             stored.extension,
+            expected_source_sha256=stored.sha256,
+            expected_source_size_bytes=stored.size_bytes,
             transform=stop,
             max_file_size_bytes=1_000_000,
             validator=FileValidator(max_pages=500, max_image_pixels=10_000),
@@ -484,6 +515,8 @@ async def test_writer_enforces_byte_cap_before_oversized_write(tmp_path: Path) -
         batch_id,
         stored.file_id,
         stored.extension,
+        expected_source_sha256=stored.sha256,
+        expected_source_size_bytes=stored.size_bytes,
         transform=transform,
         max_file_size_bytes=len(valid),
         validator=FileValidator(max_pages=500, max_image_pixels=10_000),
@@ -543,6 +576,8 @@ async def test_all_writer_surfaces_enforce_byte_cap_before_growth(
         batch_id,
         stored.file_id,
         stored.extension,
+        expected_source_sha256=stored.sha256,
+        expected_source_size_bytes=stored.size_bytes,
         transform=transform,
         max_file_size_bytes=cap,
         validator=FileValidator(max_pages=500, max_image_pixels=10_000),
@@ -569,6 +604,8 @@ async def test_writer_exposes_no_descriptor_or_raw_mutator_bypass(tmp_path: Path
         batch_id,
         stored.file_id,
         stored.extension,
+        expected_source_sha256=stored.sha256,
+        expected_source_size_bytes=stored.size_bytes,
         transform=transform,
         max_file_size_bytes=len(valid),
         validator=FileValidator(max_pages=500, max_image_pixels=10_000),
@@ -595,6 +632,8 @@ async def test_derivative_rejects_non_positive_or_boolean_byte_cap(
             batch_id,
             stored.file_id,
             stored.extension,
+            expected_source_sha256=stored.sha256,
+            expected_source_size_bytes=stored.size_bytes,
             transform=transform,
             max_file_size_bytes=cap,
             validator=FileValidator(max_pages=500, max_image_pixels=10_000),

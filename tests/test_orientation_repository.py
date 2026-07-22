@@ -101,6 +101,11 @@ async def test_issue_persists_only_digest_and_content_free_columns(repository) -
         columns = await connection.run_sync(
             lambda sync: {item["name"] for item in inspect(sync).get_columns("orientation_recoveries")}
         )
+        unique_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints(
+                "orientation_recoveries"
+            )
+        )
         row = (await connection.execute(text("SELECT * FROM orientation_recoveries"))).mappings().one()
 
     assert issue.snapshot.state is RecoveryState.ISSUED
@@ -109,6 +114,37 @@ async def test_issue_persists_only_digest_and_content_free_columns(repository) -
     assert issue.token not in " ".join(str(value) for value in row.values())
     assert not {"token", "text", "content", "filename", "url", "path"} & columns
     assert row["suspected_pages"] == "2,4"
+    assert {"file_id", "source_result_version"} in {
+        frozenset(item["column_names"]) for item in unique_constraints
+    }
+
+
+@pytest.mark.asyncio
+async def test_issue_rejects_second_token_for_same_file_result_version(repository) -> None:
+    repo, _, batch_id, _ = repository
+    await repo.issue(binding(batch_id), now=NOW)
+    with pytest.raises(OrientationFailure) as caught:
+        await repo.issue(binding(batch_id), now=NOW)
+    assert caught.value.code == OrientationErrorCode.REQUEST_CONFLICT.value
+
+
+@pytest.mark.asyncio
+async def test_concurrent_issue_creates_exactly_one_token_for_source_version(repository) -> None:
+    repo, engine, batch_id, _ = repository
+    outcomes = await asyncio.gather(
+        *(repo.issue(binding(batch_id), now=NOW) for _ in range(8)),
+        return_exceptions=True,
+    )
+    issued = [item for item in outcomes if not isinstance(item, BaseException)]
+    failures = [item for item in outcomes if isinstance(item, OrientationFailure)]
+    assert len(issued) == 1
+    assert len(failures) == 7
+    assert {item.code for item in failures} == {
+        OrientationErrorCode.REQUEST_CONFLICT.value
+    }
+    async with engine.connect() as connection:
+        count = await connection.scalar(text("SELECT count(*) FROM orientation_recoveries"))
+    assert count == 1
 
 
 @pytest.mark.asyncio
@@ -250,11 +286,9 @@ async def test_terminal_transitions_reject_expired_deleted_or_forged_claims(repo
         )
     assert expired.value.code == OrientationErrorCode.CLAIM_CONFLICT.value
 
-    fresh = await repo.issue(binding(batch_id), now=NOW)
-    fresh_claim = await repo.claim(fresh.token, (4,), now=NOW)
     forged = replace(
-        fresh_claim,
-        snapshot=replace(fresh_claim.snapshot, source_result_version=1),
+        claim,
+        snapshot=replace(claim.snapshot, source_result_version=1),
     )
     with pytest.raises(OrientationFailure) as mismatch:
         await repo.complete(
@@ -272,7 +306,7 @@ async def test_terminal_transitions_reject_expired_deleted_or_forged_claims(repo
     await repo.invalidate_batch(batch_id, now=NOW)
     with pytest.raises(OrientationFailure) as deleted:
         await repo.fail(
-            fresh_claim,
+            claim,
             state=RecoveryState.FAILED,
             error_code="orientation_failed",
             now=NOW,
@@ -369,16 +403,18 @@ async def test_invalidate_prevents_later_issue_and_tombstone_blocks_resolution(r
             ),
             {"due": NOW + timedelta(hours=1), "batch": batch_id},
         )
-    live_issue = await repo.issue(
-        binding(batch_id, expires_at=NOW + timedelta(hours=1)), now=NOW
-    )
+    with pytest.raises(OrientationFailure) as duplicate:
+        await repo.issue(
+            binding(batch_id, expires_at=NOW + timedelta(hours=1)), now=NOW
+        )
+    assert duplicate.value.code == OrientationErrorCode.REQUEST_CONFLICT.value
     async with engine.begin() as connection:
         await connection.execute(
             text("UPDATE retention SET data_tombstone = 'data-deleting' WHERE batch_id = :batch"),
             {"batch": batch_id},
         )
     with pytest.raises(OrientationFailure):
-        await repo.resolve(live_issue.token, now=NOW)
+        await repo.resolve(issue.token, now=NOW)
 
 
 @pytest.mark.asyncio

@@ -88,3 +88,8 @@ class GatewayInvalidRequest(GatewayFailure):
 class GatewayUnsupportedMediaType(GatewayFailure):
     code = "unsupported_media_type"
     safe_message = "The document media type is not supported."
+
+
+class GatewayOrientationUncertain(GatewayFailure):
+    code = "orientation_uncertain"
+    safe_message = "A reliable non-zero page orientation could not be determined."

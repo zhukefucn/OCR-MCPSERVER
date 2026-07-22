@@ -137,18 +137,49 @@ class OrientationRecoveryRepository:
                         or binding.expires_at > _db_utc(source.expires_at)
                     ):
                         raise OrientationFailure(OrientationErrorCode.TOKEN_INVALID)
+                    duplicate = await session.scalar(
+                        select(OrientationRecoveryRecord.token_digest).where(
+                            OrientationRecoveryRecord.file_id == binding.file_id,
+                            OrientationRecoveryRecord.source_result_version
+                            == binding.source_result_version,
+                        )
+                    )
+                    if duplicate is not None:
+                        raise OrientationFailure(
+                            OrientationErrorCode.REQUEST_CONFLICT
+                        )
                     session.add(record)
                     await session.commit()
                     return RecoveryTokenIssue(token, self._snapshot(record))
             except OrientationFailure:
                 raise
             except IntegrityError:
+                if await self._source_token_exists(binding):
+                    raise OrientationFailure(
+                        OrientationErrorCode.REQUEST_CONFLICT
+                    ) from None
                 continue
             except SQLAlchemyError:
                 raise OrientationFailure(OrientationErrorCode.PERSISTENCE_FAILED) from None
             except Exception:
                 raise OrientationFailure(OrientationErrorCode.PERSISTENCE_FAILED) from None
         raise OrientationFailure(OrientationErrorCode.PERSISTENCE_FAILED) from None
+
+    async def _source_token_exists(self, binding: RecoveryTokenBinding) -> bool:
+        try:
+            async with self._sessions() as session:
+                existing = await session.scalar(
+                    select(OrientationRecoveryRecord.token_digest).where(
+                        OrientationRecoveryRecord.file_id == binding.file_id,
+                        OrientationRecoveryRecord.source_result_version
+                        == binding.source_result_version,
+                    )
+                )
+                return existing is not None
+        except SQLAlchemyError:
+            raise OrientationFailure(
+                OrientationErrorCode.PERSISTENCE_FAILED
+            ) from None
 
     async def resolve(self, token: str, *, now: datetime) -> RecoverySnapshot:
         now = _utc(now)

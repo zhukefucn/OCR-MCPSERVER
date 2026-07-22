@@ -26,7 +26,7 @@ import threading
 from typing import BinaryIO
 from uuid import UUID, uuid4, uuid5
 
-from ..domain.constants import SUPPORTED_EXTENSIONS
+from ..domain.constants import DEFAULT_MAX_FILE_SIZE_BYTES, SUPPORTED_EXTENSIONS
 from ..domain.errors import FileIntakeErrorCode, FileIntakeFailure
 from ..domain.files import IncomingFile, StoredFile
 from .file_validation import FileValidator, ValidatedFileMetadata
@@ -430,12 +430,150 @@ class FileStorage:
             raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
         return result
 
+    async def resolve_stored(
+        self,
+        batch_id: str,
+        file_id: str,
+        *,
+        expected_page_count: int,
+        max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES,
+    ) -> StoredFile:
+        """Resolve one original input from server IDs through held handles.
+
+        No caller-controlled path or extension is accepted.  The file is
+        revalidated while its descriptor and anchored parent directory remain
+        open, and the returned path is derived only from canonical identifiers.
+        """
+
+        if (
+            type(expected_page_count) is not int
+            or expected_page_count < 1
+            or type(max_file_size_bytes) is not int
+            or max_file_size_bytes < 1
+        ):
+            raise FileIntakeFailure(FileIntakeErrorCode.INVALID_DOCUMENT)
+        try:
+            return await asyncio.to_thread(
+                self._resolve_stored_sync,
+                batch_id,
+                file_id,
+                expected_page_count,
+                max_file_size_bytes,
+            )
+        except FileIntakeFailure as exc:
+            self._clear_exception_context(exc)
+            raise
+        except Exception:
+            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH) from None
+
+    def _resolve_stored_sync(
+        self,
+        batch_id: str,
+        file_id: str,
+        expected_page_count: int,
+        max_file_size_bytes: int,
+    ) -> StoredFile:
+        canonical_batch_id = self._canonical_uuid(batch_id)
+        canonical_file_id = self._canonical_uuid(file_id)
+        directory: _OpenedDirectory | None = None
+        descriptor: int | None = None
+        try:
+            directory = self._open_input_directory(canonical_batch_id, create=False)
+            if directory is None:
+                raise OSError("input directory unavailable")
+            matches: list[tuple[str, int]] = []
+            for extension in sorted(SUPPORTED_EXTENSIONS):
+                try:
+                    candidate = self._open_existing_file(
+                        directory, f"{canonical_file_id}{extension}"
+                    )
+                except FileNotFoundError:
+                    continue
+                matches.append((extension, candidate))
+            if len(matches) != 1:
+                raise OSError("stored input is missing or ambiguous")
+            extension, descriptor = matches[0]
+            info = os.fstat(descriptor)
+            identity = self._identity(info)
+            name = f"{canonical_file_id}{extension}"
+            if (
+                self._is_reparse(info)
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or info.st_size < 1
+                or info.st_size > max_file_size_bytes
+            ):
+                raise OSError("unsafe stored input")
+            self._assert_name_identity(directory, name, identity)
+            digest = self._hash_descriptor(descriptor)
+            mime = {
+                ".pdf": "application/pdf",
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+            }[extension]
+            metadata = FileValidator(
+                max_pages=500, max_image_pixels=100_000_000
+            ).validate(
+                lambda: self._duplicate_reader(descriptor),
+                display_name=name,
+                declared_mime=mime,
+            )
+            final_digest = self._hash_descriptor(descriptor)
+            after = os.fstat(descriptor)
+            if (
+                self._is_reparse(after)
+                or not stat.S_ISREG(after.st_mode)
+                or after.st_nlink != 1
+                or self._identity(after) != identity
+                or after.st_size != info.st_size
+                or after.st_size > max_file_size_bytes
+                or final_digest != digest
+                or metadata.page_count != expected_page_count
+                or metadata.extension != extension
+            ):
+                raise OSError("stored input changed or mismatched")
+            self._assert_name_identity(directory, name, identity)
+            return StoredFile(
+                file_id=canonical_file_id,
+                path=directory.path / name,
+                sha256=digest,
+                size_bytes=info.st_size,
+                media_type=metadata.media_type,
+                extension=metadata.extension,
+                page_count=metadata.page_count,
+                width=metadata.width,
+                height=metadata.height,
+            )
+        except FileIntakeFailure:
+            raise
+        except Exception:
+            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH) from None
+        finally:
+            closed: set[int] = set()
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                    closed.add(descriptor)
+                except OSError:
+                    pass
+            for _, extra in matches if "matches" in locals() else ():
+                if extra in closed:
+                    continue
+                try:
+                    os.close(extra)
+                except OSError:
+                    pass
+            self._close_directory(directory)
+
     async def create_immutable_derivative(
         self,
         batch_id: str,
         source_file_id: str,
         extension: str,
         *,
+        expected_source_sha256: str,
+        expected_source_size_bytes: int,
         transform: Callable[[BinaryIO, BinaryIO], None],
         max_file_size_bytes: int,
         validator: FileValidator,
@@ -448,6 +586,17 @@ class FileStorage:
 
         if type(max_file_size_bytes) is not int or max_file_size_bytes < 1:
             raise FileIntakeFailure(FileIntakeErrorCode.TOO_LARGE)
+        if (
+            not isinstance(expected_source_sha256, str)
+            or len(expected_source_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_source_sha256
+            )
+            or type(expected_source_size_bytes) is not int
+            or expected_source_size_bytes < 1
+        ):
+            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
         cancelled = threading.Event()
         worker = asyncio.create_task(
             asyncio.to_thread(
@@ -455,6 +604,8 @@ class FileStorage:
                 batch_id,
                 source_file_id,
                 extension,
+                expected_source_sha256,
+                expected_source_size_bytes,
                 transform,
                 max_file_size_bytes,
                 validator,
@@ -512,6 +663,8 @@ class FileStorage:
         batch_id: str,
         source_file_id: str,
         extension: str,
+        expected_source_sha256: str,
+        expected_source_size_bytes: int,
         transform: Callable[[BinaryIO, BinaryIO], None],
         max_file_size_bytes: int,
         validator: FileValidator,
@@ -553,6 +706,17 @@ class FileStorage:
                 raise OSError("unsafe source")
             self._assert_name_identity(directory, source_name, source_identity)
             source_digest = self._hash_descriptor(source_descriptor)
+            bound_source = os.fstat(source_descriptor)
+            if (
+                source_info.st_size != expected_source_size_bytes
+                or source_digest != expected_source_sha256
+                or self._is_reparse(bound_source)
+                or not stat.S_ISREG(bound_source.st_mode)
+                or bound_source.st_nlink != 1
+                or self._identity(bound_source) != source_identity
+                or bound_source.st_size != expected_source_size_bytes
+            ):
+                raise OSError("source binding mismatch")
 
             staged_descriptor = self._open_part(directory, part_name)
             staged_identity = self._identity(os.fstat(staged_descriptor))
@@ -590,13 +754,20 @@ class FileStorage:
             if cancelled.is_set():
                 raise asyncio.CancelledError
             current_source = os.fstat(source_descriptor)
+            current_source_digest = self._hash_descriptor(source_descriptor)
+            final_source = os.fstat(source_descriptor)
             if (
                 self._is_reparse(current_source)
                 or not stat.S_ISREG(current_source.st_mode)
                 or current_source.st_nlink != 1
                 or self._identity(current_source) != source_identity
-                or current_source.st_size != source_info.st_size
-                or self._hash_descriptor(source_descriptor) != source_digest
+                or current_source.st_size != expected_source_size_bytes
+                or current_source_digest != expected_source_sha256
+                or self._is_reparse(final_source)
+                or not stat.S_ISREG(final_source.st_mode)
+                or final_source.st_nlink != 1
+                or self._identity(final_source) != source_identity
+                or final_source.st_size != expected_source_size_bytes
             ):
                 raise OSError("source changed")
             self._assert_name_identity(directory, source_name, source_identity)

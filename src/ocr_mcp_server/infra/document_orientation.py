@@ -46,6 +46,8 @@ class ImmutableDocumentCorrector:
                 request.batch_id,
                 request.file_id,
                 request.extension,
+                expected_source_sha256=request.expected_source_sha256,
+                expected_source_size_bytes=request.expected_source_size_bytes,
                 transform=transform,
                 max_file_size_bytes=self._max_file_size_bytes,
                 validator=self._validator,
