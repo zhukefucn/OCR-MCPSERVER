@@ -627,106 +627,6 @@ def _publish_stage_anchored(
     raise OSError(error_number, os.strerror(error_number))
 
 
-def _safe_remove_owned_stage(
-    stage: Path,
-    root: Path,
-    *,
-    expected_stage_identity: os.stat_result,
-    expected_root_identity: os.stat_result,
-    expected_names: frozenset[str],
-    root_descriptor: int | None,
-    stage_descriptor: int | None,
-) -> None:
-    try:
-        if stage.parent != root or not stage.name.startswith(".merge-stage-"):
-            return
-        if root_descriptor is not None and stage_descriptor is not None:
-            if (
-                not _same_object_identity(
-                    os.fstat(root_descriptor), expected_root_identity
-                )
-                or not _same_object_identity(
-                    os.fstat(stage_descriptor), expected_stage_identity
-                )
-                or not _same_object_identity(
-                    os.stat(
-                        stage.name,
-                        dir_fd=root_descriptor,
-                        follow_symlinks=False,
-                    ),
-                    expected_stage_identity,
-                )
-            ):
-                return
-            names = set(os.listdir(stage_descriptor))
-            if not names.issubset(expected_names):
-                return
-            identities = {}
-            for name in names:
-                item_stat = os.stat(
-                    name, dir_fd=stage_descriptor, follow_symlinks=False
-                )
-                if not stat.S_ISREG(item_stat.st_mode) or _is_reparse(item_stat):
-                    return
-                identities[name] = item_stat
-            for name, identity in identities.items():
-                if not _same_identity(
-                    os.stat(
-                        name, dir_fd=stage_descriptor, follow_symlinks=False
-                    ),
-                    identity,
-                ):
-                    return
-                os.unlink(name, dir_fd=stage_descriptor)
-            if os.listdir(stage_descriptor):
-                return
-            if not _same_object_identity(
-                os.stat(
-                    stage.name,
-                    dir_fd=root_descriptor,
-                    follow_symlinks=False,
-                ),
-                expected_stage_identity,
-            ):
-                return
-            os.rmdir(stage.name, dir_fd=root_descriptor)
-            return
-
-        if (
-            not _same_object_identity(os.lstat(root), expected_root_identity)
-            or not _same_object_identity(os.lstat(stage), expected_stage_identity)
-        ):
-            return
-        names = {item.name for item in stage.iterdir()}
-        if not names.issubset(expected_names):
-            return
-        identities = {}
-        for name in names:
-            item_stat = os.lstat(stage / name)
-            if (
-                not stat.S_ISREG(item_stat.st_mode)
-                or stat.S_ISLNK(item_stat.st_mode)
-                or _is_reparse(item_stat)
-            ):
-                return
-            identities[name] = item_stat
-        for name, identity in identities.items():
-            if (
-                not _same_object_identity(os.lstat(stage), expected_stage_identity)
-                or not _same_identity(os.lstat(stage / name), identity)
-            ):
-                return
-            os.unlink(stage / name)
-        if (
-            any(stage.iterdir())
-            or not _same_object_identity(os.lstat(stage), expected_stage_identity)
-        ):
-            return
-        os.rmdir(stage)
-    except BaseException:
-        pass
-
-
 def _existing_matches(
     target: Path, expected: Mapping[str, bytes]
 ) -> _TargetBinding | None:
@@ -1016,7 +916,6 @@ def _publish(root: Path, output_version: int, contents: Mapping[str, bytes], max
                 pass
         _fail(MergeErrorCode.PUBLICATION_FAILED)
     stage_identity = os.lstat(stage)
-    published = False
     stage_descriptor = None
     try:
         _ensure_safe_directory(stage, create=False)
@@ -1064,7 +963,6 @@ def _publish(root: Path, output_version: int, contents: Mapping[str, bytes], max
             ),
             root_descriptor=root_descriptor,
         )
-        published = True
         try:
             root_fd = root_descriptor
             owns_root_fd = False
@@ -1111,16 +1009,6 @@ def _publish(root: Path, output_version: int, contents: Mapping[str, bytes], max
     except BaseException:
         _fail(MergeErrorCode.PUBLICATION_FAILED)
     finally:
-        if not published:
-            _safe_remove_owned_stage(
-                stage,
-                root,
-                expected_stage_identity=stage_identity,
-                expected_root_identity=root_identity,
-                expected_names=frozenset(contents),
-                root_descriptor=root_descriptor,
-                stage_descriptor=stage_descriptor,
-            )
         if stage_descriptor is not None:
             try:
                 os.close(stage_descriptor)

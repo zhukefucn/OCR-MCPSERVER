@@ -470,7 +470,7 @@ def test_idempotent_retry_rejects_target_swap_after_byte_match(tmp_path, limits,
     assert raised.value.code == MergeErrorCode.UNSAFE_PUBLICATION_PATH.value
 
 
-def test_publish_failure_cleans_only_own_stage(tmp_path, limits, monkeypatch):
+def test_publish_failure_preserves_stage_as_orphan(tmp_path, limits, monkeypatch):
     node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
     result, collection, candidate, _ = _setup(tmp_path, [node])
     root = tmp_path / "published"; root.mkdir(); unrelated = root / ".staging-unrelated"; unrelated.mkdir()
@@ -478,7 +478,14 @@ def test_publish_failure_cleans_only_own_stage(tmp_path, limits, monkeypatch):
     with pytest.raises(MergeFailure):
         merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=root, output_version=2, timestamp=NOW, limits=limits)
     assert unrelated.exists()
-    assert not list(root.glob(".merge-stage-*"))
+    orphans = list(root.glob(".merge-stage-*"))
+    assert len(orphans) == 1
+    assert {item.name for item in orphans[0].iterdir()} == {
+        "original_content_list_v2.json",
+        "content_list_v2.json",
+        "secondary_ocr_audit.json",
+        "publication_manifest.json",
+    }
 
 
 def test_publish_failure_does_not_delete_replacement_at_staging_path(tmp_path, limits, monkeypatch):
@@ -525,7 +532,7 @@ def test_stage_name_swap_before_rename_never_returns_publication_success(tmp_pat
         merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=root, output_version=2, timestamp=NOW, limits=limits)
 
 
-def test_cleanup_swap_inside_delete_never_removes_replacement_directory(tmp_path, limits, monkeypatch):
+def test_failed_publication_never_unlinks_same_name_file_replacement(tmp_path, limits, monkeypatch):
     node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
     result, collection, candidate, _ = _setup(tmp_path, [node])
     root = tmp_path / "published"; root.mkdir()
@@ -535,21 +542,47 @@ def test_cleanup_swap_inside_delete_never_removes_replacement_directory(tmp_path
 
     monkeypatch.setattr("ocr_mcp_server.services.merge_publication._publish_stage_anchored", lambda *_: (_ for _ in ()).throw(OSError("injected")))
 
-    def swap_at_owned_file_delete(path, *args, **kwargs):
+    def replace_validated_file_before_unlink(path, *args, **kwargs):
         if victim["path"] is None:
             stage = next(root.glob(".merge-stage-*"))
-            owned = stage.with_name(stage.name + "-owned-at-delete")
-            stage.rename(owned)
-            stage.mkdir()
-            (stage / "victim-marker").write_text("survive", encoding="utf-8")
-            victim["path"] = stage
+            candidate_path = stage / Path(path).name if kwargs.get("dir_fd") is not None else Path(path)
+            owned = candidate_path.with_name(candidate_path.name + ".owned")
+            candidate_path.rename(owned)
+            candidate_path.write_text("victim", encoding="utf-8")
+            victim["path"] = candidate_path
         return original_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr("ocr_mcp_server.services.merge_publication.os.unlink", swap_at_owned_file_delete)
+    monkeypatch.setattr("ocr_mcp_server.services.merge_publication.os.unlink", replace_validated_file_before_unlink)
     with pytest.raises(MergeFailure):
         merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=root, output_version=2, timestamp=NOW, limits=limits)
-    assert victim["path"].is_dir()
-    assert (victim["path"] / "victim-marker").read_text(encoding="utf-8") == "survive"
+    assert victim["path"] is None or victim["path"].read_text(encoding="utf-8") == "victim"
+    assert list(root.glob(".merge-stage-*"))
+
+
+def test_failed_publication_never_removes_same_name_directory_replacement(tmp_path, limits, monkeypatch):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    root = tmp_path / "published"; root.mkdir()
+    victim = {"path": None}
+    os_module = __import__("os")
+    original_rmdir = os_module.rmdir
+
+    monkeypatch.setattr("ocr_mcp_server.services.merge_publication._publish_stage_anchored", lambda *_: (_ for _ in ()).throw(OSError("injected")))
+
+    def replace_validated_directory_before_rmdir(path, *args, **kwargs):
+        if victim["path"] is None:
+            stage = next(root.glob(".merge-stage-*"))
+            owned = stage.with_name(stage.name + "-owned-at-rmdir")
+            stage.rename(owned)
+            stage.mkdir()
+            victim["path"] = stage
+        return original_rmdir(path, *args, **kwargs)
+
+    monkeypatch.setattr("ocr_mcp_server.services.merge_publication.os.rmdir", replace_validated_directory_before_rmdir)
+    with pytest.raises(MergeFailure):
+        merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=root, output_version=2, timestamp=NOW, limits=limits)
+    assert victim["path"] is None or victim["path"].is_dir()
+    assert list(root.glob(".merge-stage-*"))
 
 
 def test_anchored_write_closes_raw_descriptor_when_fdopen_fails(tmp_path, monkeypatch):
