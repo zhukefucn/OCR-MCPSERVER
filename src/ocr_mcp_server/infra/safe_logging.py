@@ -43,24 +43,26 @@ def _invalid() -> ValueError:
     return ValueError("invalid log event")
 
 
-def _canonical_id(value: object) -> bool:
+def _canonical_id(value: object) -> str | None:
     if value is None:
-        return True
-    if not isinstance(value, str):
-        return False
+        return None
+    if type(value) is not str:
+        raise _invalid()
     try:
         parsed = UUID(value)
     except (ValueError, AttributeError):
-        return False
-    return str(parsed) == value
+        raise _invalid() from None
+    canonical = str(parsed)
+    if canonical != value:
+        raise _invalid()
+    return canonical
 
 
 def _count(value: object) -> bool:
     return (
         value is None
         or (
-            not isinstance(value, bool)
-            and isinstance(value, int)
+            type(value) is int
             and 0 <= value <= _MAX_COUNT
         )
     )
@@ -99,32 +101,40 @@ class SafeLogEvent:
     failure_count: int | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.event, SafeLogEventName):
+        if type(self.event) is not SafeLogEventName:
             raise _invalid()
-        if not all(
-            _canonical_id(value)
-            for value in (self.batch_id, self.file_id, self.recovery_id)
-        ):
+        object.__setattr__(self, "event", SafeLogEventName(self.event.value))
+        object.__setattr__(self, "batch_id", _canonical_id(self.batch_id))
+        object.__setattr__(self, "file_id", _canonical_id(self.file_id))
+        object.__setattr__(self, "recovery_id", _canonical_id(self.recovery_id))
+        if self.stage is not None and type(self.stage) is not ProcessingStage:
             raise _invalid()
-        if self.stage is not None and not isinstance(self.stage, ProcessingStage):
-            raise _invalid()
+        if self.stage is not None:
+            object.__setattr__(self, "stage", ProcessingStage(self.stage.value))
         if self.error_code is not None and (
-            not isinstance(self.error_code, str)
+            type(self.error_code) is not str
             or self.error_code not in _ERROR_CODES
         ):
             raise _invalid()
+        if self.error_code is not None:
+            object.__setattr__(self, "error_code", str(self.error_code))
         if self.duration_ms is not None and (
-            isinstance(self.duration_ms, bool)
-            or not isinstance(self.duration_ms, (int, float))
+            type(self.duration_ms) not in {int, float}
             or not math.isfinite(self.duration_ms)
             or self.duration_ms < 0
         ):
             raise _invalid()
+        if self.duration_ms is not None:
+            object.__setattr__(self, "duration_ms", float(self.duration_ms))
         if not all(
             _count(value)
             for value in (self.item_count, self.success_count, self.failure_count)
         ):
             raise _invalid()
+        for field_name in ("item_count", "success_count", "failure_count"):
+            value = object.__getattribute__(self, field_name)
+            if value is not None:
+                object.__setattr__(self, field_name, int(value))
 
 
 class JsonEventFormatter(logging.Formatter):
@@ -146,7 +156,11 @@ class JsonEventFormatter(logging.Formatter):
         for key, value in asdict(event).items():
             if value is None:
                 continue
-            payload[key] = value.value if isinstance(value, StrEnum) else value
+            payload[key] = (
+                value.value
+                if type(value) in {SafeLogEventName, ProcessingStage}
+                else value
+            )
         return json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
 
 

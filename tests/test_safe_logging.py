@@ -189,6 +189,56 @@ def test_subclass_cannot_smuggle_overridden_fields_into_formatter_or_logger() ->
     assert records == []
 
 
+def test_string_subclass_cannot_smuggle_caller_content_through_uuid_fields() -> None:
+    canary = "TOP_SECRET_SCALAR_CANARY"
+    canonical = "12345678-1234-5678-9234-567812345678"
+
+    class SmuggledString(str):
+        def replace(self, old: str, new: str, count: int = -1) -> str:
+            del old, new, count
+            return canonical
+
+        def __eq__(self, other: object) -> bool:
+            return other == canonical
+
+        __hash__ = str.__hash__
+
+    smuggled = SmuggledString(canary)
+    event = SafeLogEvent(event=SafeLogEventName.HTTP_REQUEST_COMPLETED)
+    object.__setattr__(event, "batch_id", smuggled)
+    record = logging.LogRecord(
+        "safe-scalar-test", logging.INFO, __file__, 1, "", (), None
+    )
+    record.safe_event = event
+
+    rendered = JsonEventFormatter().format(record)
+
+    assert json.loads(rendered)["event"] == "observability_failure"
+    assert canary not in rendered
+
+    records: list[logging.LogRecord] = []
+
+    class RecordingHandler(logging.Handler):
+        def emit(self, emitted: logging.LogRecord) -> None:
+            records.append(emitted)
+
+    underlying = logging.Logger("safe-scalar-emit-test", level=logging.INFO)
+    underlying.addHandler(RecordingHandler())
+    with pytest.raises(ValueError) as emit_error:
+        SafeEventLogger(underlying).emit(event)
+    assert str(emit_error.value) == "invalid log event"
+    assert canary not in str(emit_error.value)
+    assert records == []
+
+    with pytest.raises(ValueError) as construction_error:
+        SafeLogEvent(
+            event=SafeLogEventName.HTTP_REQUEST_COMPLETED,
+            batch_id=smuggled,
+        )
+    assert str(construction_error.value) == "invalid log event"
+    assert canary not in str(construction_error.value)
+
+
 def test_handler_failure_is_best_effort_and_non_recursive() -> None:
     class FailingHandler(logging.Handler):
         calls = 0
