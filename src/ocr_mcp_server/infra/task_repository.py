@@ -295,6 +295,7 @@ class TaskRepository:
         counters: ProgressCounters | None = None,
         error_code: str | None = None,
         now: datetime,
+        _clamp_retry_progress: bool = False,
     ) -> FileTaskSnapshot:
         now = _require_time(now)
         if (
@@ -321,6 +322,9 @@ class TaskRepository:
                     raise StateTransitionError()
                 if old_status is FileStatus.PROCESSING:
                     self._require_lease(record, lease_token, now)
+                mapped_progress = progress
+                if _clamp_retry_progress and record.attempt_count > 1:
+                    progress = max(record.progress, mapped_progress)
                 validate_file_transition(
                     old_status,
                     old_stage,
@@ -330,8 +334,12 @@ class TaskRepository:
                     progress,
                 )
                 self._validate_counter_transition(record, stage, counters)
-                if counters is not None and map_stage_progress(stage, counters) != progress:
-                    raise StateTransitionError()
+                if counters is not None:
+                    expected_progress = map_stage_progress(stage, counters)
+                    if _clamp_retry_progress and record.attempt_count > 1:
+                        expected_progress = max(record.progress, expected_progress)
+                    if expected_progress != progress:
+                        raise StateTransitionError()
                 self._add_event(
                     session,
                     record,
@@ -379,6 +387,7 @@ class TaskRepository:
             progress=progress,
             counters=counters,
             now=now,
+            _clamp_retry_progress=True,
         )
 
     async def complete_file(
@@ -481,16 +490,25 @@ class TaskRepository:
         except SQLAlchemyError as exc:
             raise PersistenceError(cause=exc) from None
 
-    async def recover_expired_leases(self, *, now: datetime) -> int:
+    async def recover_expired_leases(
+        self, *, now: datetime
+    ) -> tuple[FileTaskSnapshot, ...]:
         now = _require_time(now)
         try:
             async with self._sessions() as session:
                 await session.execute(text("BEGIN IMMEDIATE"))
                 records = (
                     await session.scalars(
-                        select(FileTaskRecord).where(
+                        select(FileTaskRecord)
+                        .join(BatchRecord, FileTaskRecord.batch_id == BatchRecord.id)
+                        .where(
                             FileTaskRecord.status == FileStatus.PROCESSING.value,
                             FileTaskRecord.lease_expires_at <= now,
+                        )
+                        .order_by(
+                            BatchRecord.created_at,
+                            BatchRecord.id,
+                            FileTaskRecord.position,
                         )
                     )
                 ).all()
@@ -530,7 +548,7 @@ class TaskRepository:
                 for batch_id in batch_ids:
                     await self._refresh_batch(session, batch_id, now)
                 await session.commit()
-                return len(records)
+                return tuple(self._file_snapshot(record) for record in records)
         except SQLAlchemyError as exc:
             raise PersistenceError(cause=exc) from None
 

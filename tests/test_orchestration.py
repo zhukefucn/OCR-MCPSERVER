@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
-from ocr_mcp_server.domain.errors import LeaseConflictError
+from ocr_mcp_server.domain.errors import LeaseConflictError, PersistenceError
 from ocr_mcp_server.domain.models import BatchStatus, FileStatus, ProcessingStage
 from ocr_mcp_server.domain.progress import ProgressCounters, ProgressUnit
 from ocr_mcp_server.infra.database import (
@@ -200,11 +200,21 @@ async def test_retry_unknown_and_nonretryable_failures_are_safe_and_siblings_con
     async def run_pipeline(file, progress, cancellation):
         calls[file.file_id] += 1
         if file.file_id == "retry" and calls[file.file_id] == 1:
+            await progress.report(
+                ProcessingStage.MERGING,
+                ProgressCounters(1, 2, ProgressUnit.ITEMS),
+            )
             raise PipelineFailure(
                 PipelineErrorCode.DEPENDENCY_UNAVAILABLE,
                 retryable=True,
                 cause=RuntimeError(secret),
             )
+        if file.file_id == "retry" and calls[file.file_id] == 2:
+            resumed = await progress.report(
+                ProcessingStage.MINERU_PARSING,
+                ProgressCounters(1, 10, ProgressUnit.PAGES),
+            )
+            assert resumed.progress == 91
         if file.file_id == "exhausted":
             raise PipelineFailure(
                 PipelineErrorCode.DEPENDENCY_UNAVAILABLE,
@@ -255,6 +265,16 @@ async def test_retry_unknown_and_nonretryable_failures_are_safe_and_siblings_con
     assert files[2].attempt_count == 1
     assert files[2].last_error_code == PipelineErrorCode.INPUT_INVALID.value
     assert files[3].last_error_code == PipelineErrorCode.UNEXPECTED.value
+    retry_events = [
+        event
+        for event in await repository.list_batch_events(created.batch.id)
+        if event.file_id == "retry"
+    ]
+    assert any(
+        event.new_stage is ProcessingStage.MINERU_PARSING
+        and event.new_progress == 91
+        for event in retry_events
+    )
     assert secret not in repr(files)
     assert secret not in repr(await repository.list_batch_events(created.batch.id))
 
@@ -365,6 +385,132 @@ async def test_startup_and_periodic_recovery_handle_expiry_and_exhaustion(
 
 
 @pytest.mark.asyncio
+async def test_startup_recovery_emits_committed_requeue_and_terminal_notifications_even_if_sink_fails(
+    orchestration_repository,
+) -> None:
+    repository, _ = orchestration_repository
+    clock = ManualClock()
+    await repository.create_batch("startup-requeue", ["requeue-file"], max_attempts=2)
+    await repository.create_batch("startup-terminal", ["failed-file"], max_attempts=1)
+    await repository.claim_next("dead-worker", now=clock.now(), lease_seconds=5)
+    await repository.claim_next("dead-worker", now=clock.now(), lease_seconds=5)
+    clock.advance(6)
+    secret = "C:/private/recovery-notification.pdf"
+
+    class FailingCheckingSink:
+        def __init__(self) -> None:
+            self.items: list[ProgressNotification] = []
+
+        async def publish(self, notification: ProgressNotification) -> None:
+            persisted = await repository.get_file(notification.file_id)
+            assert persisted is not None
+            assert persisted.version == notification.version
+            assert persisted.status is notification.status
+            self.items.append(notification)
+            raise RuntimeError(secret)
+
+    sink = FailingCheckingSink()
+
+    async def run_pipeline(file, progress, cancellation):
+        return PipelineResult.success()
+
+    service = OrchestrationService(
+        repository,
+        CallablePipeline(run_pipeline),
+        OrchestrationSettings(),
+        notification_sink=sink,
+        clock=clock,
+        worker_identity="restarted-worker",
+    )
+    await service.start()
+
+    assert {
+        item.file_id: (item.status, item.stage, item.error_code)
+        for item in sink.items
+    } == {
+        "requeue-file": (
+            FileStatus.QUEUED,
+            ProcessingStage.QUEUED,
+            "lease_expired",
+        ),
+        "failed-file": (
+            FileStatus.FAILED,
+            ProcessingStage.FAILED,
+            "lease_expired",
+        ),
+    }
+    assert secret not in repr(sink.items)
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_periodic_recovery_emits_requeue_before_the_recovered_file_is_reclaimed(
+    orchestration_repository,
+) -> None:
+    repository, _ = orchestration_repository
+    clock = ManualClock()
+    await repository.create_batch("periodic-notification", ["file-a"], max_attempts=2)
+    await repository.claim_next("dead-worker", now=clock.now(), lease_seconds=5)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    recovery_seen = asyncio.Event()
+
+    class CheckingSink:
+        def __init__(self) -> None:
+            self.items: list[ProgressNotification] = []
+
+        async def publish(self, notification: ProgressNotification) -> None:
+            self.items.append(notification)
+            if notification.status is FileStatus.QUEUED:
+                recovery_seen.set()
+
+    sink = CheckingSink()
+
+    async def run_pipeline(file, progress, cancellation):
+        entered.set()
+        await release.wait()
+        return PipelineResult.success()
+
+    service = OrchestrationService(
+        repository,
+        CallablePipeline(run_pipeline),
+        OrchestrationSettings(
+            lease_seconds=10,
+            heartbeat_seconds=2,
+            idle_poll_seconds=100,
+            recovery_scan_seconds=5,
+        ),
+        notification_sink=sink,
+        clock=clock,
+        worker_identity="worker",
+    )
+    await service.start()
+
+    async def recovery_timer_is_armed() -> bool:
+        return any(deadline == 5 for deadline, _future in clock._sleepers)
+
+    await wait_until(recovery_timer_is_armed)
+    clock.advance(6)
+
+    await recovery_seen.wait()
+    await entered.wait()
+    statuses = [item.status for item in sink.items]
+    assert statuses.index(FileStatus.QUEUED) < statuses.index(FileStatus.PROCESSING)
+    recovery_notification = next(
+        item for item in sink.items if item.status is FileStatus.QUEUED
+    )
+    events = await repository.list_batch_events(recovery_notification.batch_id)
+    assert any(
+        event.version == recovery_notification.version
+        and event.new_status is FileStatus.QUEUED
+        and event.error_code == "lease_expired"
+        for event in events
+    )
+    release.set()
+    await service.close()
+
+
+@pytest.mark.asyncio
 async def test_idle_poll_and_periodic_recovery_find_work_without_wake_tokens(
     orchestration_repository,
 ) -> None:
@@ -454,7 +600,7 @@ async def test_shutdown_leaves_interrupted_work_for_expiry_and_never_repeats_ter
     assert persisted.status is FileStatus.PROCESSING
     assert persisted.status is not FileStatus.CANCELLED
     clock.advance(6)
-    assert await repository.recover_expired_leases(now=clock.now()) == 1
+    assert len(await repository.recover_expired_leases(now=clock.now())) == 1
     assert (await repository.get_file("interrupted-file")).status is FileStatus.QUEUED
     assert (await repository.get_batch(completed.batch.id)).status is BatchStatus.COMPLETED
 
@@ -548,6 +694,70 @@ async def test_sink_failure_and_cancellation_fall_back_to_polling_and_lifecycle_
     assert service.notify_work() is False
     async with engine.connect() as connection:
         assert (await connection.exec_driver_sql("SELECT 1")).scalar_one() == 1
+
+
+@pytest.mark.asyncio
+async def test_transient_claim_persistence_error_returns_worker_to_idle_poll_without_leaking(
+    orchestration_repository,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    repository, _ = orchestration_repository
+    created = await repository.create_batch("transient-claim", ["file-a"])
+    clock = ManualClock()
+    first_failure_seen = asyncio.Event()
+    pipeline_entered = asyncio.Event()
+    secret = "C:/private/customer.pdf recognized account text"
+
+    class OneShotFailingRepository:
+        def __init__(self, wrapped: TaskRepository) -> None:
+            self.wrapped = wrapped
+            self.claim_attempts = 0
+
+        def __getattr__(self, name: str):
+            return getattr(self.wrapped, name)
+
+        async def claim_next(self, *args, **kwargs):
+            self.claim_attempts += 1
+            if self.claim_attempts == 1:
+                first_failure_seen.set()
+                raise PersistenceError(cause=RuntimeError(secret))
+            return await self.wrapped.claim_next(*args, **kwargs)
+
+    flaky_repository = OneShotFailingRepository(repository)
+
+    async def run_pipeline(file, progress, cancellation):
+        pipeline_entered.set()
+        return PipelineResult.success()
+
+    service = OrchestrationService(
+        flaky_repository,  # type: ignore[arg-type]
+        CallablePipeline(run_pipeline),
+        OrchestrationSettings(idle_poll_seconds=1),
+        clock=clock,
+        worker_identity="worker",
+    )
+    await service.start()
+    await first_failure_seen.wait()
+
+    async def idle_timer_is_armed() -> bool:
+        return any(deadline == 1 for deadline, _future in clock._sleepers)
+
+    await wait_until(idle_timer_is_armed)
+    assert (await repository.get_batch(created.batch.id)).status is BatchStatus.QUEUED
+    clock.advance(1)
+    await asyncio.wait_for(pipeline_entered.wait(), timeout=1)
+
+    async def terminal() -> bool:
+        return (await repository.get_batch(created.batch.id)).status is BatchStatus.COMPLETED
+
+    await wait_until(terminal)
+    assert flaky_repository.claim_attempts >= 2
+    assert any(
+        task.get_name() == "ocr-worker-0" and not task.done()
+        for task in service._tasks
+    )
+    assert secret not in caplog.text
+    await service.close()
 
 
 def test_pipeline_failure_and_lifecycle_errors_discard_unsafe_causes() -> None:

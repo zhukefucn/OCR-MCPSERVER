@@ -9,7 +9,12 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Protocol
 
-from ..domain.errors import DomainError, InputValidationError, LeaseConflictError
+from ..domain.errors import (
+    DomainError,
+    InputValidationError,
+    LeaseConflictError,
+    PersistenceError,
+)
 from ..domain.models import FileStatus, ProcessingStage, utc_now
 from ..domain.progress import ProgressCounters, ProgressUnit
 from ..domain.tasks import FileTaskSnapshot, LeaseClaim
@@ -234,8 +239,13 @@ class _NotificationDispatcher:
         if previous is not None and (
             snapshot.version <= previous.version
             or snapshot.progress < previous.progress
-            or not material
-            or (not immediate and now - previous.sent_at < self._minimum_interval)
+            or (
+                not immediate
+                and (
+                    not material
+                    or now - previous.sent_at < self._minimum_interval
+                )
+            )
         ):
             return
         state = _NotificationState(
@@ -362,7 +372,11 @@ class OrchestrationService:
     async def start(self) -> None:
         if self._started or self._closed:
             raise ServiceLifecycleError()
-        await self._repository.recover_expired_leases(now=self._clock.now())
+        recovered = await self._repository.recover_expired_leases(
+            now=self._clock.now()
+        )
+        for snapshot in recovered:
+            await self._notifier.emit(snapshot)
         self._started = True
         for number in range(self._settings.worker_count):
             self._create_task(self._worker(number), f"ocr-worker-{number}")
@@ -419,15 +433,21 @@ class OrchestrationService:
             await self._wake_queue.get()
             try:
                 while not self._closing:
-                    claim = await self._repository.claim_next(
-                        worker_id,
-                        now=self._clock.now(),
-                        lease_seconds=self._settings.lease_seconds,
-                    )
+                    try:
+                        claim = await self._repository.claim_next(
+                            worker_id,
+                            now=self._clock.now(),
+                            lease_seconds=self._settings.lease_seconds,
+                        )
+                    except DomainError:
+                        break
                     if claim is None:
                         break
                     self.notify_work()
-                    await self._execute_claim(claim)
+                    try:
+                        await self._execute_claim(claim)
+                    except DomainError:
+                        break
             finally:
                 self._wake_queue.task_done()
 
@@ -497,6 +517,8 @@ class OrchestrationService:
                 current = asyncio.current_task()
                 if current is not None and current.cancelling():
                     raise
+            except PersistenceError:
+                raise
             except Exception:
                 try:
                     snapshot = await self._repository.fail_file(
@@ -555,4 +577,6 @@ class OrchestrationService:
                 now=self._clock.now()
             )
             if recovered:
+                for snapshot in recovered:
+                    await self._notifier.emit(snapshot)
                 self.notify_work()

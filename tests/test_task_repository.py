@@ -276,7 +276,12 @@ async def test_restart_recovers_only_expired_processing_tasks(tmp_path: Path) ->
     await initialize_schema(restarted_engine)
     restarted = TaskRepository(create_session_factory(restarted_engine))
     try:
-        assert await restarted.recover_expired_leases(now=now + timedelta(seconds=6)) == 1
+        recovered_changes = await restarted.recover_expired_leases(
+            now=now + timedelta(seconds=6)
+        )
+        assert tuple(item.id for item in recovered_changes) == (expired.file.id,)
+        assert recovered_changes[0].status is FileStatus.QUEUED
+        assert recovered_changes[0].last_error_code == "lease_expired"
         recovered = await restarted.get_file(expired.file.id)
         untouched = await restarted.get_file(complete.file.id)
         assert recovered.status is FileStatus.QUEUED

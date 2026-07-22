@@ -179,6 +179,64 @@ async def test_non_retryable_failure_is_atomic_and_does_not_consume_future_attem
 
 
 @pytest.mark.asyncio
+async def test_retry_attempt_restarts_stages_without_regressing_achieved_progress(
+    progress_repository,
+) -> None:
+    repository = progress_repository
+    await repository.create_batch("retry-resume", ["file-a"], max_attempts=2)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    first_claim = await repository.claim_next("worker", now=now, lease_seconds=60)
+    assert first_claim is not None
+    merging = await repository.update_progress(
+        first_claim.file.id,
+        first_claim.lease_token,
+        stage=ProcessingStage.MERGING,
+        counters=ProgressCounters(1, 2, ProgressUnit.ITEMS),
+        now=now + timedelta(seconds=1),
+    )
+    assert merging.progress == 91
+    queued = await repository.retry_or_fail(
+        first_claim.file.id,
+        first_claim.lease_token,
+        error_code="pipeline_dependency_unavailable",
+        now=now + timedelta(seconds=2),
+    )
+    second_claim = await repository.claim_next(
+        "worker", now=now + timedelta(seconds=3), lease_seconds=60
+    )
+    assert second_claim is not None
+
+    restarted = await repository.update_progress(
+        second_claim.file.id,
+        second_claim.lease_token,
+        stage=ProcessingStage.MINERU_PARSING,
+        counters=ProgressCounters(1, 10, ProgressUnit.PAGES),
+        now=now + timedelta(seconds=4),
+    )
+    advanced = await repository.update_progress(
+        second_claim.file.id,
+        second_claim.lease_token,
+        stage=ProcessingStage.COLLECTING_IMAGES,
+        counters=ProgressCounters(1, 2, ProgressUnit.IMAGES),
+        now=now + timedelta(seconds=5),
+    )
+
+    assert queued.progress == second_claim.file.progress == 91
+    assert restarted.stage is ProcessingStage.MINERU_PARSING
+    assert restarted.progress == 91
+    assert advanced.stage is ProcessingStage.COLLECTING_IMAGES
+    assert advanced.progress == 91
+    with pytest.raises(StateTransitionError):
+        await repository.update_progress(
+            second_claim.file.id,
+            second_claim.lease_token,
+            stage=ProcessingStage.MINERU_PARSING,
+            counters=ProgressCounters(2, 10, ProgressUnit.PAGES),
+            now=now + timedelta(seconds=6),
+        )
+
+
+@pytest.mark.asyncio
 async def test_repository_rejects_boolean_progress_and_unsafe_enums_before_mutation(
     progress_repository,
 ) -> None:
