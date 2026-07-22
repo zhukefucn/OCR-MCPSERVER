@@ -97,3 +97,12 @@ exit 0
 git diff --check 97af3f8..HEAD
 exit 0
 ```
+
+## 第二次复审收口
+
+复审 `f9ab6f2` 发现 2 个剩余 Important，均在 `35e3e0d` 以 TDD 修复：
+
+1. `_safe_call` 原先无条件重新抛出 `ToolError`。恶意/错误 gateway 因而可用 `ToolError("private-customer-filename.pdf")` 绕过安全错误映射。协议 Client RED 原样收到该文件名。现在 gateway await 边界只信任本项目的 `GatewayFailure`；包括 `ToolError` 在内的其余异常全部成为无 cause `internal_error`。`_require_gateway` 在 awaitable 构造前产生的服务未配置安全错误仍由外层保留。
+2. 上传路由虽拒绝三个业务 metadata header 的重复值，但仍通过合并视图读取 `Content-Length`。双 `Content-Length: 4` RED 到达 gateway 并返回 201。现在 `Content-Length` 同样从 ASGI raw header 列表读取，超过一个值即在读取正文和调用 gateway 前返回安全 422。
+
+最终证据：focused `131 passed in 2.43s`；全套 `727 passed, 13 skipped in 12.18s`；`pip check`、`compileall -q src tests`、`git diff --check f9ab6f2..HEAD` 均通过。
