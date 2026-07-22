@@ -182,3 +182,41 @@ Final controller-closure gate:
 - The SQLite MVP still uses `create_all` rather than an Alembic migration. Existing local databases must be recreated to receive the new tables/columns.
 - Artifact-manifest and archive hashes cannot be self-embedded without circularity; SQLite and the returned immutable result are the authoritative bindings.
 - Retention content deletion, unavailability marking, metadata purge, early deletion, cleanup ownership/concurrency, and their settings/tests remain intentionally deferred to Task 9B.
+
+## Linux publication fallback closure (2026-07-22)
+
+The Ubuntu container accepted `O_TMPFILE` but rejected `linkat(..., AT_EMPTY_PATH)`
+with `ENOENT`. A same-filesystem syscall probe established that linking the same open
+descriptor through `/proc/self/fd/<fd>` with `AT_SYMLINK_FOLLOW` succeeds and remains
+descriptor-bound. The publisher now tries that form only after the anonymous direct
+link is rejected with `ENOENT`, `EPERM`, or `EACCES`.
+
+When the filesystem rejects `O_TMPFILE` with a supported-capability error, staging
+falls back to a random root-relative file created under the pinned artifact-root
+descriptor with `O_CREAT | O_EXCL | O_NOFOLLOW`, mode `0600`. Publication uses
+`renameat2(..., RENAME_NOREPLACE)` under the same pinned root. Post-publication inode
+checks reject both pre-publication stage-name replacement and late target-name
+replacement; failure scrubs the exact open stage descriptor so verified archive
+content is not exposed through an attacker-moved name.
+
+TDD regressions cover:
+
+- a forced `AT_EMPTY_PATH` restriction followed by successful proc-descriptor linking;
+- forced `O_TMPFILE` `EOPNOTSUPP` followed by named-stage publication;
+- a named-stage swap before publication, proving failure and descriptor scrubbing;
+- a same-size target swap after the first identity check, proving no false success.
+
+Final verification:
+
+1. Windows artifact suite: `56 passed, 4 skipped in 1.80s`.
+2. Ubuntu container artifact suite: `56 passed, 4 skipped in 1.34s`.
+3. Windows full suite: `673 passed, 9 skipped in 10.05s`.
+4. Ubuntu container full suite: `671 passed, 10 skipped, 1 failed in 9.03s`.
+   The sole failure is the separately scoped retention regression
+   `test_owned_root_deletion_leaks_and_preserves_a_concurrent_name_replacement`;
+   all artifact tests pass.
+5. `pip check`: `No broken requirements found.`
+6. `compileall -q src tests`: exit 0.
+7. `git diff --check`: exit 0 (line-ending conversion warnings only).
+
+No push or deployment was performed.

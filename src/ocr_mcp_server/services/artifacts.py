@@ -580,16 +580,41 @@ class _PinnedArtifactRoot:
     def create_stage(self) -> tuple[int, str | None, Path | None]:
         if self.descriptor is not None:
             temporary_flag = getattr(os, "O_TMPFILE", 0)
-            if not temporary_flag:
-                raise OSError from None
-            descriptor = os.open(
-                self.path,
-                os.O_RDWR
-                | temporary_flag
-                | getattr(os, "O_CLOEXEC", 0),
-                0o600,
-            )
-            return descriptor, None, None
+            if temporary_flag:
+                try:
+                    descriptor = os.open(
+                        self.path,
+                        os.O_RDWR
+                        | temporary_flag
+                        | getattr(os, "O_CLOEXEC", 0),
+                        0o600,
+                    )
+                    return descriptor, None, None
+                except OSError as exc:
+                    if exc.errno not in {
+                        errno.EOPNOTSUPP,
+                        errno.EINVAL,
+                        errno.EISDIR,
+                        errno.ENOENT,
+                    }:
+                        raise
+            for _ in range(32):
+                name = f".artifact-stage-{secrets.token_hex(16)}.zip"
+                try:
+                    descriptor = os.open(
+                        name,
+                        os.O_RDWR
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                        dir_fd=self.descriptor,
+                    )
+                except FileExistsError:
+                    continue
+                return descriptor, name, self.path / name
+            raise OSError from None
         import msvcrt
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -683,6 +708,31 @@ class _PinnedArtifactRoot:
                 raise FileExistsError(error_number, os.strerror(error_number))
             raise OSError(error_number, os.strerror(error_number))
         libc = ctypes.CDLL(None, use_errno=True)
+        if stage_name is not None:
+            try:
+                renameat2 = libc.renameat2
+            except AttributeError:
+                raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS)) from None
+            renameat2.argtypes = (
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            renameat2.restype = ctypes.c_int
+            if renameat2(
+                self.descriptor,
+                os.fsencode(stage_name),
+                self.descriptor,
+                os.fsencode(target_name),
+                1,
+            ) == 0:
+                return
+            error_number = ctypes.get_errno()
+            if error_number == errno.EEXIST:
+                raise FileExistsError(error_number, os.strerror(error_number))
+            raise OSError(error_number, os.strerror(error_number))
         linkat = libc.linkat
         linkat.argtypes = (
             ctypes.c_int,
@@ -701,19 +751,23 @@ class _PinnedArtifactRoot:
         ) == 0:
             return
         error_number = ctypes.get_errno()
+        if error_number in {errno.ENOENT, errno.EPERM, errno.EACCES}:
+            proc_descriptor = os.fsencode(f"/proc/self/fd/{stage_descriptor}")
+            if linkat(
+                -100,
+                proc_descriptor,
+                self.descriptor,
+                os.fsencode(target_name),
+                0x400,
+            ) == 0:
+                return
+            error_number = ctypes.get_errno()
         if error_number == errno.EEXIST:
             raise FileExistsError(error_number, os.strerror(error_number))
         raise OSError(error_number, os.strerror(error_number))
 
     def unlink_stage(self, stage_name: str | None) -> None:
-        if stage_name is None:
-            return
-        if self.descriptor is None:
-            return
-        try:
-            os.unlink(stage_name, dir_fd=self.descriptor)
-        except FileNotFoundError:
-            pass
+        return
 
     def arm_stage_cleanup(self, stage_descriptor: int, stage_name: str | None) -> None:
         if stage_name is None:
@@ -784,7 +838,10 @@ class _PinnedArtifactRoot:
     def force_stage_cleanup(
         self, stage_descriptor: int, stage_name: str | None
     ) -> None:
-        if stage_name is None or self.descriptor is not None:
+        if stage_name is None:
+            return
+        if self.descriptor is not None:
+            self.scrub_stage(stage_descriptor)
             return
         try:
             self._set_stage_cleanup(stage_descriptor, True)
@@ -1619,6 +1676,8 @@ class ArtifactBundler:
                             not _same_object(stage_identity, published_identity)
                             or published_identity.st_size != size
                         ):
+                            if pinned.descriptor is not None:
+                                pinned.scrub_stage(descriptor)
                             _fail(ArtifactErrorCode.PUBLISH_FAILED)
                     except ArtifactFailure:
                         raise
@@ -1634,7 +1693,16 @@ class ArtifactBundler:
                 ):
                     _fail(ArtifactErrorCode.PUBLISH_FAILED)
                 final_identity = pinned._named_stat(artifact_name)
-                if not stat.S_ISREG(final_identity.st_mode) or final_identity.st_size != size:
+                if (
+                    not stat.S_ISREG(final_identity.st_mode)
+                    or final_identity.st_size != size
+                    or (
+                        published
+                        and not _same_object(stage_identity, final_identity)
+                    )
+                ):
+                    if published and pinned.descriptor is not None:
+                        pinned.scrub_stage(descriptor)
                     _fail(ArtifactErrorCode.PUBLISH_FAILED)
                 return ArtifactBundle(
                     artifact_id=artifact_id,

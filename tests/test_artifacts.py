@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+import errno
 from hashlib import sha256
 import json
 import os
@@ -842,6 +843,197 @@ def test_publish_interruption_leaves_no_visible_target_or_stage(tmp_path: Path, 
     assert caught.value.code == ArtifactErrorCode.PUBLISH_FAILED.value
     assert not list(artifact_root.rglob("*.zip"))
     assert not list(artifact_root.rglob(".artifact-stage-*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX anonymous publication contract")
+def test_posix_publication_falls_back_when_empty_path_link_is_restricted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from ocr_mcp_server.services import artifacts as module
+
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    real_libc = module.ctypes.CDLL(None, use_errno=True)
+    real_linkat = real_libc.linkat
+    real_linkat.argtypes = (
+        module.ctypes.c_int,
+        module.ctypes.c_char_p,
+        module.ctypes.c_int,
+        module.ctypes.c_char_p,
+        module.ctypes.c_int,
+    )
+    real_linkat.restype = module.ctypes.c_int
+    calls: list[tuple[bytes, int]] = []
+
+    class RestrictedLinkAt:
+        argtypes = None
+        restype = None
+
+        def __call__(self, source_fd, source_name, root_fd, target_name, flags):
+            calls.append((source_name, flags))
+            if source_name == b"":
+                module.ctypes.set_errno(errno.ENOENT)
+                return -1
+            return real_linkat(source_fd, source_name, root_fd, target_name, flags)
+
+    class RestrictedLibC:
+        linkat = RestrictedLinkAt()
+
+    monkeypatch.setattr(
+        module.ctypes, "CDLL", lambda *_args, **_kwargs: RestrictedLibC()
+    )
+    with module._PinnedArtifactRoot(root, os.lstat(root)) as pinned:
+        descriptor, stage_name, _stage_path = pinned.create_stage()
+        try:
+            os.write(descriptor, b"descriptor-bound-stage")
+            os.fsync(descriptor)
+            pinned.link_no_replace(descriptor, stage_name, "published.zip")
+            assert module._same_object(
+                os.fstat(descriptor),
+                os.stat(
+                    "published.zip",
+                    dir_fd=pinned.descriptor,
+                    follow_symlinks=False,
+                ),
+            )
+        finally:
+            os.close(descriptor)
+    assert calls[0] == (b"", 0x1000)
+    assert calls[1][0].startswith(b"/proc/self/fd/") and calls[1][1] == 0x400
+    assert not list(root.glob(".artifact-stage-*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX named publication fallback")
+def test_posix_publication_falls_back_when_otmpfile_is_unsupported(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from ocr_mcp_server.services import artifacts as module
+
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    real_open = module.os.open
+    temporary_flag = getattr(module.os, "O_TMPFILE", 0)
+    assert temporary_flag
+
+    def without_otmpfile(path, flags, *args, **kwargs):
+        if flags & temporary_flag == temporary_flag:
+            raise OSError(errno.EOPNOTSUPP, "planted unsupported anonymous stage")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "open", without_otmpfile)
+    with module._PinnedArtifactRoot(root, os.lstat(root)) as pinned:
+        descriptor, stage_name, _stage_path = pinned.create_stage()
+        try:
+            assert stage_name is not None
+            os.write(descriptor, b"descriptor-bound-stage")
+            os.fsync(descriptor)
+            pinned.link_no_replace(descriptor, stage_name, "published.zip")
+            assert module._same_object(
+                os.fstat(descriptor),
+                os.stat(
+                    "published.zip",
+                    dir_fd=pinned.descriptor,
+                    follow_symlinks=False,
+                ),
+            )
+        finally:
+            os.close(descriptor)
+    assert not list(root.glob(".artifact-stage-*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX named publication fallback")
+def test_posix_named_stage_swap_never_succeeds_or_leaks_stage_content(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result, publication, _, _ = _inputs(tmp_path)
+    artifact_root = (tmp_path / "artifacts").absolute()
+    from ocr_mcp_server.services import artifacts as module
+
+    real_open = module.os.open
+    temporary_flag = getattr(module.os, "O_TMPFILE", 0)
+
+    def without_otmpfile(path, flags, *args, **kwargs):
+        if temporary_flag and flags & temporary_flag == temporary_flag:
+            raise OSError(errno.EOPNOTSUPP, "planted unsupported anonymous stage")
+        return real_open(path, flags, *args, **kwargs)
+
+    moved_stage: Path | None = None
+    replacement_target: Path | None = None
+
+    def swap_before_publish(self, _descriptor, stage_name, target_name):
+        nonlocal moved_stage, replacement_target
+        assert stage_name is not None and self.descriptor is not None
+        moved_stage = self.path / ".attacker-moved-stage"
+        replacement_target = self.path / target_name
+        os.rename(
+            stage_name,
+            moved_stage.name,
+            src_dir_fd=self.descriptor,
+            dst_dir_fd=self.descriptor,
+        )
+        replacement_target.write_bytes(b"attacker replacement")
+
+    monkeypatch.setattr(module.os, "open", without_otmpfile)
+    monkeypatch.setattr(module._PinnedArtifactRoot, "link_no_replace", swap_before_publish)
+    with pytest.raises(ArtifactFailure) as caught:
+        ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
+            result,
+            publication,
+            artifact_root=artifact_root,
+            batch_id=BATCH_ID,
+            created_at=NOW,
+            expires_at=NOW + timedelta(hours=24),
+        )
+    assert caught.value.code == ArtifactErrorCode.PUBLISH_FAILED.value
+    assert moved_stage is not None and moved_stage.read_bytes() == b""
+    assert replacement_target is not None
+    assert replacement_target.read_bytes() == b"attacker replacement"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX named publication fallback")
+def test_posix_named_target_late_swap_never_returns_success(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result, publication, _, _ = _inputs(tmp_path)
+    artifact_root = (tmp_path / "artifacts").absolute()
+    from ocr_mcp_server.services import artifacts as module
+
+    real_open = module.os.open
+    temporary_flag = getattr(module.os, "O_TMPFILE", 0)
+
+    def without_otmpfile(path, flags, *args, **kwargs):
+        if temporary_flag and flags & temporary_flag == temporary_flag:
+            raise OSError(errno.EOPNOTSUPP, "planted unsupported anonymous stage")
+        return real_open(path, flags, *args, **kwargs)
+
+    original_fsync = module._PinnedArtifactRoot.fsync
+    moved_target: Path | None = None
+    replacement_target: Path | None = None
+
+    def swap_after_first_identity_check(self):
+        nonlocal moved_target, replacement_target
+        target = next(self.path.glob("artifact-*.zip"))
+        moved_target = self.path / ".attacker-late-moved"
+        replacement_target = target
+        os.rename(target, moved_target)
+        replacement_target.write_bytes(b"x" * moved_target.stat().st_size)
+        return original_fsync(self)
+
+    monkeypatch.setattr(module.os, "open", without_otmpfile)
+    monkeypatch.setattr(module._PinnedArtifactRoot, "fsync", swap_after_first_identity_check)
+    with pytest.raises(ArtifactFailure) as caught:
+        ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
+            result,
+            publication,
+            artifact_root=artifact_root,
+            batch_id=BATCH_ID,
+            created_at=NOW,
+            expires_at=NOW + timedelta(hours=24),
+        )
+    assert caught.value.code == ArtifactErrorCode.PUBLISH_FAILED.value
+    assert moved_target is not None and moved_target.read_bytes() == b""
+    assert replacement_target is not None
+    assert set(replacement_target.read_bytes()) == {ord("x")}
 
 
 def test_post_link_identity_swap_never_returns_success(tmp_path: Path, monkeypatch) -> None:
