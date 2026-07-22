@@ -105,7 +105,8 @@ Tests:
 ## Commit
 
 - `b8e0380` — `feat: publish deterministic indexed artifacts`
-- This report is committed separately; its commit is the final Task 9A HEAD reported to the controller.
+- `951993d` — `docs: record task 9a artifact verification`
+- The final verification evidence update to this report is committed separately and its commit is the final Task 9A HEAD reported to the controller.
 
 No push, sync, deployment, image build, parent-plan edit, or external mutation was performed.
 
@@ -122,7 +123,18 @@ Pre-implementation-commit gate:
 4. `git diff --check`
    - Exit 0 with no whitespace errors.
 
-The same mandatory gate is rerun after the report commit using `git diff --check 6c3969d..HEAD` so the controller receives final-HEAD evidence.
+Post-report gate from `951993d`:
+
+1. `.\.venv\Scripts\python.exe -m pytest -p no:cacheprovider`
+   - Exit 0: `601 passed, 5 skipped in 6.68s`.
+2. `.\.venv\Scripts\python.exe -m pip check`
+   - Exit 0: `No broken requirements found.`
+3. `.\.venv\Scripts\python.exe -m compileall -q src tests`
+   - Exit 0 with no output.
+4. `git diff --check 6c3969d..HEAD`
+   - Exit 0 with no output.
+5. `git status --short`
+   - Exit 0 with no output; the worktree was clean.
 
 ## Review closure and remaining concerns
 
