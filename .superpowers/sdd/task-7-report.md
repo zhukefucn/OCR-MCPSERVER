@@ -45,3 +45,58 @@
 
 - 当前机器是 Windows；Linux 专用 openat/renameat2 分支需要控制层按既定节奏在 Ubuntu 同步后运行全套测试与容器启动验证。
 - LaTeX 使用保守白名单；真实 Paddle 输出若出现新但无副作用的数学命令，应先加验证样本和安全评估，再显式扩充白名单。
+
+## Controller 复审修复（2026-07-22）
+
+Controller 复审提出 2 Critical、3 Important，修复提交：
+
+- `53a476a17bb2cbb39cd46d8e9787ba74b37614e2` — `fix: bind published versions to verified identities`
+
+新增回归位于：
+
+- `tests/test_merge_publication.py`
+  - staging 名称在最终检查后被替换时不得返回成功；
+  - 清理删除窗口发生目录替换时保留 victim；
+  - rollback publication manifest 拒绝额外顶层字段；
+  - candidate ID 与 processing record ID 必须按 Task 5 公式重算匹配。
+- `tests/test_structured_content_validation.py`
+  - 单元格正文中的裸 `<` 必须拒绝，文本小于号只能通过批准实体表达。
+
+RED 命令：
+
+```text
+.\.venv\Scripts\python.exe -m pytest tests/test_structured_content_validation.py tests/test_merge_publication.py -q
+```
+
+RED 结果：`7 failed`，失败项与 controller 五项发现一致：2 个裸 `<`、2 个伪造 ID、staging 名称替换、清理删除窗口替换、rollback manifest 额外字段。
+
+GREEN focused 命令：
+
+```text
+.\.venv\Scripts\python.exe -m pytest tests/test_structured_content_validation.py tests/test_merge_publication.py -q
+```
+
+GREEN focused 结果：`122 passed in 1.08s`。
+
+提交前完整门禁命令：
+
+```text
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\python.exe -m compileall -q src tests
+git diff --check
+```
+
+结果：
+
+- Full：`529 passed, 5 skipped in 4.16s`
+- pip check：`No broken requirements found.`
+- compileall：退出码 0
+- diff-check：退出码 0，仅 Git LF/CRLF 提示
+
+修复要点：
+
+- 原子 rename 后、设置 `published=True` 前，重新从 root fd/安全路径打开目标，要求目标 identity 等于原始 open staging identity，并验证精确文件集合、每个固定文件 identity、长度与字节哈希。
+- 失败清理不再调用 `shutil.rmtree`；POSIX 使用已持有的 root/stage fd 做目录相对的精确 unlink/rmdir，Windows 逐文件复核 identity 后仅删除已知文件。任何名称或 identity 不一致均保留目录。
+- rollback 独立 manifest 采用精确顶层 schema，并要求磁盘字节等于重新生成的 canonical JSON。
+- merge 边界按 Task 5 既定 SHA-256 公式重算 candidate/record ID，任何不匹配全局失败且不发布。
