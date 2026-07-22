@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from ..services.health import DependencyStatus
+from ..services.health import DependencyStatus, normalize_snapshot
 
 
 router = APIRouter()
@@ -20,7 +20,7 @@ def liveness() -> dict[str, str]:
 
 @router.get("/health/ready", operation_id="readiness")
 async def readiness(request: Request) -> JSONResponse:
-    snapshot = await request.app.state.readiness.check()
+    snapshot = normalize_snapshot(await request.app.state.readiness.check())
     body = {
         "status": snapshot.status.value,
         "dependencies": [

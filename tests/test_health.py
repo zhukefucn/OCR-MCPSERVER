@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import gc
+import time
 
 import pytest
 
@@ -16,6 +18,7 @@ from ocr_mcp_server.services.health import (
     ProbeCode,
     ProbeResult,
     ReadinessService,
+    ReadinessSnapshot,
 )
 from ocr_mcp_server.services.observability import DependencyName
 
@@ -194,6 +197,58 @@ def test_probe_result_rejects_inconsistent_or_non_finite_values() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "canary"),
+    [
+        ("dependency", "dependency-canary.invalid"),
+        ("status", "status-canary.invalid"),
+        ("code", "code-canary.invalid"),
+    ],
+)
+async def test_post_construction_probe_result_mutation_is_normalized_content_free(
+    field: str, canary: str
+) -> None:
+    mutated = result(DependencyName.SQLITE)
+    object.__setattr__(mutated, field, canary)
+    assert canary not in repr(mutated)
+
+    async def check() -> ProbeResult:
+        return mutated
+
+    async def ready(dependency: DependencyName) -> ProbeResult:
+        return result(dependency)
+
+    snapshot = await service(
+        Probe(DependencyName.SQLITE, check),
+        Probe(DependencyName.MINERU, lambda: ready(DependencyName.MINERU)),
+        Probe(DependencyName.PADDLE, lambda: ready(DependencyName.PADDLE)),
+    ).check()
+
+    assert snapshot.dependencies[0] == result(
+        DependencyName.SQLITE,
+        DependencyStatus.UNAVAILABLE,
+        ProbeCode.INVALID_RESPONSE,
+    )
+    assert canary not in repr(snapshot)
+
+
+def test_readiness_snapshot_reconstructs_canonical_probe_result_copies() -> None:
+    originals = tuple(result(dependency) for dependency in DependencyName)
+    snapshot = ReadinessSnapshot(originals)
+
+    object.__setattr__(originals[0], "code", "copy-canary.invalid")
+
+    assert snapshot.dependencies == tuple(
+        result(dependency) for dependency in DependencyName
+    )
+    assert all(
+        canonical is not original
+        for canonical, original in zip(snapshot.dependencies, originals, strict=True)
+    )
+    assert "copy-canary" not in repr(snapshot)
+
+
+@pytest.mark.asyncio
 async def test_caller_cancellation_cancels_and_awaits_all_probe_tasks() -> None:
     started = [asyncio.Event() for _ in DependencyName]
     finished = [asyncio.Event() for _ in DependencyName]
@@ -218,6 +273,223 @@ async def test_caller_cancellation_cancels_and_awaits_all_probe_tasks() -> None:
     with pytest.raises(asyncio.CancelledError):
         await pending
     assert all(event.is_set() for event in finished)
+
+
+@pytest.mark.asyncio
+async def test_late_ready_after_deadline_is_irrevocably_timeout() -> None:
+    cancelled = asyncio.Event()
+
+    async def suppress_cancellation() -> ProbeResult:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            return result(DependencyName.SQLITE)
+
+    async def ready(dependency: DependencyName) -> ProbeResult:
+        return result(dependency)
+
+    snapshot = await service(
+        Probe(DependencyName.SQLITE, suppress_cancellation),
+        Probe(DependencyName.MINERU, lambda: ready(DependencyName.MINERU)),
+        Probe(DependencyName.PADDLE, lambda: ready(DependencyName.PADDLE)),
+        timeout=0.01,
+    ).check()
+
+    assert cancelled.is_set()
+    assert snapshot.dependencies[0] == result(
+        DependencyName.SQLITE,
+        DependencyStatus.UNAVAILABLE,
+        ProbeCode.TIMEOUT,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancellation_suppressing_probe_cannot_delay_timeout_or_metrics() -> None:
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def refuses_cancellation() -> ProbeResult:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+            return result(DependencyName.SQLITE)
+
+    async def ready(dependency: DependencyName) -> ProbeResult:
+        return result(dependency)
+
+    class Sink:
+        def __init__(self) -> None:
+            self.calls: list[tuple[DependencyName, bool]] = []
+
+        def set_dependency_ready(self, dependency: DependencyName, ready: bool) -> None:
+            self.calls.append((dependency, ready))
+
+    sink = Sink()
+    started = time.monotonic()
+    pending = asyncio.create_task(
+        service(
+            Probe(DependencyName.SQLITE, refuses_cancellation),
+            Probe(DependencyName.MINERU, lambda: ready(DependencyName.MINERU)),
+            Probe(DependencyName.PADDLE, lambda: ready(DependencyName.PADDLE)),
+            timeout=0.01,
+            observability=sink,
+        ).check()
+    )
+    try:
+        await asyncio.wait_for(cancelled.wait(), timeout=0.1)
+        await asyncio.sleep(0.02)
+        assert pending.done()
+        snapshot = await pending
+        assert time.monotonic() - started < 0.1
+        assert snapshot.dependencies[0].code is ProbeCode.TIMEOUT
+        assert sink.calls == [
+            (DependencyName.SQLITE, False),
+            (DependencyName.MINERU, True),
+            (DependencyName.PADDLE, True),
+        ]
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+    assert sink.calls == [
+        (DependencyName.SQLITE, False),
+        (DependencyName.MINERU, True),
+        (DependencyName.PADDLE, True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_caller_cancellation_returns_promptly_when_probe_refuses_cancellation() -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def refuses_cancellation(dependency: DependencyName) -> ProbeResult:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+            return result(dependency)
+
+    readiness = service(
+        *(
+            Probe(
+                dependency,
+                lambda dependency=dependency: refuses_cancellation(dependency),
+            )
+            for dependency in DependencyName
+        ),
+        timeout=10,
+    )
+    pending = asyncio.create_task(readiness.check())
+    await started.wait()
+    pending.cancel()
+    try:
+        await asyncio.wait_for(cancelled.wait(), timeout=0.1)
+        done, _ = await asyncio.wait({pending}, timeout=0.05)
+        assert done == {pending}
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_detached_probe_exception_after_caller_cancellation_is_consumed() -> None:
+    canary = "detached-exception-canary.invalid"
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+    contexts: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+
+    async def refuses_cancellation() -> ProbeResult:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+            raise RuntimeError(canary)
+
+    async def ready(dependency: DependencyName) -> ProbeResult:
+        return result(dependency)
+
+    pending = asyncio.create_task(
+        service(
+            Probe(DependencyName.SQLITE, refuses_cancellation),
+            Probe(DependencyName.MINERU, lambda: ready(DependencyName.MINERU)),
+            Probe(DependencyName.PADDLE, lambda: ready(DependencyName.PADDLE)),
+            timeout=10,
+        ).check()
+    )
+    await started.wait()
+    pending.cancel()
+    try:
+        await asyncio.wait_for(cancelled.wait(), timeout=0.1)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(pending, timeout=0.1)
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        gc.collect()
+        await asyncio.sleep(0)
+        assert canary not in repr(contexts)
+        assert contexts == []
+    finally:
+        release.set()
+        loop.set_exception_handler(previous_handler)
+
+
+def test_probe_constructor_masks_raising_iterators_and_descriptors() -> None:
+    canary = "constructor-canary.invalid/private"
+
+    class RaisingIterable:
+        def __iter__(self):
+            raise RuntimeError(canary)
+
+    class RaisingProbe:
+        @property
+        def dependency(self):
+            raise RuntimeError(canary)
+
+        async def check(self):
+            raise AssertionError("unreachable")
+
+    for probes in (RaisingIterable(), [RaisingProbe()]):
+        with pytest.raises(ValueError) as exc_info:
+            ReadinessService(probes, 1)
+        assert str(exc_info.value) == "invalid readiness probes"
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+        assert canary not in repr(exc_info.value)
+
+
+def test_probe_constructor_inspects_at_most_four_iterable_items() -> None:
+    class BoundedInfinite:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.calls += 1
+            if self.calls > 4:
+                raise AssertionError("iterator consumed without a bound")
+            return Probe(DependencyName.SQLITE, None)
+
+    probes = BoundedInfinite()
+    with pytest.raises(ValueError, match="^invalid readiness probes$"):
+        ReadinessService(probes, 1)
+    assert probes.calls == 4
 
 
 @pytest.mark.asyncio

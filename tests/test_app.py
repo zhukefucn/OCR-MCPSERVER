@@ -116,3 +116,29 @@ def test_liveness_never_calls_readiness() -> None:
         response = client.get("/health/live")
     assert response.json() == {"status": "ok"}
     assert readiness.calls == 0
+
+
+def test_readiness_api_renormalizes_mutated_injected_snapshot_content_free() -> None:
+    canary = "api-canary.invalid/private/path"
+    snapshot = _snapshot()
+    object.__setattr__(snapshot.dependencies[0], "code", canary)
+    assert canary not in repr(snapshot)
+    readiness = Readiness(snapshot)
+
+    with TestClient(create_app(AppSettings(), readiness=readiness)) as client:
+        response = client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unavailable",
+        "dependencies": [
+            {
+                "dependency": "sqlite",
+                "status": "unavailable",
+                "code": "invalid_response",
+            },
+            {"dependency": "mineru", "status": "ready", "code": "ready"},
+            {"dependency": "paddle", "status": "ready", "code": "ready"},
+        ],
+    }
+    assert canary not in response.text

@@ -444,6 +444,13 @@ def test_example_yaml_documents_health_probe_timeout() -> None:
     assert health.probe_timeout_seconds == 3.0
 
 
+def test_health_probe_timeout_accepts_numeric_environment_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OCR_HEALTH__PROBE_TIMEOUT_SECONDS", "1.5")
+    assert AppSettings().health.probe_timeout_seconds == 1.5
+
+
 def test_example_yaml_documents_structured_merge_safety_limits() -> None:
     structured = load_settings(config_file=Path("config/example.yaml")).structured_content
     assert structured.max_characters > 0

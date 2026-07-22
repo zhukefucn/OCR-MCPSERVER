@@ -334,13 +334,15 @@ class HealthSettings(_SettingsSection):
 
     @field_validator("probe_timeout_seconds", mode="before")
     @classmethod
-    def require_finite_positive_timeout(cls, value: object) -> object:
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or value <= 0
-        ):
+    def reject_boolean_timeout(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("health probe timeout must be finite and positive")
+        return value
+
+    @field_validator("probe_timeout_seconds")
+    @classmethod
+    def require_finite_positive_timeout(cls, value: float) -> float:
+        if not math.isfinite(value) or value <= 0:
             raise ValueError("health probe timeout must be finite and positive")
         return value
 

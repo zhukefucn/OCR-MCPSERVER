@@ -46,6 +46,24 @@ class ProbeResult:
         ):
             raise ValueError("invalid probe result")
 
+    def __repr__(self) -> str:
+        try:
+            if (
+                type(self.dependency) is DependencyName
+                and type(self.status) is DependencyStatus
+                and type(self.code) is ProbeCode
+                and (self.status is DependencyStatus.READY)
+                == (self.code is ProbeCode.READY)
+            ):
+                return (
+                    "ProbeResult("
+                    f"dependency={self.dependency.value!r}, "
+                    f"status={self.status.value!r}, code={self.code.value!r})"
+                )
+        except Exception:
+            pass
+        return "ProbeResult(invalid)"
+
 
 @dataclass(frozen=True, slots=True)
 class ReadinessSnapshot:
@@ -55,11 +73,17 @@ class ReadinessSnapshot:
         if (
             type(self.dependencies) is not tuple
             or len(self.dependencies) != len(DependencyName)
-            or any(type(item) is not ProbeResult for item in self.dependencies)
-            or tuple(item.dependency for item in self.dependencies)
-            != tuple(DependencyName)
         ):
             raise ValueError("invalid readiness snapshot")
+        canonical = tuple(
+            _canonical_result(item, dependency)
+            for dependency, item in zip(
+                DependencyName, self.dependencies, strict=True
+            )
+        )
+        if any(item is None for item in canonical):
+            raise ValueError("invalid readiness snapshot")
+        object.__setattr__(self, "dependencies", canonical)
 
     @property
     def status(self) -> DependencyStatus:
@@ -78,6 +102,10 @@ class ReadinessSnapshot:
     @property
     def ready(self) -> bool:
         return self.status is DependencyStatus.READY
+
+    def __repr__(self) -> str:
+        normalized = normalize_snapshot(self)
+        return f"ReadinessSnapshot(status={normalized.status.value!r})"
 
 
 class DependencyProbe(Protocol):
@@ -102,23 +130,10 @@ class ReadinessService:
             or timeout_seconds <= 0
         ):
             raise ValueError("invalid readiness timeout")
-        try:
-            provided = tuple(probes)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            raise ValueError("invalid readiness probes") from None
-        by_dependency: dict[DependencyName, DependencyProbe] = {}
-        for probe in provided:
-            dependency = getattr(probe, "dependency", None)
-            if (
-                type(dependency) is not DependencyName
-                or dependency in by_dependency
-                or not callable(getattr(probe, "check", None))
-            ):
-                raise ValueError("invalid readiness probes")
-            by_dependency[dependency] = probe
-        if set(by_dependency) != set(DependencyName):
+        validated = _validated_probes(probes)
+        if validated is None:
             raise ValueError("invalid readiness probes")
-        self._probes = tuple(by_dependency[name] for name in DependencyName)
+        self._probes = validated
         self._timeout_seconds = float(timeout_seconds)
         self._observability = (
             observability if observability is not None else NullObservability()
@@ -149,17 +164,126 @@ class ReadinessService:
         self, probe: DependencyProbe, dependency: DependencyName
     ) -> ProbeResult:
         try:
-            async with asyncio.timeout(self._timeout_seconds):
-                result = await probe.check()
-        except TimeoutError:
-            return _unavailable(dependency, ProbeCode.TIMEOUT)
+            probe_task = asyncio.create_task(probe.check())
         except asyncio.CancelledError:
             raise
         except Exception:
-            return _unavailable(dependency, ProbeCode.UNAVAILABLE)
-        if type(result) is not ProbeResult or result.dependency is not dependency:
             return _unavailable(dependency, ProbeCode.INVALID_RESPONSE)
-        return result
+        try:
+            completed, _ = await asyncio.wait(
+                {probe_task}, timeout=self._timeout_seconds
+            )
+        except asyncio.CancelledError:
+            await _cancel_or_detach(probe_task)
+            raise
+        if not completed:
+            await _cancel_or_detach(probe_task)
+            return _unavailable(dependency, ProbeCode.TIMEOUT)
+        try:
+            result = probe_task.result()
+        except asyncio.CancelledError:
+            return _unavailable(dependency, ProbeCode.UNAVAILABLE)
+        except Exception:
+            return _unavailable(dependency, ProbeCode.UNAVAILABLE)
+        canonical = _canonical_result(result, dependency)
+        if canonical is None:
+            return _unavailable(dependency, ProbeCode.INVALID_RESPONSE)
+        return canonical
+
+
+_DETACHED_PROBES: set[asyncio.Task[object]] = set()
+
+
+async def _cancel_or_detach(task: asyncio.Task[object]) -> None:
+    """Bound cancellation cleanup without trusting a coroutine to cooperate."""
+
+    task.cancel()
+    await asyncio.sleep(0)
+    if task.done():
+        _consume_probe_task(task)
+        return
+    _DETACHED_PROBES.add(task)
+    task.add_done_callback(_consume_probe_task)
+
+
+def _consume_probe_task(task: asyncio.Task[object]) -> None:
+    _DETACHED_PROBES.discard(task)
+    try:
+        task.result()
+    except BaseException:
+        pass
+
+
+def _canonical_result(
+    value: object, expected_dependency: DependencyName
+) -> ProbeResult | None:
+    try:
+        if (
+            type(value) is not ProbeResult
+            or type(value.dependency) is not DependencyName
+            or value.dependency is not expected_dependency
+            or type(value.status) is not DependencyStatus
+            or type(value.code) is not ProbeCode
+            or (value.status is DependencyStatus.READY)
+            != (value.code is ProbeCode.READY)
+        ):
+            return None
+        return ProbeResult(value.dependency, value.status, value.code)
+    except Exception:
+        return None
+
+
+def normalize_snapshot(value: object) -> ReadinessSnapshot:
+    """Create a safe public snapshot from an otherwise untrusted result."""
+
+    dependencies: object = None
+    if type(value) is ReadinessSnapshot:
+        try:
+            dependencies = value.dependencies
+        except Exception:
+            pass
+    if type(dependencies) is not tuple or len(dependencies) != len(DependencyName):
+        return ReadinessSnapshot(
+            tuple(
+                _unavailable(dependency, ProbeCode.INVALID_RESPONSE)
+                for dependency in DependencyName
+            )
+        )
+    normalized = tuple(
+        _canonical_result(item, dependency)
+        or _unavailable(dependency, ProbeCode.INVALID_RESPONSE)
+        for dependency, item in zip(DependencyName, dependencies, strict=True)
+    )
+    return ReadinessSnapshot(normalized)
+
+
+def _validated_probes(probes: object) -> tuple[DependencyProbe, ...] | None:
+    provided: list[object] = []
+    try:
+        iterator = iter(probes)  # type: ignore[arg-type]
+        for _ in range(len(DependencyName) + 1):
+            try:
+                provided.append(next(iterator))
+            except StopIteration:
+                break
+        if len(provided) != len(DependencyName):
+            return None
+        by_dependency: dict[DependencyName, DependencyProbe] = {}
+        for probe in provided:
+            dependency = getattr(probe, "dependency")
+            check = getattr(probe, "check")
+            if (
+                type(dependency) is not DependencyName
+                or dependency in by_dependency
+                or not callable(check)
+            ):
+                return None
+            by_dependency[dependency] = probe  # type: ignore[assignment]
+        if set(by_dependency) != set(DependencyName):
+            return None
+        return tuple(by_dependency[name] for name in DependencyName)
+    except Exception:
+        return None
 
 
 def _unavailable(dependency: DependencyName, code: ProbeCode) -> ProbeResult:
@@ -174,4 +298,5 @@ __all__ = [
     "ProbeResultCode",
     "ReadinessService",
     "ReadinessSnapshot",
+    "normalize_snapshot",
 ]
