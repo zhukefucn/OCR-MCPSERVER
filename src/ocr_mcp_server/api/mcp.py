@@ -4,9 +4,9 @@ import math
 from typing import Annotated
 
 from fastmcp import Context, FastMCP
-from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import NotFoundError, ToolError
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
-from pydantic import Field, ValidationError
+from pydantic import BaseModel, Field, StrictInt, ValidationError
 
 from .contracts import (
     BatchStatusResponse,
@@ -28,18 +28,39 @@ McpIdempotencyKey = Annotated[
 ]
 McpRecoveryToken = Annotated[str, Field(min_length=8, max_length=256)]
 McpPages = Annotated[
-    list[Annotated[int, Field(gt=0)]], Field(min_length=1, max_length=500)
+    list[Annotated[StrictInt, Field(gt=0)]], Field(min_length=1, max_length=500)
 ]
+
+
+class _SafeFastMCP(FastMCP):
+    """Contain framework errors raised outside the FastMCP middleware chain."""
+
+    async def _call_tool_mcp(self, key, arguments):
+        try:
+            return await super()._call_tool_mcp(key, arguments)
+        except ToolError:
+            raise
+        except NotFoundError:
+            raise ToolError(
+                "not_found: The requested tool was not found."
+            ) from None
+        except Exception:
+            raise ToolError(
+                "internal_error: The request could not be completed."
+            ) from None
 
 
 def create_mcp_server(gateway: DocumentGateway | None) -> FastMCP:
     """Create only the approved weak-agent-facing tools."""
 
-    mcp = FastMCP(
+    mcp = _SafeFastMCP(
         "OCR Document Gateway",
         middleware=[_SafeValidationMiddleware()],
         mask_error_details=True,
-        strict_input_validation=True,
+        # SDK-level JSON Schema errors echo input values and run outside middleware.
+        # FunctionTool still validates against the same published schema inside the
+        # safe middleware chain.
+        strict_input_validation=False,
     )
 
     @mcp.tool(
@@ -54,18 +75,22 @@ def create_mcp_server(gateway: DocumentGateway | None) -> FastMCP:
         request = ParseDocumentsRequest(
             sources=sources, idempotency_key=idempotency_key
         )
-        return await _safe_call(
+        result = await _safe_call(
             _require_gateway(gateway).parse_documents(
                 request, progress=_ProgressBridge(ctx) if ctx is not None else None
             )
         )
+        return _validated_output(ParseSubmission, result)
 
     @mcp.tool(
         name="get_task_status",
         description="Get current progress and final artifact links for an OCR task.",
     )
     async def get_task_status(batch_id: CanonicalId) -> BatchStatusResponse:
-        return await _safe_call(_require_gateway(gateway).get_task_status(batch_id))
+        result = await _safe_call(
+            _require_gateway(gateway).get_task_status(batch_id)
+        )
+        return _validated_output(BatchStatusResponse, result)
 
     @mcp.tool(
         name="reparse_with_page_orientation",
@@ -79,11 +104,12 @@ def create_mcp_server(gateway: DocumentGateway | None) -> FastMCP:
         request = OrientationReparseRequest(
             recovery_token=recovery_token, pages=pages
         )
-        return await _safe_call(
+        result = await _safe_call(
             _require_gateway(gateway).reparse_with_page_orientation(
                 request, progress=_ProgressBridge(ctx) if ctx is not None else None
             )
         )
+        return _validated_output(OrientationReparseSubmission, result)
 
     return mcp
 
@@ -103,6 +129,15 @@ async def _safe_call(awaitable):
         raise
     except GatewayFailure as exc:
         raise ToolError(f"{exc.code}: {exc.safe_message}") from None
+    except Exception:
+        raise ToolError(
+            "internal_error: The request could not be completed."
+        ) from None
+
+
+def _validated_output(model: type[BaseModel], value):
+    try:
+        return model.model_validate(value)
     except Exception:
         raise ToolError(
             "internal_error: The request could not be completed."

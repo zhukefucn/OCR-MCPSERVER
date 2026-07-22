@@ -53,25 +53,33 @@ class AuthenticationSettings(_SettingsSection):
 
     api_keys: list[SecretStr] = Field(default_factory=list, max_length=32)
 
-    @field_validator("api_keys", mode="before")
-    @classmethod
-    def validate_api_keys(cls, value: object) -> object:
-        if not isinstance(value, list):
-            raise ValueError("API keys must be a list")
-        canonical: list[str] = []
+    def __init__(self, **data: Any) -> None:
+        """Wrap valid raw values and replace invalid ones before Pydantic errors."""
+
+        raw_keys = data.get("api_keys", [])
+        protected = self._protect_api_keys(raw_keys)
+        data["api_keys"] = protected
+        super().__init__(**data)
+
+    @staticmethod
+    def _protect_api_keys(value: object) -> object:
+        if not isinstance(value, list) or len(value) > 32:
+            return None
+        protected: list[SecretStr] = []
+        seen: set[str] = set()
         for item in value:
-            if isinstance(item, bool) or not isinstance(item, str):
-                raise ValueError("API keys must be strings")
             if (
-                not 24 <= len(item) <= 256
+                isinstance(item, bool)
+                or not isinstance(item, str)
+                or not 24 <= len(item) <= 256
                 or item.strip() != item
                 or any(ord(character) < 33 or ord(character) > 126 for character in item)
+                or item in seen
             ):
-                raise ValueError("API key is malformed")
-            if item in canonical:
-                raise ValueError("API keys must be unique")
-            canonical.append(item)
-        return canonical
+                return [None]  # type: ignore[list-item]
+            seen.add(item)
+            protected.append(SecretStr(item))
+        return protected
 
 
 class LimitsSettings(_SettingsSection):

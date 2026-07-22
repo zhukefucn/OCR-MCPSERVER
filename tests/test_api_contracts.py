@@ -90,6 +90,12 @@ def test_reparse_accepts_only_token_and_unique_positive_pages() -> None:
         with pytest.raises(ValidationError):
             OrientationReparseRequest.model_validate(payload)
 
+    for page in (True, 1.0, "1"):
+        with pytest.raises(ValidationError):
+            OrientationReparseRequest(
+                recovery_token="opaque-token_123", pages=[page]
+            )
+
 
 def test_terminal_status_requires_consistent_counts_and_artifacts() -> None:
     batch_id = _uuid()

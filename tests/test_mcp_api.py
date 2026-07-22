@@ -69,6 +69,21 @@ class FakeGateway:
         return OrientationReparseSubmission(batch_id=str(uuid4()), status="queued")
 
 
+class LeakyOutputGateway(FakeGateway):
+    async def get_task_status(self, batch_id: str):
+        return {
+            "batch_id": batch_id,
+            "status": "completed",
+            "progress": 100,
+            "total_files": 1,
+            "completed_files": 1,
+            "failed_files": 0,
+            "files": [],
+            "artifacts": [],
+            "recognized_text": "SENSITIVE_OUTPUT_VALUE",
+        }
+
+
 def test_project_pins_fastmcp_2_without_heavy_ocr_dependencies() -> None:
     metadata = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     dependencies = metadata["project"]["dependencies"]
@@ -211,6 +226,63 @@ async def test_mcp_validation_errors_mask_supplied_business_values() -> None:
                 },
             )
     assert sensitive not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_mcp_protocol_masks_schema_validation_unknown_tool_and_output() -> None:
+    from fastmcp import Client
+    from fastmcp.exceptions import ToolError
+    from ocr_mcp_server.api.mcp import create_mcp_server
+
+    cases = [
+        (
+            create_mcp_server(FakeGateway()),
+            "parse_documents",
+            {"sources": [{"file_id": "SENSITIVE_INPUT_VALUE"}]},
+            "invalid_request: The request is invalid.",
+            "SENSITIVE_INPUT_VALUE",
+        ),
+        (
+            create_mcp_server(FakeGateway()),
+            "unknown-SENSITIVE_TOOL_VALUE",
+            {},
+            "not_found: The requested tool was not found.",
+            "SENSITIVE_TOOL_VALUE",
+        ),
+        (
+            create_mcp_server(LeakyOutputGateway()),
+            "get_task_status",
+            {"batch_id": str(uuid4())},
+            "internal_error: The request could not be completed.",
+            "SENSITIVE_OUTPUT_VALUE",
+        ),
+    ]
+    for server, tool_name, arguments, expected, sensitive in cases:
+        async with Client(server) as client:
+            with pytest.raises(ToolError) as exc_info:
+                await client.call_tool(tool_name, arguments)
+        assert str(exc_info.value) == expected
+        assert sensitive not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page", [True, 1.0, "1"])
+async def test_mcp_reparse_rejects_non_integer_page_types_before_gateway(
+    page: object,
+) -> None:
+    from fastmcp import Client
+    from fastmcp.exceptions import ToolError
+    from ocr_mcp_server.api.mcp import create_mcp_server
+
+    gateway = FakeGateway()
+    async with Client(create_mcp_server(gateway)) as client:
+        with pytest.raises(ToolError) as exc_info:
+            await client.call_tool(
+                "reparse_with_page_orientation",
+                {"recovery_token": "opaque-token_123", "pages": [page]},
+            )
+    assert str(exc_info.value) == "invalid_request: The request is invalid."
+    assert gateway.reparse_request is None
 
 
 @pytest.mark.asyncio

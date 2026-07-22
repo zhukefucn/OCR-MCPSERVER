@@ -13,6 +13,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictInt,
     field_validator,
     model_validator,
 )
@@ -176,7 +177,7 @@ class TaskStatusRequest(StrictContract):
 
 class OrientationReparseRequest(StrictContract):
     recovery_token: str = Field(min_length=8, max_length=256)
-    pages: list[int] | None = Field(default=None, min_length=1, max_length=500)
+    pages: list[StrictInt] | None = Field(default=None, min_length=1, max_length=500)
 
     @field_validator("recovery_token")
     @classmethod

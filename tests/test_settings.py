@@ -72,8 +72,21 @@ def test_authentication_keys_are_secret_and_reject_unsafe_values() -> None:
     assert secret not in str(settings.model_dump())
 
     for keys in ([""], ["short"], [secret, secret], [True]):
-        with pytest.raises(ValidationError):
+        with pytest.raises(ValidationError) as exc_info:
             AppSettings(auth={"api_keys": keys})
+        assert secret not in str(exc_info.value)
+        assert secret not in repr(exc_info.value.errors())
+        assert secret not in exc_info.value.json()
+
+
+def test_invalid_authentication_key_never_appears_in_validation_details() -> None:
+    malformed = "recognized-private-authentication-key"
+    for keys in ([malformed + "\n"], [malformed, malformed]):
+        with pytest.raises(ValidationError) as exc_info:
+            AppSettings(auth={"api_keys": keys})
+        assert malformed not in str(exc_info.value)
+        assert malformed not in repr(exc_info.value.errors())
+        assert malformed not in exc_info.value.json()
 
 
 @pytest.mark.parametrize(

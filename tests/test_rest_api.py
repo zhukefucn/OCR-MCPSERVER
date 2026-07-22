@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from ocr_mcp_server.api.contracts import (
@@ -66,6 +67,7 @@ class FakeGateway:
     failure: Exception | None = None
     upload_display_name: str | None = None
     upload_idempotency_key: str | None = None
+    upload_called: bool = False
 
     async def upload_document(
         self,
@@ -76,6 +78,7 @@ class FakeGateway:
         content_length: int | None,
         idempotency_key: str | None,
     ) -> UploadReceipt:
+        self.upload_called = True
         assert not isinstance(content, (bytes, bytearray))
         self.upload_display_name = display_name
         self.upload_idempotency_key = idempotency_key
@@ -179,6 +182,27 @@ def test_upload_rejects_missing_or_path_like_display_names() -> None:
         assert gateway.upload_chunks == []
 
 
+def test_upload_rejects_duplicate_transport_headers_before_gateway() -> None:
+    for duplicate_name, duplicate_value in (
+        ("X-Document-Name", "statement.pdf"),
+        ("Idempotency-Key", "upload-1"),
+        ("Content-Type", "application/pdf"),
+    ):
+        gateway = FakeGateway()
+        headers = [
+            ("X-API-Key", KEY),
+            ("X-Document-Name", "statement.pdf"),
+            ("Idempotency-Key", "upload-1"),
+            ("Content-Type", "application/pdf"),
+            (duplicate_name, duplicate_value),
+        ]
+        with client(gateway) as api:
+            response = api.post("/v1/uploads", headers=headers, content=b"%PDF")
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "invalid_request"
+        assert gateway.upload_called is False
+
+
 def test_rest_workflow_uses_strict_contracts_and_explicit_operation_ids() -> None:
     gateway = FakeGateway()
     file_id = str(uuid4())
@@ -278,3 +302,45 @@ def test_unexpected_gateway_exception_is_contained_at_the_route_boundary() -> No
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "internal_error"
     assert "recognized private business text" not in response.text
+
+
+def test_gateway_response_validation_is_contained_before_fastapi_serialization() -> None:
+    class LeakyGateway(FakeGateway):
+        async def get_task_status(self, batch_id: str):
+            return {
+                "batch_id": batch_id,
+                "status": "completed",
+                "progress": 100,
+                "total_files": 1,
+                "completed_files": 1,
+                "failed_files": 0,
+                "files": [],
+                "artifacts": [],
+                "recognized_text": "SENSITIVE_GATEWAY_OUTPUT",
+            }
+
+    settings = AppSettings(auth={"api_keys": [KEY]})
+    with TestClient(create_app(settings, gateway=LeakyGateway())) as api:
+        response = api.get(f"/v1/tasks/{uuid4()}", headers=AUTH)
+    assert response.status_code == 500
+    assert response.json()["error"] == {
+        "code": "internal_error",
+        "message": "The request could not be completed.",
+    }
+    assert "SENSITIVE_GATEWAY_OUTPUT" not in response.text
+
+
+@pytest.mark.parametrize("page", [True, 1.0, "1"])
+def test_rest_reparse_rejects_non_integer_page_types_before_gateway(
+    page: object,
+) -> None:
+    gateway = FakeGateway()
+    with client(gateway) as api:
+        response = api.post(
+            "/v1/orientation-reparse",
+            headers=AUTH,
+            json={"recovery_token": "opaque-token_123", "pages": [page]},
+        )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert gateway.reparse_request is None
