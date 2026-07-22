@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from ocr_mcp_server.domain.errors import ConfigurationError
 from ocr_mcp_server.domain.models import SecondaryOCREngine
@@ -25,6 +26,17 @@ def test_settings_defaults_match_domain_constraints() -> None:
     assert settings.retention.audit_metadata_days == 30
     assert settings.mineru.backend == "vlm-http-client"
     assert settings.secondary_ocr.engine is SecondaryOCREngine.PP_STRUCTURE_V3
+    assert settings.database.url == "sqlite+aiosqlite:///data/ocr.sqlite3"
+    assert settings.database.busy_timeout_ms == 5000
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["sqlite:///data/ocr.sqlite3", "postgresql+asyncpg://host/db", "file.db"],
+)
+def test_settings_reject_non_aiosqlite_database_urls(url: str) -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(database={"url": url})
 
 
 def test_load_settings_reads_a_real_yaml_file(tmp_path: Path) -> None:

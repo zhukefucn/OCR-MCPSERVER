@@ -14,7 +14,13 @@ from ocr_mcp_server.domain.constants import (
     DEFAULT_RESULT_RETENTION_HOURS,
     SUPPORTED_EXTENSIONS,
 )
-from ocr_mcp_server.domain.errors import ConfigurationError, InputValidationError
+from ocr_mcp_server.domain.errors import (
+    ConfigurationError,
+    InputValidationError,
+    LeaseConflictError,
+    PersistenceError,
+    StateTransitionError,
+)
 from ocr_mcp_server.domain.models import (
     BatchStatus,
     FileStatus,
@@ -92,6 +98,9 @@ def test_domain_errors_expose_stable_code_and_safe_message_only() -> None:
 
     config_error = ConfigurationError(cause=sensitive_cause)
     input_error = InputValidationError(cause=sensitive_cause)
+    state_error = StateTransitionError(cause=sensitive_cause)
+    lease_error = LeaseConflictError(cause=sensitive_cause)
+    persistence_error = PersistenceError(cause=sensitive_cause)
 
     assert config_error.code == "configuration_invalid"
     assert str(config_error) == "Service configuration is invalid."
@@ -99,3 +108,9 @@ def test_domain_errors_expose_stable_code_and_safe_message_only() -> None:
     assert str(input_error) == "Input validation failed."
     assert "recognized private business text" not in str(config_error)
     assert "recognized private business text" not in str(input_error)
+    assert state_error.code == "state_transition_invalid"
+    assert str(state_error) == "Task state transition is invalid."
+    assert lease_error.code == "lease_conflict"
+    assert str(lease_error) == "Task lease is invalid or expired."
+    assert persistence_error.code == "persistence_error"
+    assert str(persistence_error) == "Task persistence operation failed."

@@ -4,6 +4,10 @@ server:
 
 data_root: data
 
+database:
+  url: sqlite+aiosqlite:///data/ocr.sqlite3
+  busy_timeout_ms: 5000
+
 limits:
   max_files: 20
   max_file_size_bytes: 31457280

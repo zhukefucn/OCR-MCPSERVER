@@ -27,6 +27,8 @@ def test_project_metadata_declares_python_dependencies_and_entrypoint() -> None:
         "pydantic",
         "pydantic-settings",
         "pyyaml",
+        "sqlalchemy",
+        "aiosqlite",
     }
     development_names = {
         dependency.split("<", 1)[0].split(">", 1)[0].split("=", 1)[0].lower()

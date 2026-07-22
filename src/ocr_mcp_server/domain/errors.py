@@ -26,3 +26,24 @@ class InputValidationError(DomainError):
 
     code = "input_invalid"
     safe_message = "Input validation failed."
+
+
+class StateTransitionError(DomainError):
+    """Raised when a requested task state change violates domain rules."""
+
+    code = "state_transition_invalid"
+    safe_message = "Task state transition is invalid."
+
+
+class LeaseConflictError(DomainError):
+    """Raised when a task lease is absent, expired, or does not match."""
+
+    code = "lease_conflict"
+    safe_message = "Task lease is invalid or expired."
+
+
+class PersistenceError(DomainError):
+    """Raised when task persistence fails without exposing database details."""
+
+    code = "persistence_error"
+    safe_message = "Task persistence operation failed."

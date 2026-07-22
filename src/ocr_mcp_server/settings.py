@@ -7,7 +7,14 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+)
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -65,6 +72,18 @@ class SecondaryOCRSettings(_SettingsSection):
     engine: SecondaryOCREngine = SecondaryOCREngine.PP_STRUCTURE_V3
 
 
+class DatabaseSettings(_SettingsSection):
+    url: str = "sqlite+aiosqlite:///data/ocr.sqlite3"
+    busy_timeout_ms: int = Field(default=5000, ge=1)
+
+    @field_validator("url")
+    @classmethod
+    def require_async_sqlite(cls, value: str) -> str:
+        if not value.startswith("sqlite+aiosqlite:///"):
+            raise ValueError("unsupported database URL")
+        return value
+
+
 class AppSettings(BaseSettings):
     """Complete process-level configuration for the service."""
 
@@ -80,6 +99,7 @@ class AppSettings(BaseSettings):
     retention: RetentionSettings = Field(default_factory=RetentionSettings)
     mineru: MinerUSettings = Field(default_factory=MinerUSettings)
     secondary_ocr: SecondaryOCRSettings = Field(default_factory=SecondaryOCRSettings)
+    database: DatabaseSettings = Field(default_factory=DatabaseSettings)
 
     @classmethod
     def settings_customise_sources(
