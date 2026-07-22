@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 import re
 from uuid import UUID, uuid4
@@ -102,6 +103,45 @@ class RetentionRepository:
                     )
                 elif marker.identity != encoded:
                     raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
+                await session.commit()
+        except RetentionFailure:
+            raise
+        except SQLAlchemyError:
+            raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT) from None
+
+    async def bind_empty_lock_marker(
+        self,
+        batch_id: str,
+        identity: tuple[int, int],
+        *,
+        allow_missing: bool,
+        initialize: Callable[[], None],
+    ) -> None:
+        if (
+            not _valid_batch_id(batch_id)
+            or not isinstance(identity, tuple)
+            or len(identity) != 2
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in identity
+            )
+            or not isinstance(allow_missing, bool)
+            or not callable(initialize)
+        ):
+            raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT) from None
+        encoded = f"{identity[0]:x}:{identity[1]:x}"
+        try:
+            async with self._sessions() as session:
+                await session.execute(text("BEGIN IMMEDIATE"))
+                retention = await session.get(RetentionRecord, batch_id)
+                if retention is None and not allow_missing:
+                    raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT)
+                if await session.get(BatchLockMarkerRecord, batch_id) is not None:
+                    raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
+                initialize()
+                session.add(
+                    BatchLockMarkerRecord(batch_id=batch_id, identity=encoded)
+                )
                 await session.commit()
         except RetentionFailure:
             raise

@@ -152,31 +152,40 @@ class FileStorage:
                     raise OSError("unsafe batch lock")
                 return marker
 
-            initialization_attempts = 0
-            while True:
-                while not acquired:
-                    acquired = self._try_batch_lock(descriptor)
-                    if not acquired:
-                        await asyncio.sleep(0.01)
-                if not lock_unchanged():
-                    raise OSError("unsafe batch lock")
-                marker = read_locked_marker()
-                if created:
-                    if marker:
-                        raise OSError("invalid new batch lock")
+            while not acquired:
+                acquired = self._try_batch_lock(descriptor)
+                if not acquired:
+                    await asyncio.sleep(0.01)
+            if not lock_unchanged():
+                raise OSError("unsafe batch lock")
+            marker = read_locked_marker()
+            if created:
+                if marker == b"":
                     os.lseek(descriptor, 0, os.SEEK_SET)
                     self._write_all(descriptor, b"\0")
                     os.fsync(descriptor)
                     marker = read_locked_marker()
-                    break
-                if marker:
-                    break
-                initialization_attempts += 1
-                if initialization_attempts >= 100:
-                    raise OSError("uninitialized batch lock")
-                self._release_batch_lock(descriptor)
-                acquired = False
-                await asyncio.sleep(0.01)
+                elif marker != b"\x00":
+                    raise OSError("invalid new batch lock")
+            elif marker == b"":
+                def initialize_empty_marker() -> None:
+                    if read_locked_marker() != b"":
+                        raise OSError("empty batch lock changed")
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    self._write_all(descriptor, b"\0")
+                    os.fsync(descriptor)
+                    if read_locked_marker() != b"\x00":
+                        raise OSError("batch lock initialization failed")
+
+                await marker_registry.bind_empty_lock_marker(
+                    canonical_batch_id,
+                    lock_identity,
+                    allow_missing=allow_missing_marker,
+                    initialize=initialize_empty_marker,
+                )
+                marker = read_locked_marker()
+                if marker != b"\x00":
+                    raise OSError("batch lock changed during initialization")
 
             recover_unbound = not created and marker == b"\x00"
             await marker_registry.bind_lock_marker(

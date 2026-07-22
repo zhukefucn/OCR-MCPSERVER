@@ -52,6 +52,9 @@ BATCH_ID = "00000000-0000-4000-8000-000000000009"
 
 
 class _MarkerRegistry:
+    async def bind_empty_lock_marker(self, *_args, initialize, **_kwargs):
+        initialize()
+
     async def bind_lock_marker(self, *_args, **_kwargs):
         return None
 

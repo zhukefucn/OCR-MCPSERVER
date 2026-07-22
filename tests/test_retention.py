@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -419,6 +420,45 @@ async def test_fresh_marker_survives_pre_bind_crash_and_is_recovered(
 
 
 @pytest.mark.asyncio
+async def test_empty_marker_survives_pre_lock_crash_and_is_recovered(
+    tmp_path: Path, retention_repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "pre-lock-crash")
+    data_root = (tmp_path / "data").absolute()
+    crashed_storage = FileStorage(data_root)
+    lock_path = data_root / ".locks" / f"{batch_id}.lock"
+
+    def crash_before_first_lock(_descriptor: int) -> bool:
+        raise RuntimeError("simulated crash before marker initialization")
+
+    monkeypatch.setattr(crashed_storage, "_try_batch_lock", crash_before_first_lock)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        async with crashed_storage.batch_lock(
+            batch_id, marker_registry=repository
+        ):
+            raise AssertionError("the injected crash must prevent entry")
+
+    original = lock_path.stat()
+    assert original.st_nlink == 1
+    assert lock_path.read_bytes() == b""
+    async with sessions() as session:
+        assert await session.get(BatchLockMarkerRecord, batch_id) is None
+
+    async with FileStorage(data_root).batch_lock(
+        batch_id, marker_registry=repository
+    ):
+        pass
+
+    current = lock_path.stat()
+    assert (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino)
+    assert lock_path.read_bytes() == b"\x00"
+    async with sessions() as session:
+        marker = await session.get(BatchLockMarkerRecord, batch_id)
+        assert marker.identity == f"{current.st_dev:x}:{current.st_ino:x}"
+
+
+@pytest.mark.asyncio
 async def test_post_bind_failure_retries_only_the_registered_marker_identity(
     tmp_path: Path, retention_repository, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -455,7 +495,7 @@ async def test_post_bind_failure_retries_only_the_registered_marker_identity(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("malformed", [b"", b"\x01", b"\x00extra"])
+@pytest.mark.parametrize("malformed", [b"\x01", b"\x00extra"])
 async def test_malformed_unbound_marker_is_rejected_without_mutation(
     tmp_path: Path, retention_repository, malformed: bytes
 ) -> None:
@@ -478,16 +518,17 @@ async def test_malformed_unbound_marker_is_rejected_without_mutation(
 
 
 @pytest.mark.asyncio
-async def test_hardlinked_fresh_unbound_marker_is_rejected_without_mutation(
-    tmp_path: Path, retention_repository,
+@pytest.mark.parametrize("contents", [b"", b"\x00"])
+async def test_hardlinked_unbound_marker_is_rejected_without_mutation(
+    tmp_path: Path, retention_repository, contents: bytes,
 ) -> None:
     repository, tasks, sessions, _ = retention_repository
-    batch_id, _ = await _create_batch(tasks, "hardlinked-marker")
+    batch_id, _ = await _create_batch(tasks, f"hardlinked-marker-{contents.hex()}")
     data_root = (tmp_path / "data").absolute()
     lock_path = data_root / ".locks" / f"{batch_id}.lock"
     lock_path.parent.mkdir(parents=True)
     external = tmp_path / "external-marker"
-    external.write_bytes(b"\x00")
+    external.write_bytes(contents)
     lock_path.hardlink_to(external)
 
     with pytest.raises((FileIntakeFailure, RetentionFailure)):
@@ -496,10 +537,90 @@ async def test_hardlinked_fresh_unbound_marker_is_rejected_without_mutation(
         ):
             raise AssertionError("a multi-link marker must not be entered")
 
-    assert external.read_bytes() == b"\x00"
-    assert lock_path.read_bytes() == b"\x00"
+    assert external.read_bytes() == contents
+    assert lock_path.read_bytes() == contents
     async with sessions() as session:
         assert await session.get(BatchLockMarkerRecord, batch_id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("matching_identity", [True, False])
+async def test_registered_empty_marker_is_never_initialized(
+    tmp_path: Path, retention_repository, matching_identity: bool,
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, _ = await _create_batch(
+        tasks, f"registered-empty-{matching_identity}"
+    )
+    data_root = (tmp_path / "data").absolute()
+    lock_path = data_root / ".locks" / f"{batch_id}.lock"
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_bytes(b"")
+    info = lock_path.stat()
+    encoded = (
+        f"{info.st_dev:x}:{info.st_ino:x}"
+        if matching_identity
+        else f"{info.st_dev:x}:{info.st_ino + 1:x}"
+    )
+    async with sessions() as session:
+        session.add(BatchLockMarkerRecord(batch_id=batch_id, identity=encoded))
+        await session.commit()
+
+    with pytest.raises((FileIntakeFailure, RetentionFailure)):
+        async with FileStorage(data_root).batch_lock(
+            batch_id, marker_registry=repository
+        ):
+            raise AssertionError("registered empty markers must not be entered")
+
+    assert lock_path.read_bytes() == b""
+    async with sessions() as session:
+        marker = await session.get(BatchLockMarkerRecord, batch_id)
+        assert marker.identity == encoded
+
+
+@pytest.mark.asyncio
+async def test_live_creator_lock_prevents_a_second_opener_from_initializing(
+    tmp_path: Path, retention_repository,
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "live-empty-creator")
+    data_root = (tmp_path / "data").absolute()
+    lock_path = data_root / ".locks" / f"{batch_id}.lock"
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_bytes(b"")
+    creator_descriptor = os.open(
+        lock_path, os.O_RDWR | getattr(os, "O_BINARY", 0)
+    )
+    storage = FileStorage(data_root)
+    assert storage._try_batch_lock(creator_descriptor) is True
+
+    async def open_after_creator() -> None:
+        async with storage.batch_lock(batch_id, marker_registry=repository):
+            pass
+
+    opener = asyncio.create_task(open_after_creator())
+    try:
+        await asyncio.sleep(0.03)
+        assert not opener.done()
+        assert os.fstat(creator_descriptor).st_size == 0
+        os.lseek(creator_descriptor, 0, os.SEEK_SET)
+        os.write(creator_descriptor, b"\x00")
+        os.fsync(creator_descriptor)
+        storage._release_batch_lock(creator_descriptor)
+        os.close(creator_descriptor)
+        creator_descriptor = -1
+        await asyncio.wait_for(opener, timeout=1)
+    finally:
+        if creator_descriptor >= 0:
+            storage._release_batch_lock(creator_descriptor)
+            os.close(creator_descriptor)
+        if not opener.done():
+            opener.cancel()
+            await asyncio.gather(opener, return_exceptions=True)
+
+    assert lock_path.read_bytes() == b"\x00"
+    async with sessions() as session:
+        assert await session.get(BatchLockMarkerRecord, batch_id) is not None
 
 
 @pytest.mark.asyncio
