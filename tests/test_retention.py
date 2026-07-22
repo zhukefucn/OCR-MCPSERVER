@@ -641,11 +641,19 @@ async def test_partial_scrub_resumes_the_persisted_tombstone_before_db_unavailab
     class FailSecondScrub(OwnedBatchRootDeleter):
         calls = 0
 
-        def _scrub_open_regular(self, descriptor, expected, path):
+        def _scrub_open_regular(
+            self, descriptor, expected, path, *, parent_descriptor, name
+        ):
             self.calls += 1
             if self.calls == 2:
                 raise RetentionFailure(RetentionErrorCode.CLEANUP_FAILED)
-            return super()._scrub_open_regular(descriptor, expected, path)
+            return super()._scrub_open_regular(
+                descriptor,
+                expected,
+                path,
+                parent_descriptor=parent_descriptor,
+                name=name,
+            )
 
     failed = RetentionService(
         repository, data_root, artifact_root, deleter=FailSecondScrub()
@@ -949,12 +957,20 @@ def test_owned_root_deletion_leaks_and_preserves_a_concurrent_name_replacement(
     moved_paths: list[Path] = []
 
     class SwapAfterOpen(OwnedBatchRootDeleter):
-        def _scrub_open_regular(self, descriptor, expected, path):
+        def _scrub_open_regular(
+            self, descriptor, expected, path, *, parent_descriptor, name
+        ):
             moved = path.with_name("moved-original.zip")
             __import__("os").rename(path, moved)
             path.write_bytes(b"replacement")
             moved_paths.append(moved)
-            return super()._scrub_open_regular(descriptor, expected, path)
+            return super()._scrub_open_regular(
+                descriptor,
+                expected,
+                path,
+                parent_descriptor=parent_descriptor,
+                name=name,
+            )
 
     with pytest.raises(RetentionFailure) as caught:
         SwapAfterOpen().delete(root, batch_id)

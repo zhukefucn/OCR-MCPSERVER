@@ -192,36 +192,77 @@ class OwnedBatchRootDeleter:
                 write_access=True,
             )
         try:
-            self._scrub_open_regular(descriptor, expected, path)
+            self._scrub_open_regular(
+                descriptor,
+                expected,
+                path,
+                parent_descriptor=parent_descriptor,
+                name=name,
+            )
         finally:
             os.close(descriptor)
 
     def _scrub_open_regular(
-        self, descriptor: int, expected: tuple[int, int], path: Path
+        self,
+        descriptor: int,
+        expected: tuple[int, int],
+        path: Path,
+        *,
+        parent_descriptor: int | None,
+        name: str,
+    ) -> None:
+        self._assert_regular_binding(
+            descriptor,
+            expected,
+            path,
+            parent_descriptor=parent_descriptor,
+            name=name,
+            require_empty=False,
+        )
+        os.ftruncate(descriptor, 0)
+        os.fsync(descriptor)
+        self._assert_regular_binding(
+            descriptor,
+            expected,
+            path,
+            parent_descriptor=parent_descriptor,
+            name=name,
+            require_empty=True,
+        )
+
+    @staticmethod
+    def _assert_regular_binding(
+        descriptor: int,
+        expected: tuple[int, int],
+        path: Path,
+        *,
+        parent_descriptor: int | None,
+        name: str,
+        require_empty: bool,
     ) -> None:
         info = os.fstat(descriptor)
+        try:
+            named = (
+                os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if parent_descriptor is not None
+                else os.lstat(path)
+            )
+        except OSError:
+            raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP) from None
         if (
             _is_reparse(info)
             or not stat.S_ISREG(info.st_mode)
             or _identity(info) != expected
             or info.st_nlink != 1
-        ):
-            raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
-        if os.name == "nt":
-            import msvcrt
-
-            if not _same_path(
-                FileStorage._windows_handle_path(msvcrt.get_osfhandle(descriptor)),
-                path,
-            ):
-                raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
-        os.ftruncate(descriptor, 0)
-        os.fsync(descriptor)
-        final = os.fstat(descriptor)
-        if (
-            _identity(final) != expected
-            or final.st_nlink != 1
-            or final.st_size != 0
+            or (require_empty and info.st_size != 0)
+            or _is_reparse(named)
+            or not stat.S_ISREG(named.st_mode)
+            or _identity(named) != expected
+            or _identity(named) != _identity(info)
         ):
             raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
         if os.name == "nt":
