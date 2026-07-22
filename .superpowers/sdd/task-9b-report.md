@@ -1,98 +1,130 @@
-# Task 9B independent controller review
+# Task 9B remediation controller re-review
 
-## Review target and verdict
+## Target and verdict
 
-- Range: `47c7b37..595e54b` (`HEAD 595e54bcf8672e996c41b1719042043b1d851bd1`)
-- Scope: retention only, including the Task 9A artifact-root integration convention
+- Head: `f74ab0fecab3c1b60b75f8664d1bcf2f84fb03d1`
+- Remediation range: `595e54b..f74ab0f`
+- Scope: Task 9 lifecycle cleanup only
 - Spec verdict: **NOT READY**
 - Code-quality verdict: **NOT READY**
 - Overall: **NOT READY**
 
-The SQLite phase model is bounded and deterministic, and the ordinary boundary/lease/purge tests pass. The change is nevertheless blocked by two core safety/completeness failures: the POSIX deletion primitive can delete a replacement object after its identity check, and artifact placement is not bound to the batch directory that retention deletes. Early deletion also cannot retry a partial metadata-phase failure.
+The remediation closes canonical artifact placement and early metadata-phase resume, and it substantially improves partial-crash recovery by persisting tombstone names before isolation. It is still blocked by ownership races in handle scrubbing and by an artifact writer barrier that is lease-only rather than coordinated with cleanup's shared OS batch lock.
+
+## Prior-finding closure
+
+| Prior finding | Result | Evidence |
+|---|---|---|
+| C1: name-swap-safe deletion | **Not closed** | Descendant `unlink`/`rmdir` was removed and POSIX traversal is descriptor-relative, but Windows child traversal can scrub a replacement after a parent swap. The scrubber also truncates multi-link files without proving that their bytes are confined to the batch. |
+| C2: batch-scoped artifact root | **Closed** | The bundler requires a canonical lowercase batch UUID, derives `<artifact base>/<batch UUID>`, and persists `<batch UUID>/<artifact-id>.zip`; the real publish/register/cleanup test passes. |
+| I1: metadata-phase early-delete resume | **Closed** | `delete_task` follows the repository's claimed current phase; injected first-purge failure resumes successfully on the second call. |
+| I2: durable write/delete barrier | **Not closed** | File intake holds the OS batch lock, but artifact packaging only holds a fixed 300-second DB lease with no renewal or OS lock. Cleanup treats an expired guard as quiescent even while its holder is still running. |
+| Minor: retired lock marker | **Not closed** | The marker is content-free (`0x01`) and the first swap is detected, but retry opens and truncates an unknown same-name replacement before ownership can be re-established. |
 
 ## Findings
 
-### Critical - POSIX final removal can delete a name-swapped replacement
+### Critical - tombstone scrubbing is not consistently bound to the owned object
 
-`OwnedBatchRootDeleter` performs a pathname identity check and then separately calls pathname-based `os.rmdir(staged)` or `os.unlink(staged)` (`src/ocr_mcp_server/services/retention.py:139-164`). Another actor can rename the verified owned object away and place a replacement at the same staged name between those operations. The subsequent call deletes the replacement. This directly violates the binding requirements that cleanup use descriptor/handle-relative deletion or another fail-safe abstraction, and that a name swap never delete the replacement.
+On Windows, `_scrub_directory` verifies the tombstone parent, then separately resolves `child_path` with `os.lstat` and opens it by pathname (`src/ocr_mcp_server/services/retention.py:98-137,144-175`). A parent-directory swap between the parent check and child lookup makes both the lookup and open refer to the replacement child. Cleanup truncates that replacement and only notices the parent mismatch during final verification.
 
-The Windows branches bind deletion to an open handle, but the POSIX branches do not. This is a release blocker because Ubuntu is the deployment target, not merely an unverified portability concern.
-
-Adversarial reproduction forced the swap at the final syscall boundary for both branches. Both completed without a retention failure and deleted the attacker replacement:
+Independent deterministic reproduction:
 
 ```text
-POSIX regular-file race reproduced: attacker replacement was deleted
-POSIX directory race reproduced: attacker replacement was deleted
+cleanup failed closed with: cleanup_ownership_invalid
+owned bytes: b'owned-original'
+replacement bytes: b''
+WINDOWS parent-swap race reproduced: attacker replacement was scrubbed
 ```
 
-Required closure: keep parent directories open and perform traversal, staging, identity checks, unlink, and rmdir relative to pinned descriptors; do not resolve the staged pathname again for final deletion. Add deterministic adversarial tests for file, nested directory, and final batch-directory swaps on the POSIX branch.
-
-### Critical - the batch-scoped artifact-root convention is neither enforced nor integrated
-
-Retention deletes only `<configured artifact root>/<canonical batch UUID>` (`src/ocr_mcp_server/services/retention.py:242-244,282-284`). Task 9A's public bundler and packaging-step APIs instead accept an arbitrary absolute `artifact_root` and publish `artifact_root/<artifact-id>.zip` (`src/ocr_mcp_server/services/artifacts.py:1238-1273,1495-1504,1656-1677`). Neither API derives nor validates a canonical batch child, and `storage_key` contains only the filename. Existing Task 9A tests commonly pass a flat base directory, so the supposed convention is not represented by the contract.
-
-An integration reproduction placed a ZIP exactly as the current public API/storage key permits and ran due cleanup against that same configured root:
+The scrubber also accepts every regular file without checking link ownership. A hard link inside the batch to a regular file outside the batch is truncated through the open handle (`src/ocr_mcp_server/services/retention.py:131-175`):
 
 ```text
-cleanup=1; metadata_available=False; flat_zip_survives=True
+link count before: 2
+external bytes after cleanup: b''
+HARDLINK confinement bug reproduced: cleanup scrubbed external bytes
 ```
 
-The service therefore reported content deletion and marked the artifact unavailable while content remained on disk. This violates content-before-marker ordering and the 24-hour/early-deletion guarantees.
+The DB content marker does not advance in the Windows swap case, so retry state is preserved, but "fail closed" is insufficient after replacement bytes have already been destroyed. Required closure is handle-relative Windows traversal rooted at the pinned parent handle, plus rejection of multi-link regular files unless ownership can be proven. Add regressions for the exact parent-swap boundary and hard-link confinement.
 
-Required closure: make one production-owned abstraction derive `<trusted artifact base>/<canonical batch UUID>`; have packaging and retention share it; reject non-canonical batch IDs and any caller-supplied per-batch root that does not exactly match; persist/validate a base-relative storage key that includes the batch segment (or otherwise prove the path binding); and add an end-to-end publish/register/cleanup test using the real bundler.
+### Critical - artifact reconciliation can scrub a same-name replacement
 
-### Important - early deletion cannot resume after a metadata purge failure
-
-`delete_task` always loops over expected phases `(CONTENT, METADATA)` (`src/ocr_mcp_server/services/retention.py:261-293`). If content cleanup commits but metadata purge fails, retry begins by requiring a content claim. The repository correctly returns a metadata claim, which the service rejects as `cleanup_claim_conflict`. Repeated authorized deletion is therefore not idempotent across the required partial-failure boundary.
-
-Adversarial reproduction:
+`ArtifactBundler.scrub_published` derives ownership from the current `bundle.path`, stats the current name, opens that current object, and truncates it (`src/ocr_mcp_server/services/artifacts.py:1681-1724`). `ArtifactBundle` carries no publication identity or still-open handle that binds reconciliation to the object originally published. A swap between publish and reconciliation therefore destroys the replacement:
 
 ```text
-attempt 1: metadata_purge_failed; phase remains metadata
-attempt 2: cleanup_claim_conflict; phase remains metadata
+owned archive size: 4364
+replacement bytes: b''
+ARTIFACT reconciliation race reproduced: replacement ZIP was scrubbed
 ```
 
-Required closure: drive `delete_task` from the repository's current phase, accepting a metadata-only resume, and add fault injection for failure after successful content completion but before metadata purge commit.
+Required closure: retain a publication identity/handle through registration and scrub only that exact object. If exact identity cannot be proven, leak and retry; never truncate the current same-name object merely because it is a regular file.
 
-### Important - an early-delete request is not a write/publication barrier
+### Critical - artifact writes do not share cleanup's durable OS barrier
 
-Artifact registration rejects only `content_deleted_at is not None`; it explicitly permits registration while `retention.early_delete` is true (`src/ocr_mcp_server/infra/artifact_repository.py:93-99,144-150`). No coordination prevents a pipeline/FileStorage writer from recreating batch content after the deleter has removed a root. A publication racing between filesystem deletion and `complete_content` can be registered and then marked unavailable while its ZIP survives; other in-flight writers can similarly recreate content after the deletion pass.
+`ArtifactPackagingStep` acquires a hard-coded 300-second DB guard and then packages/registers without taking `FileStorage.batch_lock` or renewing the guard (`src/ocr_mcp_server/services/artifacts.py:1758-1821`). `require_content_write_quiescent` clears an expired token and permits cleanup (`src/ocr_mcp_server/infra/retention_repository.py:322-340`). Unlike file intake, a live artifact writer that exceeds the fixed lease is not blocked by the OS lock while cleanup isolates and scrubs the artifact directory.
 
-Required closure: reject artifact registration once early deletion is requested, prevent new pipeline/intake writes for that batch, and coordinate cleanup with the existing batch write lock or an equivalent durable delete barrier. Add deterministic races at the pre-delete, between-roots, and pre-`complete_content` boundaries.
-
-### Minor - per-batch recovery lock files are not included in cleanup
-
-`FileStorage.batch_lock` creates persistent `data_root/.locks/<batch UUID>.lock`, while retention deletes only `data_root/<batch UUID>`. These server-owned per-batch recovery artifacts remain after both ordinary and early deletion. They are content-free, but the brief explicitly includes recovery artifacts in content cleanup. Either remove them safely under the shared lock protocol or document and test a separately bounded purge policy.
-
-## Positive observations
-
-- `claim_due` uses `BEGIN IMMEDIATE`, deterministic due-time/batch-ID ordering, a hard maximum limit, unique tokens, and exact lease-boundary reclaim.
-- Artifact unavailable/deleted state is committed only in `complete_content`, after both deleter calls return.
-- Metadata purge order is referentially safe for the current schema and occurs in one transaction.
-- Stable retention errors discard unsafe causes, and the focused planted-content error-chain test passes.
-- No Task 10+ REST/MCP/auth/transport surface or prohibited broker/model dependency was added.
-
-## Verification evidence
-
-Focused repository tests:
+Independent repository reproduction retained the live guard object while cleanup accepted quiescence at its exact expiry:
 
 ```text
-.\.venv\Scripts\python.exe -m pytest tests/test_retention.py tests/test_artifacts.py::test_repository_extends_batch_content_retention_to_artifact_expiry -p no:cacheprovider
-13 passed in 0.98s
+cleanup accepted quiescence while writer still holds guard: <live token>
 ```
 
-Independent adversarial checks:
+This can let cleanup reach the retired marker/DB transition while a slow 1 GiB publication still holds the old directory and can continue writing. Required closure: artifact packaging must participate in the same batch OS lock for the full write/reconcile interval, or implement a renewable lease with a proven stop-writing protocol before expiry. Add deterministic overrun and crash-at-expiry tests; no real sleep is needed.
 
-- POSIX regular-file final-name swap: **failure reproduced; replacement deleted**.
-- POSIX empty-directory final-name swap: **failure reproduced; replacement deleted**.
-- Flat Task 9A artifact plus due retention cleanup: **failure reproduced; ZIP survived while row became unavailable**.
-- Metadata purge fails after committed content phase, then `delete_task` retry: **failure reproduced; retry returned claim conflict**.
+### Important - post-registration failures create an available row for a scrubbed archive
 
-Fresh repository-wide controller gate:
+The packaging step catches every exception after `bundle` exists and scrubs it, including cancellation or progress failure after `repository.register` has committed (`src/ocr_mcp_server/services/artifacts.py:1808-1821`). The metadata row remains available with the original size/hash while the archive is zero bytes.
+
+Independent reproduction injected cancellation at the post-register checkpoint:
+
+```text
+pipeline raised: post-register cancellation
+row_available= True row_size= 4364 disk_size= 0
+POST-REGISTER SCRUB bug reproduced: available row points to scrubbed archive
+```
+
+Required closure: track whether registration committed. Scrub only before a successful DB commit; after commit, either return the committed result despite nonessential progress failure or transactionally make the row unavailable before scrubbing the exact published object.
+
+### Important - a retry mutates the same-name lock replacement
+
+`batch_lock` treats any non-retired regular file at the canonical lock name as an active service marker and writes/truncates it to one byte before yielding (`src/ocr_mcp_server/services/file_storage.py:92-141`). After the tested first-attempt name swap, a retry therefore opens the replacement and changes its bytes before it can prove continuity with the original lock.
+
+Independent reproduction after replacing a previously initialized lock name:
+
+```text
+before retry b'attacker-replacement'
+retry failed: path_unsafe bytes now: b'\x00'
+after retry b'\x00'
+```
+
+The retained `0x01` marker itself is content-free, but the name-swap recovery is not safe. Persist sufficient marker identity/state before mutation, reject unknown existing lock objects, and test the second cleanup attempt after the first swap failure.
+
+## Confirmed behavior
+
+- Content and metadata due boundaries remain exactly 24 hours and 30 days with configurable positive settings.
+- SQLite cleanup claims remain bounded, deterministic, exclusive, and reclaimable at the lease boundary.
+- Tombstone names are persisted before directory isolation; partial scrub retries use the same tombstone.
+- The ordinary and injected partial-failure paths update artifact availability only after both owned roots are reported scrubbed and the retired marker is written.
+- Metadata purge remains referentially ordered and transactional.
+- Canonical batch artifact placement and storage-key validation are integrated with the real bundler.
+- Early deletion resumes directly in metadata after a first purge failure.
+- File intake and cleanup serialize on the same OS batch lock in both tested orderings.
+- Stable errors and retained SQLite metadata remain content-free in the reviewed paths.
+- No Task 10 endpoint/auth/MCP work was introduced.
+
+## Verification
+
+Focused remediation suites:
+
+```text
+.\.venv\Scripts\python.exe -m pytest tests/test_retention.py tests/test_artifacts.py tests/test_file_intake.py tests/test_remote_fetch.py -p no:cacheprovider
+118 passed in 4.10s
+```
+
+Fresh repository-wide gate:
 
 ```text
 .\.venv\Scripts\python.exe -m pytest -p no:cacheprovider
-642 passed, 5 skipped in 7.75s
+655 passed, 5 skipped in 8.42s
 
 .\.venv\Scripts\python.exe -m pip check
 No broken requirements found.
@@ -104,54 +136,100 @@ git diff --check 6c3969d..HEAD
 exit 0, no output
 ```
 
-These green broad checks do not exercise the adversarial race/integration failures above and do not change the NOT READY verdict.
+Patch package validation before this report edit:
 
-## Required disposition
+```text
+git apply --check --reverse .superpowers/sdd/review-595e54b..f74ab0f.diff
+exit 0
+package Git blob: a25cf29fc460fd705702124ff784bef2c21582e7
+```
 
-Do not merge or advance Task 9B. Fix both Critical findings and the early-delete retry/barrier findings, add adversarial regressions, then repeat this independent review. The batch-scoped artifact directory must be a checked production invariant, not a caller convention.
+The broad test suite is green, but it does not cover the independently reproduced ownership and post-registration lifecycle failures.
 
-## Implementer architecture reassessment before remediation
+## Disposition
 
-The controller findings required changing the architecture, not patching individual syscalls:
+Do not advance Task 9B. Close the three Critical ownership/barrier findings and both Important consistency findings, add focused regressions, and repeat controller review.
 
-- A POSIX pathname cannot safely bind a later `unlink`/`rmdir` to an earlier identity check. Cleanup therefore no longer removes descendant names. It atomically isolates the canonical batch directory under a persisted, retry-stable tombstone name, opens directories/files without following links, scrubs regular-file bytes through pinned descriptors/handles, verifies the complete retained tree, and keeps content-free empty tombstones.
-- Artifact placement is now owned by the bundler. Its input is the trusted global artifact base plus a canonical lowercase batch UUID; it creates and pins `<base>/<batch UUID>`, publishes only there, and records `<batch UUID>/<artifact-id>.zip` as the storage key.
-- Content writers and cleanup now share a durable barrier. Artifact packaging and file intake acquire a retention content-write lease before bytes can become successful. File intake holds that lease inside the existing `FileStorage.batch_lock`. Cleanup first creates its durable DB claim, then takes the same OS batch lock, verifies that prior writers are quiescent, scrubs both owned roots, writes a handle-bound one-byte content-free retired marker, and only then commits `content_deleted_at`. The retired marker prevents an early-deleted UUID from being resurrected after its metadata row is purged.
-- Early deletion is repository-state-driven. A retry may resume directly in the metadata phase after content completion, rather than assuming every call starts with content.
+## Implementer architecture assessment before second remediation
 
-This assessment was recorded before the remediation evidence below. The retained empty directory/file tombstones and one-byte lock marker are deliberate content-free safety state; namespace deletion is not used where it would reintroduce a name-swap race.
+The six findings share one root cause: ownership was checked independently at adjacent layers, but no single invariant remained valid from writer admission through filesystem mutation and DB publication.
 
-## Controller remediation RED/GREEN evidence
+The second remediation therefore uses one ownership/locking/binding invariant:
 
-### Critical 1: name-race-safe content cleanup
+1. Every batch writer and cleanup operation enters the same canonical `FileStorage` batch-lock domain before it can publish, register, isolate, scrub, or advance retention metadata.
+2. The durable retention row binds that lock name to the exact server-created marker identity. An existing same-name object whose identity is unknown or differs is never normalized, truncated, removed, or adopted during retry.
+3. Every directory chain used for scrubbing remains pinned for the complete child operation. On Windows, the pinned parent denies delete/rename sharing; children are opened while that parent is stable, and handle identity/final path plus parent identity are checked before and after mutation. If the chain cannot be proven stable, cleanup fails before touching the candidate.
+4. A regular file is scrub-eligible only when its open handle identifies the expected object and its link count is exactly one. Multi-link files are outside the owned-byte boundary and are rejected untouched.
+5. An artifact rollback is bound to the publication identity, expected size, and digest returned by the publish operation. Reconciliation opens once without following links, verifies all three properties on that descriptor, scrubs that same descriptor, then verifies that the name still binds to it. A same-name replacement is preserved.
+6. DB registration is the artifact commit point. Before commit, rollback may scrub the exact published object; after commit, cancellation or progress failure never scrubs an available artifact.
 
-- RED: deterministic file and directory swaps showed that the old POSIX check-then-`unlink`/`rmdir` path could delete a replacement.
-- GREEN: adversarial tests now cover root replacement before isolation, file replacement after open, opened-directory replacement, persisted-tombstone retry after partial scrub, and a prohibition on descendant `unlink`/`rmdir`. Replacements survive, owned open handles are scrubbed when safe, and DB availability remains unchanged on failure.
+This assessment was written before production changes or second-remediation GREEN results. Canonical batch artifact placement and state-driven metadata resume remain unchanged.
 
-### Critical 2: enforced artifact placement
+## Second remediation implementation and RED/GREEN evidence
 
-- RED: the bundler accepted flat arbitrary placement, and cleanup could mark an artifact unavailable while that flat ZIP survived.
-- GREEN: non-canonical batch IDs are rejected; placement assertions require `<global base>/<canonical batch UUID>/<artifact-id>.zip`; the storage key includes the batch segment; and a real bundler -> repository -> retention-service integration test proves that the published ZIP is scrubbed before the row becomes unavailable.
+The implementation now applies the invariant above at every destructive or publishing boundary.
 
-### Important 1: early metadata resume
+### C1 - Windows parent replacement
 
-- RED: fault injection after committed content cleanup made the next `delete_task` call reject the repository's metadata claim.
-- GREEN: `delete_task` follows the claimed current phase. A first metadata purge failure followed by a second authorized call now completes the purge.
+RED: the deterministic Windows seam could not request an exclusive directory handle, and the existing pathname-based child traversal allowed a replacement parent to supply the object that was scrubbed. The reproduction left the owned bytes intact but reduced the replacement to `b''`.
 
-### Important 2: reusable write/delete barrier
+GREEN: cleanup pins the configured root, reopens the isolated tombstone with delete/rename sharing denied, and verifies the final path and object identity of the directory and child handles before and after mutation. `test_windows_exclusive_parent_handle_blocks_directory_replacement` and `test_windows_parent_replacement_is_blocked_or_preserved_before_child_scrub` now prove that the replacement is either blocked or preserved untouched. The pre-existing child-rename regression was strengthened to require the moved original's bytes to remain unchanged when final-path binding is lost.
 
-- RED: artifact publication and input storage could race an early-delete request, allowing filesystem bytes after the deletion pass or an unavailable orphan.
-- GREEN: artifact registration requires the exact active content-write guard; packaging scrubs a published archive if registration fails and releases the guard in `finally`. File intake acquires the reusable guard inside the existing batch lock. Deterministic concurrency tests prove both orderings: cleanup-first blocks intake before bytes land, while intake-first makes cleanup wait and then remove the completed write. Missing-row canonical new batches remain writable; early-deleted UUIDs are blocked by the retired marker even after metadata purge. A lock-name swap preserves the replacement and prevents the DB content marker from advancing.
+### C2 - hard-linked descendant confinement
 
-### Minor: recovery lock artifact
+RED: `test_hardlinked_descendant_is_rejected_without_touching_external_bytes` reproduced a batch descendant with link count two and observed the external file truncated by cleanup.
 
-- RED: `.locks/<batch UUID>.lock` survived without a defined post-retention meaning.
-- GREEN: the held lock descriptor is normalized to server-owned content-free bytes and retired as the single byte `0x01` before `content_deleted_at` commits. The exact open handle and final name identity are verified. This bounded marker is intentionally retained to prevent post-purge UUID resurrection.
+GREEN: the scrubber now requires `st_nlink == 1` before mutation and again after descriptor scrubbing. The same integration test now reports cleanup failure, preserves the external bytes, and keeps the artifact metadata available for retry.
 
-### Verification after remediation
+### C3 - exact artifact rollback binding
 
-- Focused artifact, retention, file-intake, and remote-fetch suites pass.
-- `\.venv\Scripts\python.exe -m pytest -p no:cacheprovider` -> `655 passed, 5 skipped in 8.00s`.
-- `\.venv\Scripts\python.exe -m pip check` -> `No broken requirements found.`
-- `\.venv\Scripts\python.exe -m compileall -q src tests` -> exit 0 with no output.
-- `git diff --check` -> exit 0; Git emitted line-ending conversion notices only.
+RED: `test_artifact_rollback_preserves_a_same_name_replacement` replaced the published ZIP before reconciliation; the prior rollback truncated the replacement and returned without an ownership error.
+
+GREEN: `ArtifactBundle` carries the publication `(st_dev, st_ino)` identity. Reconciliation opens the current name once without following links, then requires that identity, the registered byte count, a single link, the full SHA-256 digest, and stable descriptor/name binding before scrubbing that same descriptor. A same-name replacement is rejected and preserved.
+
+### C4 - shared cleanup/writer barrier
+
+RED: the new deterministic overrun test initially failed because `ArtifactPackagingStep` had no batch-lock dependency; packaging held only the expiring DB lease.
+
+GREEN: `ArtifactPackagingStep` now requires `FileStorage` and a marker registry and holds the same OS batch lock used by cleanup around DB-guard acquisition, publication, registration, rollback, and guard release. `test_expired_artifact_guard_cannot_bypass_the_shared_batch_lock` pauses publication until the DB lease has expired, starts cleanup, and proves cleanup remains blocked on the OS lock until packaging has stopped writing.
+
+### I1 - registration as the artifact commit point
+
+RED: `test_post_register_cancellation_never_scrubs_an_available_artifact` injected cancellation immediately after registration and observed an available row of 4,364 bytes pointing to a zero-byte archive.
+
+GREEN: the step records successful registration and only performs rollback before that commit point. The same test now observes the propagated cancellation while the available row's size and digest still match the archive on disk.
+
+### I2 - durable lock-marker ownership
+
+RED: `test_cleanup_retry_never_adopts_or_mutates_a_lock_name_replacement` reproduced a failed cleanup followed by replacement of the marker name; the prior retry succeeded and rewrote the replacement. `test_cleanup_rejects_an_unknown_preexisting_lock_without_mutation` also showed that a pre-existing unknown marker was adopted.
+
+GREEN: the new `batch_lock_markers` registry persists the exact server-created lock-object identity independently of the retention row, including after metadata purge. Lock acquisition creates a new marker with exclusive-create semantics or validates an existing marker against the registry while holding its OS lock. Unknown and mismatched marker objects are rejected before any write, truncate, or normalization. Both regressions now preserve the replacement bytes and fail closed.
+
+## Second remediation verification
+
+Focused lifecycle suites after all implementation changes:
+
+```text
+.\.venv\Scripts\python.exe -m pytest tests/test_retention.py tests/test_artifacts.py tests/test_file_intake.py tests/test_remote_fetch.py -p no:cacheprovider
+126 passed in 4.53s
+```
+
+Repository-wide gate after the final ownership check:
+
+```text
+.\.venv\Scripts\python.exe -m pytest -p no:cacheprovider
+663 passed, 5 skipped in 9.10s
+
+.\.venv\Scripts\python.exe -m pip check
+No broken requirements found.
+
+.\.venv\Scripts\python.exe -m compileall -q src tests
+exit 0, no output
+
+git diff --check
+exit 0 (line-ending notices only)
+```
+
+## Second remediation disposition
+
+All six re-review findings have implementation coverage and deterministic regression coverage. Task 9B is ready for the same controller reviewer to repeat the spec and code-quality review. No push, deployment, or Task 10 work is included.
