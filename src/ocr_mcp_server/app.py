@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from .api import router
 from .api.auth import ApiKeyAuthMiddleware
 from .api.gateway import GatewayFailure, GatewayUploadTooLarge
+from .api.mcp import create_mcp_server
 from .settings import AppSettings, load_settings
 
 
@@ -18,9 +19,16 @@ def create_app(
     """Create the HTTP application without starting external services."""
 
     resolved_settings = settings if settings is not None else load_settings()
-    app = FastAPI(title="OCR MCP Server")
+    mcp_server = create_mcp_server(gateway)
+    mcp_app = mcp_server.http_app(path="/mcp")
+    app = FastAPI(
+        title="OCR MCP Server",
+        routes=[*mcp_app.routes],
+        lifespan=mcp_app.lifespan,
+    )
     app.state.settings = resolved_settings
     app.state.gateway = gateway
+    app.state.mcp_server = mcp_server
     app.include_router(router)
     app.add_middleware(ApiKeyAuthMiddleware, settings=resolved_settings.auth)
 

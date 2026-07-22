@@ -237,12 +237,13 @@ def test_validation_errors_are_content_free_and_do_not_reach_gateway() -> None:
 
 
 def test_task_status_rejects_noncanonical_identifier_before_gateway() -> None:
-    gateway = FakeGateway()
-    with client(gateway) as api:
-        response = api.get("/v1/tasks/not-a-uuid", headers=AUTH)
-    assert response.status_code == 422
-    assert response.json()["error"]["code"] == "invalid_request"
-    assert gateway.status_id is None
+    for batch_id in ("not-a-uuid", "x" * 36, str(uuid4()).upper()):
+        gateway = FakeGateway()
+        with client(gateway) as api:
+            response = api.get(f"/v1/tasks/{batch_id}", headers=AUTH)
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "invalid_request"
+        assert gateway.status_id is None
 
 
 def test_gateway_failures_map_to_stable_safe_http_errors() -> None:
