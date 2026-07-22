@@ -24,6 +24,14 @@ The recoverable failure boundary is after exclusive marker creation and durable 
 
 A failure after the registry commit already has durable identity state. Retry follows the normal exact-identity path and does not use adoption. No filesystem bytes are normalized before authorization.
 
+### Empty-marker creation crash
+
+Canonical exclusive creation has an earlier crash boundary: the process can exit after publishing the zero-length file but before acquiring its OS lock and writing `0x00`. A later opener may initialize that exact empty marker only while holding its OS lock and only through `RetentionRepository.bind_empty_lock_marker`.
+
+That repository method holds `BEGIN IMMEDIATE`, verifies the retention row is allowed and no `BatchLockMarkerRecord` exists, then invokes a narrow synchronous initializer callback. The callback re-proves the stable canonical name, data root, `.locks` parent, open descriptor identity, regular non-reparse type, single-link count, and exact zero length; writes `0x00` through that descriptor; fsyncs; and repeats the full proof with exact one-byte contents. Only after the callback returns does the repository insert the identity and commit.
+
+Any existing registry row rejects the empty marker before the callback, including a row with the same identity. A mismatched, retired, linked, reparse, renamed, parent-swapped, or non-empty marker is never initialized. If the process exits before the callback write, the transaction rolls back and the empty marker remains retryable. If it exits after fsync but before commit, the transaction rolls back and the existing initialized-marker recovery path binds the exact `0x00` object on retry.
+
 ## Metadata purge
 
 `RetentionRepository.purge_metadata` deletes the batch's marker registry row inside the existing metadata-purge transaction. Deletion remains referentially ordered: audit/artifact/event/file dependents first, then the independent marker row and retention row, then the batch row. The ordinary exactly-30-day path and immediate early-delete path use the same repository method.
@@ -44,6 +52,9 @@ Strict RED/GREEN tests will cover:
 4. presence of the batch's `batch_lock_markers` row before the 30-day boundary and deletion exactly at it, while the retired on-disk byte remains `0x01` and non-adoptable;
 5. the same row deletion for immediate early metadata purge;
 6. all six prior closure regressions, focused lifecycle suites, and the repository-wide gate.
+7. an injected crash immediately after empty canonical creation, followed by handle-bound initialization and binding of the same identity;
+8. a live two-opener handoff in which an existing opener encounters the creator's empty marker but cannot initialize or race the still-live creator;
+9. rejection without mutation when an empty marker already has registry state, is multi-link, or loses stable name/parent binding.
 
 ## Scope
 
