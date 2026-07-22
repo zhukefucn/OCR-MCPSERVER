@@ -21,6 +21,7 @@ from ..domain.orientation import (
     RecoveryTokenIssue,
     canonical_pages,
 )
+from ..domain.constants import DEFAULT_MAX_FILE_SIZE_BYTES
 from .database import SessionFactory
 from .task_models import (
     ArtifactRecord,
@@ -255,6 +256,9 @@ class OrientationRecoveryRepository:
         corrected_input_version: int,
         result_batch_id: str,
         result_version: int,
+        accepted_input_file_id: str,
+        accepted_input_sha256: str,
+        accepted_input_size_bytes: int,
         now: datetime,
     ) -> RecoverySnapshot:
         if (
@@ -264,6 +268,16 @@ class OrientationRecoveryRepository:
             or not _valid_uuid(result_batch_id)
             or type(result_version) is not int
             or result_version <= claim.snapshot.source_result_version
+            or not _valid_uuid(accepted_input_file_id)
+            or accepted_input_file_id == claim.snapshot.file_id
+            or not isinstance(accepted_input_sha256, str)
+            or len(accepted_input_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in accepted_input_sha256
+            )
+            or type(accepted_input_size_bytes) is not int
+            or not 1 <= accepted_input_size_bytes <= DEFAULT_MAX_FILE_SIZE_BYTES
         ):
             raise OrientationFailure(OrientationErrorCode.CLAIM_CONFLICT) from None
         now = _utc(now)
@@ -280,25 +294,48 @@ class OrientationRecoveryRepository:
                 )
                 if record is not None:
                     self._snapshot(record)
-                self._require_claim(record, retention, claim, now)
-                if await session.get(BatchRecord, result_batch_id) is None:
+                self._require_takeover_claim(record, retention, claim)
+                accepted_file = await session.get(
+                    FileTaskRecord, accepted_input_file_id
+                )
+                if (
+                    await session.get(BatchRecord, result_batch_id) is None
+                    or accepted_file is None
+                    or accepted_file.batch_id != result_batch_id
+                ):
                     raise OrientationFailure(OrientationErrorCode.CLAIM_CONFLICT)
-                expected = (corrected_input_version, result_batch_id, result_version)
+                expected = (
+                    corrected_input_version,
+                    result_batch_id,
+                    result_version,
+                    accepted_input_file_id,
+                    accepted_input_sha256,
+                    accepted_input_size_bytes,
+                )
                 persisted = (
                     record.corrected_input_version,
                     record.result_batch_id,
                     record.result_version,
+                    record.accepted_input_file_id,
+                    record.accepted_input_sha256,
+                    record.accepted_input_size_bytes,
                 )
                 if record.state == RecoveryState.COMPLETED.value:
                     if persisted != expected:
                         raise OrientationFailure(OrientationErrorCode.CLAIM_CONFLICT)
                     return self._snapshot(record)
-                if record.state != RecoveryState.CLAIMED.value:
+                if record.state not in {
+                    RecoveryState.CLAIMED.value,
+                    RecoveryState.DELETED.value,
+                }:
                     raise OrientationFailure(OrientationErrorCode.CLAIM_CONFLICT)
                 record.state = RecoveryState.COMPLETED.value
                 record.corrected_input_version = corrected_input_version
                 record.result_batch_id = result_batch_id
                 record.result_version = result_version
+                record.accepted_input_file_id = accepted_input_file_id
+                record.accepted_input_sha256 = accepted_input_sha256
+                record.accepted_input_size_bytes = accepted_input_size_bytes
                 record.updated_at = now
                 record.version += 1
                 await session.commit()
@@ -339,10 +376,18 @@ class OrientationRecoveryRepository:
                 )
                 if record is not None:
                     self._snapshot(record)
-                self._require_claim(record, retention, claim, now)
+                if error_code == "orientation_recovery_interrupted":
+                    self._require_takeover_claim(record, retention, claim)
+                else:
+                    self._require_claim(record, retention, claim, now)
                 if record.state == state.value and record.error_code == error_code:
                     return self._snapshot(record)
-                if record.state != RecoveryState.CLAIMED.value:
+                allowed_states = (
+                    {RecoveryState.CLAIMED.value, RecoveryState.DELETED.value}
+                    if error_code == "orientation_recovery_interrupted"
+                    else {RecoveryState.CLAIMED.value}
+                )
+                if record.state not in allowed_states:
                     raise OrientationFailure(OrientationErrorCode.CLAIM_CONFLICT)
                 record.state = state.value
                 record.error_code = error_code
@@ -391,7 +436,7 @@ class OrientationRecoveryRepository:
     async def list_claimed(
         self, *, now: datetime, limit: int
     ) -> tuple[RecoveryClaim, ...]:
-        """Return a bounded deterministic set of live claims for restart repair."""
+        """Return bounded claims that may have durable runner-owned inputs."""
         now = _utc(now)
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise OrientationFailure(OrientationErrorCode.REQUEST_INVALID) from None
@@ -406,14 +451,15 @@ class OrientationRecoveryRepository:
                             == OrientationRecoveryRecord.batch_id,
                         )
                         .where(
-                            OrientationRecoveryRecord.state
-                            == RecoveryState.CLAIMED.value,
-                            OrientationRecoveryRecord.expires_at > now,
-                            RetentionRecord.early_delete.is_(False),
-                            RetentionRecord.content_deleted_at.is_(None),
-                            RetentionRecord.data_tombstone.is_(None),
-                            RetentionRecord.artifact_tombstone.is_(None),
-                            RetentionRecord.content_due_at > now,
+                            OrientationRecoveryRecord.state.in_(
+                                (
+                                    RecoveryState.CLAIMED.value,
+                                    RecoveryState.DELETED.value,
+                                )
+                            ),
+                            OrientationRecoveryRecord.claim_id.is_not(None),
+                            OrientationRecoveryRecord.selected_pages.is_not(None),
+                            OrientationRecoveryRecord.result_batch_id.is_(None),
                         )
                         .order_by(
                             OrientationRecoveryRecord.updated_at,
@@ -431,7 +477,7 @@ class OrientationRecoveryRepository:
                         snapshot=snapshot,
                         acquired=False,
                     )
-                    self._require_claim(record, retention, claim, now)
+                    self._require_takeover_claim(record, retention, claim)
                     claims.append(claim)
                 return tuple(claims)
         except OrientationFailure:
@@ -515,6 +561,34 @@ class OrientationRecoveryRepository:
         try:
             OrientationRecoveryRepository._require_retained(retention, now)
         except OrientationFailure:
+            raise OrientationFailure(OrientationErrorCode.CLAIM_CONFLICT) from None
+
+    @staticmethod
+    def _require_takeover_claim(
+        record: OrientationRecoveryRecord | None,
+        retention: RetentionRecord | None,
+        claim: RecoveryClaim,
+    ) -> None:
+        """Validate identity for a runner-owned input without source liveness."""
+        if (
+            record is None
+            or retention is None
+            or record.state
+            not in {
+                RecoveryState.CLAIMED.value,
+                RecoveryState.COMPLETED.value,
+                RecoveryState.DELETED.value,
+            }
+            or record.claim_id != claim.claim_id
+            or record.request_fingerprint != claim.request_fingerprint
+            or record.file_id != claim.snapshot.file_id
+            or record.batch_id != claim.snapshot.batch_id
+            or record.source_result_version != claim.snapshot.source_result_version
+            or record.page_count != claim.snapshot.page_count
+            or _decode_pages(record.suspected_pages) != claim.snapshot.suspected_pages
+            or _decode_pages(record.selected_pages or "")
+            != claim.snapshot.selected_pages
+        ):
             raise OrientationFailure(OrientationErrorCode.CLAIM_CONFLICT) from None
 
     @staticmethod

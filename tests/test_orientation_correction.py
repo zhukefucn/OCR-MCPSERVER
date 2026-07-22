@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from array import array
+from dataclasses import replace
 from io import BytesIO
 import asyncio
 import io
@@ -20,7 +21,7 @@ from ocr_mcp_server.domain.files import IncomingFile, SupportedMediaType
 from ocr_mcp_server.domain.orientation import OrientationDecision, OrientationFailure
 from ocr_mcp_server.domain.secondary_ocr import OrthogonalAngle
 from ocr_mcp_server.infra.document_orientation import ImmutableDocumentCorrector
-from ocr_mcp_server.services.file_storage import FileStorage
+from ocr_mcp_server.services.file_storage import BatchLockLease, FileStorage
 from ocr_mcp_server.services.file_validation import FileValidator
 from ocr_mcp_server.services.orientation_recovery import OrientationCorrectionRequest
 
@@ -62,6 +63,25 @@ async def _stored(tmp_path: Path, payload: bytes, name: str, mime: str):
     return storage, batch_id, stored
 
 
+class _Markers:
+    async def bind_lock_marker(self, *args, **kwargs):
+        return None
+
+    async def bind_empty_lock_marker(
+        self, *args, initialize, **kwargs
+    ):
+        initialize()
+
+
+async def _correct_locked(storage, batch_id, corrector, request):
+    async with storage.batch_lock(
+        batch_id,
+        marker_registry=_Markers(),
+        allow_missing_marker=True,
+    ) as lease:
+        return await corrector.correct(replace(request, batch_lock=lease))
+
+
 def _request(batch_id: str, stored, *decisions: OrientationDecision):
     return OrientationCorrectionRequest(
         batch_id=batch_id,
@@ -72,6 +92,7 @@ def _request(batch_id: str, stored, *decisions: OrientationDecision):
         expected_source_sha256=stored.sha256,
         expected_source_size_bytes=stored.size_bytes,
         decisions=decisions,
+        batch_lock=BatchLockLease(batch_id, -1, lambda: True),
     )
 
 
@@ -208,6 +229,7 @@ async def test_correction_request_has_no_path_angle_or_engine_control(tmp_path: 
             expected_source_sha256=stored.sha256,
             expected_source_size_bytes=stored.size_bytes,
             decisions=(_decision(1, OrthogonalAngle.DEG_90),),
+            batch_lock=BatchLockLease(batch_id, -1, lambda: True),
             output_path=tmp_path / "chosen.pdf",
         )
 
@@ -226,6 +248,7 @@ async def test_pdf_page_count_binding_mismatch_creates_no_derivative(tmp_path: P
         expected_source_sha256=stored.sha256,
         expected_source_size_bytes=stored.size_bytes,
         decisions=(_decision(1, OrthogonalAngle.DEG_90),),
+        batch_lock=BatchLockLease(batch_id, -1, lambda: True),
     )
 
     with pytest.raises(OrientationFailure) as caught:
@@ -489,6 +512,7 @@ async def test_transform_baseexception_preserves_control_flow_and_cleans_stage(
             transform=stop,
             max_file_size_bytes=1_000_000,
             validator=FileValidator(max_pages=500, max_image_pixels=10_000),
+            batch_lock=BatchLockLease(batch_id, -1, lambda: True),
         )
     assert list(stored.path.parent.glob("*.pdf")) == [stored.path]
     assert not list(stored.path.parent.glob("*.part"))
@@ -520,6 +544,7 @@ async def test_writer_enforces_byte_cap_before_oversized_write(tmp_path: Path) -
         transform=transform,
         max_file_size_bytes=len(valid),
         validator=FileValidator(max_pages=500, max_image_pixels=10_000),
+        batch_lock=BatchLockLease(batch_id, -1, lambda: True),
     )
     assert observed is True
     assert corrected.size_bytes == len(valid)
@@ -581,6 +606,7 @@ async def test_all_writer_surfaces_enforce_byte_cap_before_growth(
         transform=transform,
         max_file_size_bytes=cap,
         validator=FileValidator(max_pages=500, max_image_pixels=10_000),
+        batch_lock=BatchLockLease(batch_id, -1, lambda: True),
     )
     assert observed is True
     assert corrected.size_bytes == len(valid)
@@ -609,6 +635,7 @@ async def test_writer_exposes_no_descriptor_or_raw_mutator_bypass(tmp_path: Path
         transform=transform,
         max_file_size_bytes=len(valid),
         validator=FileValidator(max_pages=500, max_image_pixels=10_000),
+        batch_lock=BatchLockLease(batch_id, -1, lambda: True),
     )
     assert corrected.size_bytes == len(valid)
 
@@ -637,6 +664,7 @@ async def test_derivative_rejects_non_positive_or_boolean_byte_cap(
             transform=transform,
             max_file_size_bytes=cap,
             validator=FileValidator(max_pages=500, max_image_pixels=10_000),
+            batch_lock=BatchLockLease(batch_id, -1, lambda: True),
         )
     assert getattr(caught.value, "code", None) == "file_too_large"
     assert called is False
@@ -1028,3 +1056,114 @@ async def test_image_applies_exif_orientation_before_clockwise_detector_rotation
     with Image.open(corrected.path) as result:
         assert result.size == (2, 3)
         assert "exif" not in result.info
+
+
+@pytest.mark.asyncio
+async def test_immutable_correction_counts_existing_and_staged_bytes_at_batch_limit(
+    tmp_path: Path,
+) -> None:
+    payload = _pdf_bytes()
+    reference_storage, reference_batch, reference = await _stored(
+        tmp_path / "reference", payload, "source.pdf", "application/pdf"
+    )
+    reference_corrected = await _correct_locked(
+        reference_storage,
+        reference_batch,
+        ImmutableDocumentCorrector(reference_storage),
+        _request(
+            reference_batch,
+            reference,
+            _decision(1, OrthogonalAngle.DEG_90),
+        )
+    )
+    exact_limit = reference.size_bytes + reference_corrected.size_bytes
+
+    exact_storage, exact_batch, exact = await _stored(
+        tmp_path / "exact", payload, "source.pdf", "application/pdf"
+    )
+    accepted = await _correct_locked(
+        exact_storage,
+        exact_batch,
+        ImmutableDocumentCorrector(
+            exact_storage, max_batch_size_bytes=exact_limit
+        ),
+        _request(exact_batch, exact, _decision(1, OrthogonalAngle.DEG_90))
+    )
+    assert exact_storage.batch_usage(exact_batch).total_bytes == exact_limit
+    assert accepted.size_bytes == reference_corrected.size_bytes
+
+    rejected_storage, rejected_batch, rejected = await _stored(
+        tmp_path / "rejected", payload, "source.pdf", "application/pdf"
+    )
+    with pytest.raises(OrientationFailure):
+        await _correct_locked(
+            rejected_storage,
+            rejected_batch,
+            ImmutableDocumentCorrector(
+                rejected_storage, max_batch_size_bytes=exact_limit - 1
+            ),
+            _request(
+                rejected_batch,
+                rejected,
+                _decision(1, OrthogonalAngle.DEG_90),
+            )
+        )
+    assert rejected_storage.batch_usage(rejected_batch).total_bytes == rejected.size_bytes
+
+
+@pytest.mark.asyncio
+async def test_concurrent_immutable_corrections_cannot_jointly_exceed_batch_limit(
+    tmp_path: Path,
+) -> None:
+    storage = FileStorage(tmp_path / "data")
+    batch_id = str(uuid4())
+    first_payload = _pdf_bytes()
+    writer = PdfWriter()
+    writer.add_blank_page(width=80, height=160)
+    writer.add_blank_page(width=110, height=210)
+    second_output = BytesIO()
+    writer.write(second_output)
+    validator = FileValidator(max_pages=500, max_image_pixels=10_000)
+    first = await storage.store(
+        batch_id,
+        IncomingFile("first.pdf", "application/pdf", _chunks(first_payload)),
+        max_file_size_bytes=1_000_000,
+        validator=validator,
+    )
+    second = await storage.store(
+        batch_id,
+        IncomingFile(
+            "second.pdf", "application/pdf", _chunks(second_output.getvalue())
+        ),
+        max_file_size_bytes=1_000_000,
+        validator=validator,
+    )
+    # Either correction can fit by itself, but both cannot fit together.
+    batch_limit = (
+        first.size_bytes
+        + second.size_bytes
+        + max(first.size_bytes, second.size_bytes)
+        + 128
+    )
+    corrector = ImmutableDocumentCorrector(
+        storage, max_batch_size_bytes=batch_limit
+    )
+    outcomes = await asyncio.gather(
+        _correct_locked(
+            storage,
+            batch_id,
+            corrector,
+            _request(batch_id, first, _decision(1, OrthogonalAngle.DEG_90))
+        ),
+        _correct_locked(
+            storage,
+            batch_id,
+            corrector,
+            _request(batch_id, second, _decision(1, OrthogonalAngle.DEG_90))
+        ),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(item, OrientationFailure) for item in outcomes) == 1
+    assert sum(not isinstance(item, BaseException) for item in outcomes) == 1
+    assert storage.batch_usage(batch_id).total_bytes <= batch_limit

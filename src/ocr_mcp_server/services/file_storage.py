@@ -26,10 +26,18 @@ import threading
 from typing import BinaryIO
 from uuid import UUID, uuid4, uuid5
 
-from ..domain.constants import DEFAULT_MAX_FILE_SIZE_BYTES, SUPPORTED_EXTENSIONS
+from ..domain.constants import (
+    DEFAULT_MAX_BATCH_SIZE_BYTES,
+    DEFAULT_MAX_FILE_SIZE_BYTES,
+    SUPPORTED_EXTENSIONS,
+)
 from ..domain.errors import FileIntakeErrorCode, FileIntakeFailure
 from ..domain.files import IncomingFile, StoredFile
 from .file_validation import FileValidator, ValidatedFileMetadata
+
+
+_DERIVATIVE_CAPACITY_LOCKS_GUARD = threading.Lock()
+_DERIVATIVE_CAPACITY_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +50,7 @@ class BatchUsage:
 class BatchLockLease:
     """Held batch lock whose one-byte marker can durably retire the batch."""
 
+    batch_id: str
     descriptor: int
     verify_identity: Callable[[], bool]
 
@@ -280,7 +289,7 @@ class FileStorage:
                     raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
             elif marker != b"\x00":
                 raise OSError("invalid batch lock marker")
-            yield BatchLockLease(descriptor, lock_unchanged)
+            yield BatchLockLease(canonical_batch_id, descriptor, lock_unchanged)
             if not lock_unchanged():
                 raise OSError("unsafe batch lock")
         except FileIntakeFailure as exc:
@@ -577,6 +586,8 @@ class FileStorage:
         transform: Callable[[BinaryIO, BinaryIO], None],
         max_file_size_bytes: int,
         validator: FileValidator,
+        batch_lock: BatchLockLease,
+        max_batch_size_bytes: int = DEFAULT_MAX_BATCH_SIZE_BYTES,
     ) -> StoredFile:
         """Transform a held input into a new server-named sibling atomically.
 
@@ -584,8 +595,19 @@ class FileStorage:
         extension.  The callback receives duplicate handles, never paths.
         """
 
-        if type(max_file_size_bytes) is not int or max_file_size_bytes < 1:
+        if (
+            type(max_file_size_bytes) is not int
+            or max_file_size_bytes < 1
+            or type(max_batch_size_bytes) is not int
+            or max_batch_size_bytes < 1
+        ):
             raise FileIntakeFailure(FileIntakeErrorCode.TOO_LARGE)
+        if (
+            not isinstance(batch_lock, BatchLockLease)
+            or batch_lock.batch_id != self._canonical_uuid(batch_id)
+            or not batch_lock.verify_identity()
+        ):
+            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
         if (
             not isinstance(expected_source_sha256, str)
             or len(expected_source_sha256) != 64
@@ -608,8 +630,10 @@ class FileStorage:
                 expected_source_size_bytes,
                 transform,
                 max_file_size_bytes,
+                max_batch_size_bytes,
                 validator,
                 cancelled,
+                batch_lock,
             )
         )
         try:
@@ -667,8 +691,50 @@ class FileStorage:
         expected_source_size_bytes: int,
         transform: Callable[[BinaryIO, BinaryIO], None],
         max_file_size_bytes: int,
+        max_batch_size_bytes: int,
         validator: FileValidator,
         cancelled: threading.Event,
+        batch_lock: BatchLockLease,
+    ) -> _DerivativeOutcome:
+        canonical_batch_id = self._canonical_uuid(batch_id)
+        key = (str(self._data_root), canonical_batch_id)
+        with _DERIVATIVE_CAPACITY_LOCKS_GUARD:
+            capacity_lock = _DERIVATIVE_CAPACITY_LOCKS.setdefault(
+                key, threading.Lock()
+            )
+        with capacity_lock:
+            if (
+                batch_lock.batch_id != canonical_batch_id
+                or not batch_lock.verify_identity()
+            ):
+                raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+            return self._create_immutable_derivative_locked_sync(
+                canonical_batch_id,
+                source_file_id,
+                extension,
+                expected_source_sha256,
+                expected_source_size_bytes,
+                transform,
+                max_file_size_bytes,
+                max_batch_size_bytes,
+                validator,
+                cancelled,
+                batch_lock,
+            )
+
+    def _create_immutable_derivative_locked_sync(
+        self,
+        batch_id: str,
+        source_file_id: str,
+        extension: str,
+        expected_source_sha256: str,
+        expected_source_size_bytes: int,
+        transform: Callable[[BinaryIO, BinaryIO], None],
+        max_file_size_bytes: int,
+        max_batch_size_bytes: int,
+        validator: FileValidator,
+        cancelled: threading.Event,
+        batch_lock: BatchLockLease,
     ) -> _DerivativeOutcome:
         canonical_batch_id = self._canonical_uuid(batch_id)
         canonical_source_id = self._canonical_uuid(source_file_id)
@@ -753,6 +819,13 @@ class FileStorage:
             )
             if cancelled.is_set():
                 raise asyncio.CancelledError
+            usage = self._batch_usage_open_directory(directory)
+            if usage.total_bytes + output_info.st_size > max_batch_size_bytes:
+                raise FileIntakeFailure(
+                    FileIntakeErrorCode.BATCH_CAPACITY_EXCEEDED
+                )
+            if not batch_lock.verify_identity():
+                raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
             current_source = os.fstat(source_descriptor)
             current_source_digest = self._hash_descriptor(source_descriptor)
             final_source = os.fstat(source_descriptor)
@@ -785,6 +858,8 @@ class FileStorage:
                 raise OSError("unsafe staged output")
             if cancelled.is_set():
                 raise asyncio.CancelledError
+            if not batch_lock.verify_identity():
+                raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
             self._publish_no_replace(
                 directory,
                 part_name,
@@ -1008,6 +1083,36 @@ class FileStorage:
         if failure is not None:
             self._clear_exception_context(failure)
             raise failure
+        return BatchUsage(file_count=file_count, total_bytes=total_bytes)
+
+    def _batch_usage_open_directory(
+        self, directory: _OpenedDirectory
+    ) -> BatchUsage:
+        file_count = 0
+        total_bytes = 0
+        for name in self._list_names(directory):
+            path = Path(name)
+            if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                continue
+            try:
+                self._canonical_uuid(path.stem)
+            except FileIntakeFailure:
+                continue
+            descriptor = self._open_existing_file(directory, name)
+            try:
+                info = os.fstat(descriptor)
+                if (
+                    self._is_reparse(info)
+                    or not stat.S_ISREG(info.st_mode)
+                    or info.st_nlink != 1
+                ):
+                    raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+                file_count += 1
+                total_bytes += info.st_size
+            finally:
+                os.close(descriptor)
+        if not self._directory_unchanged(directory):
+            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
         return BatchUsage(file_count=file_count, total_bytes=total_bytes)
 
     def _find_duplicate(

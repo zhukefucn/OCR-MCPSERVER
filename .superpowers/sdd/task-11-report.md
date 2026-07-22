@@ -37,3 +37,48 @@ python -m pytest -q tests/test_orientation_repository.py tests/test_orientation_
 ```
 
 The final complete Windows suite passed with `832 passed, 20 skipped`. `pip check`, `compileall -q src tests`, and `git diff --check` also passed. Controller-level review, push, Ubuntu verification, image build/start, and version pinning remain intentionally outside this implementation worker's scope.
+
+## Final Important fixes - durable takeover and batch capacity
+
+### Design and implementation
+
+- `FullRecoveryPipelineSubmission` now carries a content-free durable takeover proof: a new accepted input UUID, SHA-256, and byte size bound to the independent result batch and exact source-result-plus-one version.
+- The live coordinator verifies the proof against the immutable corrected input before releasing the source batch lock/content-write guard. SQLite completion additionally verifies that the accepted input task belongs to the result batch and persists the proof atomically.
+- Restart reconciliation can recover a claimed operation after token/content expiry or after retention marks the source recovery row deleted. It never repeats detection, correction, or pipeline submission. A runner-owned accepted input can converge to completed while the source token remains unusable.
+- Schema initialization includes an additive migration for existing SQLite databases.
+- Immutable correction now requires the active matching `BatchLockLease`. While holding that lease and the anchored input-directory handle, storage serializes derivative publication, counts existing immutable inputs plus the staged output, and rejects totals above `DEFAULT_MAX_BATCH_SIZE_BYTES`. The existing 30 MB derivative/file limit remains enforced independently.
+
+### RED evidence
+
+The takeover-proof and capacity tests were added before implementation. The first aggregate run stopped during collection on the missing proof fields:
+
+```text
+.venv\\Scripts\\python.exe -m pytest -q tests/test_orientation_recovery.py tests/test_orientation_correction.py -x
+ERROR tests/test_orientation_recovery.py
+TypeError: FullRecoveryPipelineSubmission.__init__() takes 4 positional arguments but 7 were given
+```
+
+### GREEN evidence
+
+Focused orientation, retention, REST, and MCP coverage:
+
+```text
+.venv\\Scripts\\python.exe -m pytest -o addopts='--basetemp=.pytest-tmp' -q tests/test_orientation_domain.py tests/test_orientation_repository.py tests/test_orientation_recovery.py tests/test_orientation_correction.py tests/test_retention.py tests/test_rest_api.py tests/test_mcp_api.py
+172 passed, 7 skipped in 9.06s
+```
+
+Covered boundaries include exact/over-limit capacity, concurrent corrections, mismatched takeover metadata, completion after expiry, repository completion failure after runner acceptance, cleanup-to-restart convergence, public schema stability, and exactly three MCP tools.
+
+Final complete Windows verification:
+
+```text
+.venv\\Scripts\\python.exe -m pytest -o addopts='--basetemp=.pytest-tmp' -q
+842 passed, 20 skipped in 16.98s
+
+.venv\\Scripts\\python.exe -m pip check
+No broken requirements found.
+
+.venv\\Scripts\\python.exe -m compileall -q src tests
+git diff --check
+# both exited 0
+```

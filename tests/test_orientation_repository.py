@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -37,10 +38,49 @@ from ocr_mcp_server.services.retention import RetentionService
 
 NOW = datetime(2026, 7, 22, tzinfo=UTC)
 FILE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+ACCEPTED_FILE_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+
+def takeover_proof() -> dict[str, object]:
+    return {
+        "accepted_input_file_id": ACCEPTED_FILE_ID,
+        "accepted_input_sha256": "b" * 64,
+        "accepted_input_size_bytes": 10,
+    }
 
 
 def database_url(path: Path) -> str:
     return f"sqlite+aiosqlite:///{path.as_posix()}"
+
+
+@pytest.mark.asyncio
+async def test_schema_upgrade_adds_durable_takeover_proof_columns(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE orientation_recoveries (token_digest VARCHAR(64) PRIMARY KEY)"
+        )
+    engine = create_database_engine(database_url(path))
+    try:
+        await initialize_schema(engine)
+        async with engine.connect() as connection:
+            columns = {
+                row[1]
+                for row in (
+                    await connection.exec_driver_sql(
+                        "PRAGMA table_info(orientation_recoveries)"
+                    )
+                )
+            }
+        assert {
+            "accepted_input_file_id",
+            "accepted_input_sha256",
+            "accepted_input_size_bytes",
+        }.issubset(columns)
+    finally:
+        await engine.dispose()
 
 
 @pytest_asyncio.fixture
@@ -136,7 +176,7 @@ async def test_issue_rejects_second_token_for_same_file_result_version(repositor
 
 
 @pytest.mark.asyncio
-async def test_list_claimed_is_bounded_live_and_excludes_expired_content(repository) -> None:
+async def test_list_claimed_is_bounded_and_keeps_claim_for_durable_reconciliation(repository) -> None:
     repo, engine, batch_id, _ = repository
     issue = await repo.issue(binding(batch_id), now=NOW)
     claimed = await repo.claim(issue.token, (4, 2), now=NOW)
@@ -145,7 +185,9 @@ async def test_list_claimed_is_bounded_live_and_excludes_expired_content(reposit
 
     assert len(recovered) == 1
     assert recovered[0] == replace(claimed, acquired=False)
-    assert await repo.list_claimed(now=NOW + timedelta(hours=20), limit=1) == ()
+    assert await repo.list_claimed(
+        now=NOW + timedelta(hours=20), limit=1
+    ) == recovered
     for invalid_limit in (0, 1001, True):
         with pytest.raises(OrientationFailure) as caught:
             await repo.list_claimed(now=NOW, limit=invalid_limit)
@@ -267,7 +309,12 @@ async def test_concurrent_restart_reconciliation_converges_without_running_work(
             self.reconcile_calls += 1
             await asyncio.sleep(0)
             return FullRecoveryPipelineSubmission(
-                result_batch_id, BatchStatus.QUEUED, 3
+                result_batch_id,
+                BatchStatus.QUEUED,
+                3,
+                ACCEPTED_FILE_ID,
+                "b" * 64,
+                10,
             )
 
         async def run(self, *args, **kwargs):
@@ -395,6 +442,7 @@ async def test_terminal_compare_and_set_is_idempotent_and_restart_safe(repositor
         corrected_input_version=3,
         result_batch_id=result_batch_id,
         result_version=3,
+        **takeover_proof(),
         now=NOW + timedelta(seconds=1),
     )
     repeated = await repo.complete(
@@ -402,10 +450,25 @@ async def test_terminal_compare_and_set_is_idempotent_and_restart_safe(repositor
         corrected_input_version=3,
         result_batch_id=result_batch_id,
         result_version=3,
+        **takeover_proof(),
         now=NOW + timedelta(seconds=2),
     )
     assert completed == repeated
     assert repeated.state is RecoveryState.COMPLETED
+    async with engine.connect() as connection:
+        proof = (
+            await connection.execute(
+                text(
+                    "SELECT accepted_input_file_id, accepted_input_sha256, "
+                    "accepted_input_size_bytes FROM orientation_recoveries"
+                )
+            )
+        ).mappings().one()
+    assert proof == {
+        "accepted_input_file_id": ACCEPTED_FILE_ID,
+        "accepted_input_sha256": "b" * 64,
+        "accepted_input_size_bytes": 10,
+    }
 
     with pytest.raises(OrientationFailure) as conflict:
         await repo.complete(
@@ -413,6 +476,7 @@ async def test_terminal_compare_and_set_is_idempotent_and_restart_safe(repositor
             corrected_input_version=4,
             result_batch_id="33333333-3333-4333-8333-333333333333",
             result_version=4,
+            **takeover_proof(),
             now=NOW + timedelta(seconds=3),
         )
     assert conflict.value.code == OrientationErrorCode.CLAIM_CONFLICT.value
@@ -468,6 +532,7 @@ async def test_terminal_transitions_reject_expired_deleted_or_forged_claims(repo
             corrected_input_version=3,
             result_batch_id=result_batch_id,
             result_version=3,
+            **takeover_proof(),
             now=NOW,
         )
     assert mismatch.value.code == OrientationErrorCode.CLAIM_CONFLICT.value
@@ -531,22 +596,100 @@ async def test_retention_authoritatively_bounds_issue_and_all_later_operations(r
     for operation in (
         lambda: repo.resolve(issue.token, now=NOW),
         lambda: repo.claim(issue.token, (2,), now=NOW),
-        lambda: repo.complete(
-            claim,
-            corrected_input_version=3,
-            result_batch_id=result_batch_id,
-            result_version=3,
-            now=NOW,
-        ),
-        lambda: repo.fail(
+    ):
+        with pytest.raises(OrientationFailure):
+            await operation()
+
+    completed = await repo.complete(
+        claim,
+        corrected_input_version=3,
+        result_batch_id=result_batch_id,
+        result_version=3,
+        **takeover_proof(),
+        now=NOW,
+    )
+    assert completed.state is RecoveryState.COMPLETED
+    with pytest.raises(OrientationFailure):
+        await repo.fail(
             claim,
             state=RecoveryState.FAILED,
             error_code="orientation_failed",
             now=NOW,
-        ),
-    ):
-        with pytest.raises(OrientationFailure):
-            await operation()
+        )
+
+
+@pytest.mark.asyncio
+async def test_durable_takeover_completes_after_token_and_content_expiry(repository) -> None:
+    repo, _, batch_id, result_batch_id = repository
+    issue = await repo.issue(
+        binding(batch_id, expires_at=NOW + timedelta(seconds=1)), now=NOW
+    )
+    claim = await repo.claim(issue.token, (2,), now=NOW)
+
+    completed = await repo.complete(
+        claim,
+        corrected_input_version=3,
+        result_batch_id=result_batch_id,
+        result_version=3,
+        **takeover_proof(),
+        now=NOW + timedelta(hours=20),
+    )
+
+    assert completed.state is RecoveryState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_deleted_source_claim_reconciles_durable_runner_takeover(repository) -> None:
+    repo, engine, batch_id, result_batch_id = repository
+    issue = await repo.issue(binding(batch_id), now=NOW)
+    await repo.claim(issue.token, (2,), now=NOW)
+    retention = RetentionRepository(create_session_factory(engine))
+    assert await retention.request_early_delete(batch_id, now=NOW)
+    cleanup_claim = await retention.claim_batch(
+        batch_id, "cleanup", now=NOW, lease_seconds=60
+    )
+    assert await retention.invalidate_orientation_recoveries(
+        cleanup_claim, now=NOW
+    ) == 1
+
+    class Runner:
+        async def reconcile(self, recovery_id):
+            return FullRecoveryPipelineSubmission(
+                result_batch_id,
+                BatchStatus.QUEUED,
+                3,
+                ACCEPTED_FILE_ID,
+                "b" * 64,
+                10,
+            )
+
+        async def run(self, *args, **kwargs):
+            raise AssertionError("reconciliation must not run work")
+
+    service = OrientationRecoveryCoordinator(
+        repository=repo,
+        detector=object(),
+        corrector=object(),
+        runner=Runner(),
+        storage=object(),
+        marker_registry=object(),
+        content_write_guards=object(),
+        now_factory=lambda: NOW + timedelta(days=1),
+    )
+    result = await service.reconcile_incomplete(limit=1)
+
+    assert (result.completed, result.failed, result.deferred) == (1, 0, 0)
+    async with engine.connect() as connection:
+        state = await connection.scalar(
+            text(
+                "SELECT state FROM orientation_recoveries "
+                "WHERE batch_id=:batch_id"
+            ),
+            {"batch_id": batch_id},
+        )
+    assert state == RecoveryState.COMPLETED.value
+    with pytest.raises(OrientationFailure):
+        await repo.resolve(issue.token, now=NOW + timedelta(days=1))
 
 
 @pytest.mark.asyncio
@@ -688,6 +831,7 @@ async def test_issue_requires_available_source_artifact_and_complete_requires_re
             corrected_input_version=3,
             result_batch_id="22222222-2222-4222-8222-222222222222",
             result_version=3,
+            **takeover_proof(),
             now=NOW,
         )
     assert missing_result.value.code == OrientationErrorCode.CLAIM_CONFLICT.value

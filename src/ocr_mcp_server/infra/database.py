@@ -46,3 +46,24 @@ async def initialize_schema(engine: AsyncEngine) -> None:
         Path(database).parent.mkdir(parents=True, exist_ok=True)
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        await connection.run_sync(_migrate_orientation_takeover_columns)
+
+
+def _migrate_orientation_takeover_columns(connection) -> None:
+    """Apply the additive Task 11 takeover-proof schema migration."""
+    existing = {
+        row[1]
+        for row in connection.exec_driver_sql(
+            "PRAGMA table_info(orientation_recoveries)"
+        )
+    }
+    additions = {
+        "accepted_input_file_id": "VARCHAR(36)",
+        "accepted_input_sha256": "VARCHAR(64)",
+        "accepted_input_size_bytes": "INTEGER",
+    }
+    for name, column_type in additions.items():
+        if name not in existing:
+            connection.exec_driver_sql(
+                f"ALTER TABLE orientation_recoveries ADD COLUMN {name} {column_type}"
+            )

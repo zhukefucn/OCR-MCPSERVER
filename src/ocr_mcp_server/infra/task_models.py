@@ -223,24 +223,40 @@ class OrientationRecoveryRecord(Base):
             "state = 'deleted' OR "
             "(state = 'issued' AND selected_pages IS NULL AND request_fingerprint IS NULL "
             "AND claim_id IS NULL AND corrected_input_version IS NULL "
-            "AND result_batch_id IS NULL AND result_version IS NULL AND error_code IS NULL) OR "
+            "AND result_batch_id IS NULL AND result_version IS NULL "
+            "AND accepted_input_file_id IS NULL AND accepted_input_sha256 IS NULL "
+            "AND accepted_input_size_bytes IS NULL AND error_code IS NULL) OR "
             "(state = 'claimed' AND selected_pages IS NOT NULL "
             "AND request_fingerprint IS NOT NULL AND claim_id IS NOT NULL "
             "AND corrected_input_version IS NULL AND result_batch_id IS NULL "
-            "AND result_version IS NULL AND error_code IS NULL) OR "
+            "AND result_version IS NULL AND accepted_input_file_id IS NULL "
+            "AND accepted_input_sha256 IS NULL AND accepted_input_size_bytes IS NULL "
+            "AND error_code IS NULL) OR "
             "(state = 'completed' AND selected_pages IS NOT NULL "
             "AND request_fingerprint IS NOT NULL AND claim_id IS NOT NULL "
             "AND corrected_input_version IS NOT NULL AND result_batch_id IS NOT NULL "
-            "AND result_version IS NOT NULL AND error_code IS NULL) OR "
+            "AND result_version IS NOT NULL AND accepted_input_file_id IS NOT NULL "
+            "AND accepted_input_sha256 IS NOT NULL AND accepted_input_size_bytes IS NOT NULL "
+            "AND error_code IS NULL) OR "
             "(state IN ('failed', 'uncertain') AND selected_pages IS NOT NULL "
             "AND request_fingerprint IS NOT NULL AND claim_id IS NOT NULL "
             "AND corrected_input_version IS NULL AND result_batch_id IS NULL "
-            "AND result_version IS NULL AND error_code IS NOT NULL)"
+            "AND result_version IS NULL AND accepted_input_file_id IS NULL "
+            "AND accepted_input_sha256 IS NULL AND accepted_input_size_bytes IS NULL "
+            "AND error_code IS NOT NULL)"
         ),
         CheckConstraint("source_result_version >= 1"),
         CheckConstraint("page_count >= 1"),
         CheckConstraint("corrected_input_version IS NULL OR corrected_input_version >= 1"),
         CheckConstraint("result_version IS NULL OR result_version >= 1"),
+        CheckConstraint(
+            "accepted_input_sha256 IS NULL OR (length(accepted_input_sha256) = 64 "
+            "AND accepted_input_sha256 NOT GLOB '*[^0-9a-f]*')"
+        ),
+        CheckConstraint(
+            "accepted_input_size_bytes IS NULL OR "
+            "(accepted_input_size_bytes >= 1 AND accepted_input_size_bytes <= 31457280)"
+        ),
         CheckConstraint("version >= 1"),
     )
 
@@ -262,6 +278,9 @@ class OrientationRecoveryRecord(Base):
     corrected_input_version: Mapped[int | None] = mapped_column(Integer)
     result_batch_id: Mapped[str | None] = mapped_column(String(36))
     result_version: Mapped[int | None] = mapped_column(Integer)
+    accepted_input_file_id: Mapped[str | None] = mapped_column(String(36))
+    accepted_input_sha256: Mapped[str | None] = mapped_column(String(64))
+    accepted_input_size_bytes: Mapped[int | None] = mapped_column(Integer)
     error_code: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

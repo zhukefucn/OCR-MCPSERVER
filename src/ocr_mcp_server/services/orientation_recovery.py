@@ -15,6 +15,7 @@ from typing import Protocol, TypeAlias
 from uuid import UUID
 
 from ..domain.files import StoredFile, SupportedMediaType
+from ..domain.constants import DEFAULT_MAX_FILE_SIZE_BYTES
 from ..domain.orientation import (
     OrientationDecision,
     OrientationErrorCode,
@@ -28,6 +29,7 @@ from ..domain.orientation import (
 from ..domain.models import BatchStatus, utc_now
 from ..domain.retention import ContentWriteGuard
 from ..domain.secondary_ocr import OrthogonalAngle
+from .file_storage import BatchLockLease
 
 
 ProgressCallback: TypeAlias = Callable[[int, int], Awaitable[None]]
@@ -122,6 +124,7 @@ class OrientationCorrectionRequest:
     expected_source_sha256: str
     expected_source_size_bytes: int
     decisions: tuple[OrientationDecision, ...]
+    batch_lock: BatchLockLease = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
         extensions = {
@@ -144,6 +147,9 @@ class OrientationCorrectionRequest:
             )
             or type(self.expected_source_size_bytes) is not int
             or self.expected_source_size_bytes < 1
+            or not isinstance(self.batch_lock, BatchLockLease)
+            or self.batch_lock.batch_id != self.batch_id
+            or not self.batch_lock.verify_identity()
         ):
             raise ValueError("invalid orientation correction request")
         decisions = tuple(self.decisions)
@@ -186,6 +192,9 @@ class OrientationRecoveryState(Protocol):
         corrected_input_version: int,
         result_batch_id: str,
         result_version: int,
+        accepted_input_file_id: str,
+        accepted_input_sha256: str,
+        accepted_input_size_bytes: int,
         now: datetime,
     ) -> RecoverySnapshot: ...
 
@@ -234,9 +243,18 @@ class RecoveryContentWriteGuards(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class FullRecoveryPipelineSubmission:
+    """Proof that the runner durably owns an independent accepted input.
+
+    A runner must not return this value until the accepted bytes and their
+    result-batch task metadata can survive deletion of the source batch.
+    """
+
     batch_id: str
     status: BatchStatus
     result_version: int
+    accepted_input_file_id: str
+    accepted_input_sha256: str
+    accepted_input_size_bytes: int
 
     def __post_init__(self) -> None:
         if (
@@ -244,11 +262,22 @@ class FullRecoveryPipelineSubmission:
             or self.status is not BatchStatus.QUEUED
             or type(self.result_version) is not int
             or self.result_version < 1
+            or not _canonical_uuid(self.accepted_input_file_id)
+            or not isinstance(self.accepted_input_sha256, str)
+            or len(self.accepted_input_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.accepted_input_sha256
+            )
+            or type(self.accepted_input_size_bytes) is not int
+            or not 1 <= self.accepted_input_size_bytes <= DEFAULT_MAX_FILE_SIZE_BYTES
         ):
             raise ValueError("invalid recovery pipeline submission")
 
 
 class FullRecoveryPipelineRunner(Protocol):
+    """Durably adopt corrected bytes before acknowledging a recovery run."""
+
     async def run(
         self,
         corrected: StoredFile,
@@ -312,9 +341,13 @@ class OrientationRecoverySubmission:
     result_version: int
 
     def __post_init__(self) -> None:
-        FullRecoveryPipelineSubmission(
-            self.batch_id, self.status, self.result_version
-        )
+        if (
+            not _canonical_uuid(self.batch_id)
+            or self.status is not BatchStatus.QUEUED
+            or type(self.result_version) is not int
+            or self.result_version < 1
+        ):
+            raise ValueError("invalid orientation recovery submission")
 
 
 class RecoveryServiceErrorCode(StrEnum):
@@ -411,7 +444,7 @@ class OrientationRecoveryCoordinator:
                 marker_registry=self._marker_registry,
                 allow_missing_marker=False,
                 allow_retired=False,
-            ):
+            ) as batch_lock:
                 guard = await self._acquire_guard(claim)
                 try:
                     source = await self._storage.resolve_stored(
@@ -435,7 +468,9 @@ class OrientationRecoveryCoordinator:
                         await _safe_progress(progress, 100)
                         raise RecoveryServiceFailure(RecoveryServiceErrorCode.UNCERTAIN)
                     await _safe_progress(progress, 50)
-                    corrected = await self._correct(claim, source, credible)
+                    corrected = await self._correct(
+                        claim, source, credible, batch_lock
+                    )
                     corrected_input_version = claim.snapshot.source_result_version + 1
                     await _safe_progress(progress, 70)
                     submission = await self._run(
@@ -444,6 +479,10 @@ class OrientationRecoveryCoordinator:
                     if (
                         submission.batch_id == claim.snapshot.batch_id
                         or submission.result_version != corrected_input_version
+                        or submission.accepted_input_file_id
+                        in {claim.snapshot.file_id, corrected.file_id}
+                        or submission.accepted_input_sha256 != corrected.sha256
+                        or submission.accepted_input_size_bytes != corrected.size_bytes
                     ):
                         await self._terminal_failure(
                             claim,
@@ -459,6 +498,9 @@ class OrientationRecoveryCoordinator:
                             corrected_input_version=corrected_input_version,
                             result_batch_id=submission.batch_id,
                             result_version=submission.result_version,
+                            accepted_input_file_id=submission.accepted_input_file_id,
+                            accepted_input_sha256=submission.accepted_input_sha256,
+                            accepted_input_size_bytes=submission.accepted_input_size_bytes,
                             now=self._now_factory(),
                         )
                     except Exception:
@@ -524,6 +566,7 @@ class OrientationRecoveryCoordinator:
                 isinstance(submission, FullRecoveryPipelineSubmission)
                 and submission.batch_id != claim.snapshot.batch_id
                 and submission.result_version == expected_version
+                and submission.accepted_input_file_id != claim.snapshot.file_id
             )
             if valid:
                 try:
@@ -532,6 +575,9 @@ class OrientationRecoveryCoordinator:
                         corrected_input_version=expected_version,
                         result_batch_id=submission.batch_id,
                         result_version=submission.result_version,
+                        accepted_input_file_id=submission.accepted_input_file_id,
+                        accepted_input_sha256=submission.accepted_input_sha256,
+                        accepted_input_size_bytes=submission.accepted_input_size_bytes,
                         now=self._now_factory(),
                     )
                     completed += 1
@@ -643,6 +689,7 @@ class OrientationRecoveryCoordinator:
         claim: RecoveryClaim,
         source: StoredFile,
         decisions: tuple[OrientationDecision, ...],
+        batch_lock: BatchLockLease,
     ) -> StoredFile:
         if (
             not isinstance(source, StoredFile)
@@ -665,6 +712,7 @@ class OrientationRecoveryCoordinator:
                     expected_source_sha256=source.sha256,
                     expected_source_size_bytes=source.size_bytes,
                     decisions=decisions,
+                    batch_lock=batch_lock,
                 )
             )
             if (

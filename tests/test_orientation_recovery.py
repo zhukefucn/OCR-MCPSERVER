@@ -36,8 +36,9 @@ from ocr_mcp_server.services.orientation_recovery import (
     OrientationRecoveryCommand,
     OrientationRecoveryCoordinator,
     OrientationRecoverySubmission,
+    RecoveryServiceFailure,
 )
-from ocr_mcp_server.services.file_storage import FileStorage
+from ocr_mcp_server.services.file_storage import BatchLockLease, FileStorage
 from ocr_mcp_server.services.file_validation import FileValidator
 
 
@@ -45,6 +46,39 @@ NOW = datetime(2026, 7, 23, tzinfo=UTC)
 BATCH_ID = "11111111-1111-4111-8111-111111111111"
 FILE_ID = "22222222-2222-4222-8222-222222222222"
 RESULT_BATCH_ID = "33333333-3333-4333-8333-333333333333"
+ACCEPTED_FILE_ID = "55555555-5555-4555-8555-555555555555"
+
+
+def pipeline_submission(
+    batch_id: str = RESULT_BATCH_ID,
+    result_version: int = 3,
+    *,
+    accepted_input_file_id: str = ACCEPTED_FILE_ID,
+    accepted_input_sha256: str = "b" * 64,
+    accepted_input_size_bytes: int = 10,
+) -> FullRecoveryPipelineSubmission:
+    return FullRecoveryPipelineSubmission(
+        batch_id,
+        BatchStatus.QUEUED,
+        result_version,
+        accepted_input_file_id,
+        accepted_input_sha256,
+        accepted_input_size_bytes,
+    )
+
+
+def test_pipeline_submission_requires_content_free_durable_takeover_proof():
+    valid = pipeline_submission()
+    assert valid.accepted_input_file_id == ACCEPTED_FILE_ID
+    assert valid.accepted_input_sha256 == "b" * 64
+    assert valid.accepted_input_size_bytes == 10
+    for changes in (
+        {"accepted_input_file_id": "not-a-uuid"},
+        {"accepted_input_sha256": "private document text"},
+        {"accepted_input_size_bytes": 0},
+    ):
+        with pytest.raises(ValueError):
+            pipeline_submission(**changes)
 
 
 def snapshot(state: RecoveryState = RecoveryState.ISSUED) -> RecoverySnapshot:
@@ -97,8 +131,22 @@ class Repo:
             acquired = False
         return RecoveryClaim("claim-123", "a" * 64, self.current, acquired)
 
-    async def complete(self, claim, *, corrected_input_version, result_batch_id, result_version, now):
+    async def complete(
+        self,
+        claim,
+        *,
+        corrected_input_version,
+        result_batch_id,
+        result_version,
+        accepted_input_file_id,
+        accepted_input_sha256,
+        accepted_input_size_bytes,
+        now,
+    ):
         self.complete_calls += 1
+        assert accepted_input_file_id == ACCEPTED_FILE_ID
+        assert accepted_input_sha256 == "b" * 64
+        assert accepted_input_size_bytes == 10
         self.current = replace(
             claim.snapshot,
             state=RecoveryState.COMPLETED,
@@ -132,7 +180,7 @@ class Storage:
         assert not allow_missing_marker and not allow_retired
         self.events.append("lock-enter")
         try:
-            yield object()
+            yield BatchLockLease(BATCH_ID, -1, lambda: True)
         finally:
             self.events.append("lock-exit")
 
@@ -213,7 +261,9 @@ class Runner:
         assert corrected.file_id != FILE_ID
         assert recovery_id == "claim-123"
         assert (source_batch_id, source_result_version, corrected_input_version) == (BATCH_ID, 2, 3)
-        return FullRecoveryPipelineSubmission(RESULT_BATCH_ID, BatchStatus.QUEUED, 3)
+        result = pipeline_submission()
+        self.reconciled = result
+        return result
 
     async def reconcile(self, recovery_id):
         self.reconcile_calls.append(recovery_id)
@@ -553,8 +603,11 @@ async def test_progress_callback_failure_never_aborts_or_leaks_into_recovery():
 @pytest.mark.parametrize(
     "submission",
     [
-        FullRecoveryPipelineSubmission(BATCH_ID, BatchStatus.QUEUED, 3),
-        FullRecoveryPipelineSubmission(RESULT_BATCH_ID, BatchStatus.QUEUED, 4),
+        pipeline_submission(BATCH_ID),
+        pipeline_submission(result_version=4),
+        pipeline_submission(accepted_input_file_id=FILE_ID),
+        pipeline_submission(accepted_input_sha256="c" * 64),
+        pipeline_submission(accepted_input_size_bytes=11),
     ],
 )
 async def test_runner_must_return_new_batch_and_exact_corrected_version(submission):
@@ -675,9 +728,7 @@ async def test_restart_reconciles_existing_runner_submission_without_duplicate_w
 
     repo.list_claimed = list_claimed
     service, _, detector, corrector, runner = coordinator(repo=repo)
-    runner.reconciled = FullRecoveryPipelineSubmission(
-        RESULT_BATCH_ID, BatchStatus.QUEUED, 3
-    )
+    runner.reconciled = pipeline_submission()
 
     result = await service.reconcile_incomplete(limit=10)
 
@@ -685,6 +736,44 @@ async def test_restart_reconciles_existing_runner_submission_without_duplicate_w
     assert runner.reconcile_calls == ["claim-123"]
     assert repo.current.state is RecoveryState.COMPLETED
     assert (detector.calls, corrector.calls, runner.calls) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_runner_takeover_survives_repository_completion_failure_and_restart():
+    class FailCompleteOnce(Repo):
+        failed_once = False
+
+        async def complete(self, *args, **kwargs):
+            if not self.failed_once:
+                self.failed_once = True
+                raise RuntimeError("database temporarily unavailable")
+            return await super().complete(*args, **kwargs)
+
+    repo = FailCompleteOnce()
+    service, guards, detector, corrector, runner = coordinator(repo=repo)
+    with pytest.raises(RecoveryServiceFailure):
+        await service.reparse(
+            OrientationRecoveryCommand(recovery_token="or_" + "x" * 32)
+        )
+    assert repo.current.state is RecoveryState.CLAIMED
+    assert (detector.calls, corrector.calls, runner.calls, guards.released) == (
+        1,
+        1,
+        1,
+        1,
+    )
+
+    repo.list_claimed = lambda **kwargs: _async_value(
+        (RecoveryClaim("claim-123", "a" * 64, repo.current, False),)
+    )
+    reconciled = await service.reconcile_incomplete(limit=1)
+    assert (reconciled.completed, reconciled.failed, reconciled.deferred) == (
+        1,
+        0,
+        0,
+    )
+    assert repo.current.state is RecoveryState.COMPLETED
+    assert (detector.calls, corrector.calls, runner.calls) == (1, 1, 1)
 
 
 @pytest.mark.asyncio
@@ -728,8 +817,8 @@ async def test_restart_defers_claim_when_runner_reconciliation_is_unavailable():
 @pytest.mark.parametrize(
     "submission",
     [
-        FullRecoveryPipelineSubmission(BATCH_ID, BatchStatus.QUEUED, 3),
-        FullRecoveryPipelineSubmission(RESULT_BATCH_ID, BatchStatus.QUEUED, 4),
+        pipeline_submission(BATCH_ID),
+        pipeline_submission(result_version=4),
         object(),
     ],
 )
