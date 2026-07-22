@@ -160,3 +160,33 @@ exit 0 (line-ending notices only)
 ### Follow-up disposition
 
 The implementation and Windows gates are ready. Task 9B should remain pending only until the same controller reviewer confirms the unchanged Ubuntu regression and Linux full gate on the committed head. No push, deployment, or Task 10 work is included.
+
+## Ubuntu verification at `5671b6e`
+
+The controller synchronized the clean committed head `5671b6e` to Ubuntu and reran the unchanged regression in a Python 3.11.15 Linux test container with the repository `src` tree explicitly selected through `PYTHONPATH`.
+
+```text
+pytest -q tests/test_retention.py::test_owned_root_deletion_leaks_and_preserves_a_concurrent_name_replacement
+1 passed
+
+pytest -q tests/test_artifacts.py tests/test_retention.py tests/test_file_intake.py
+all selected tests passed; 6 Windows-only tests skipped
+
+pytest -q -rs
+all repository tests passed; 10 Windows-only tests skipped
+
+python -m pip check
+No broken requirements found.
+
+python -m compileall -q src tests
+exit 0, no output
+
+git diff --check 6c3969d..HEAD
+exit 0, no output
+```
+
+The Ubuntu regression now preserves both the moved original and the concurrent same-name replacement. Together with the Windows `675 passed, 10 skipped` gate above, the implementation has fresh evidence on both supported development platforms and is ready for the final same-reviewer disposition.
+
+## Final same-reviewer disposition
+
+The original Task 9B reviewer inspected the bounded range `69021de..5671b6e`, including the parent-descriptor/name binding in `b4ecb1f`, with the fresh Windows and Ubuntu evidence above. Final verdict: **READY**. No Critical, Important, or Minor blocker remains.

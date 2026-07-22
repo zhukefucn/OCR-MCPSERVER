@@ -28,7 +28,7 @@
 - Produces: `_scrub_open_regular(descriptor, expected, path, *, parent_descriptor, name)` with pre/post name binding.
 - Produces: `_assert_regular_binding(descriptor, expected, path, *, parent_descriptor, name, require_empty)`.
 
-- [ ] **Step 1: Verify the existing Ubuntu regression is RED**
+- [x] **Step 1: Verify the existing Ubuntu regression is RED**
 
 Run on Linux:
 
@@ -38,7 +38,7 @@ Run on Linux:
 
 Expected: FAIL because `moved-original.zip` is truncated to `b''` while the replacement remains unchanged.
 
-- [ ] **Step 2: Preserve the injection while extending the internal contract**
+- [x] **Step 2: Preserve the injection while extending the internal contract**
 
 Update test subclasses to accept and forward `parent_descriptor` and `name` as keyword-only arguments:
 
@@ -58,7 +58,7 @@ def _scrub_open_regular(
 
 Do not alter the failure code or byte-preservation assertions.
 
-- [ ] **Step 3: Add the shared pre/post binding assertion**
+- [x] **Step 3: Add the shared pre/post binding assertion**
 
 The helper must inspect `fstat(descriptor)` and the current named entry. On POSIX:
 
@@ -72,7 +72,7 @@ named = os.stat(
 
 On Windows, use `os.lstat(path)` plus the existing final handle-path comparison. Require both objects to be non-reparse regular files with identity `expected`, require descriptor link count one, and when `require_empty=True` require descriptor size zero.
 
-- [ ] **Step 4: Call the assertion immediately around mutation**
+- [x] **Step 4: Call the assertion immediately around mutation**
 
 In `_scrub_open_regular`:
 
@@ -97,7 +97,7 @@ self._assert_regular_binding(
 )
 ```
 
-- [ ] **Step 5: Verify GREEN and safety regressions**
+- [x] **Step 5: Verify GREEN and safety regressions**
 
 Run on Linux:
 
@@ -124,7 +124,7 @@ Expected: all selected tests pass; Windows-only tests retain their platform skip
 - Consumes: exact Linux RED/GREEN and Linux/Windows gate output.
 - Produces: final controller evidence without replacing the current report.
 
-- [ ] **Step 1: Run focused Linux and Windows gates**
+- [x] **Step 1: Run focused Linux and Windows gates**
 
 Linux:
 
@@ -140,7 +140,7 @@ Windows:
 .\.venv\Scripts\python.exe -m pytest -p no:cacheprovider
 ```
 
-- [ ] **Step 2: Run auxiliary verification**
+- [x] **Step 2: Run auxiliary verification**
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip check
@@ -148,10 +148,10 @@ Windows:
 git diff --check
 ```
 
-- [ ] **Step 3: Append evidence and commit locally**
+- [x] **Step 3: Append evidence and commit locally**
 
 Append root cause, RED symptom, binding invariant, GREEN results, and no-push/no-deploy disposition. Commit implementation/tests separately from plan/report documentation.
 
-- [ ] **Step 4: Request same-reviewer review**
+- [x] **Step 4: Request same-reviewer review**
 
 Send commit hashes and both-platform evidence to the same controller reviewer for a final bounded review.
