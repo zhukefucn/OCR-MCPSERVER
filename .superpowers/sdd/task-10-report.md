@@ -67,3 +67,4 @@ exit 0, no output
 - MCP list-tools schema 原先没有显示 sources/page 数量约束。新增 schema 断言先以 `KeyError: minItems` 失败；工具签名现显式发布 sources `1..20` 和 pages `1..500`，运行时仍复用严格 DTO 处理唯一页码等不易用 JSON Schema 表达的约束。
 - 鉴权不再保存/比较可变长度原始 key。配置 key 与来访凭据先计算固定 32-byte SHA-256 digest，再对每个已配置 digest 执行 `hmac.compare_digest`；冲突的双凭据也使用固定长度 digest 比较。
 - 最终 focused API/MCP/settings/app：`119 passed`。
+- 最终提交后的仓库全套：`715 passed, 13 skipped in 12.01s`；`pip check`、`compileall -q src tests`、`git diff --check 1624c6b..HEAD` 均 exit 0，worktree clean。
