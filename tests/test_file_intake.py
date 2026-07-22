@@ -336,7 +336,7 @@ def test_process_shared_lock_prevents_cross_process_file_limit_race(
                 process.terminate()
                 process.join(timeout=5)
 
-    assert sorted(result[0] for result in results) == ["error", "stored"]
+    assert sorted(result[0] for result in results) == ["error", "stored"], results
     assert next(result[1] for result in results if result[0] == "error") == (
         "batch_capacity_exceeded"
     )

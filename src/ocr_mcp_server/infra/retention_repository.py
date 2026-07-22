@@ -70,14 +70,19 @@ class RetentionRepository:
         identity: tuple[int, int],
         *,
         created: bool,
+        recover_unbound: bool,
         allow_missing: bool,
     ) -> None:
         if (
             not _valid_batch_id(batch_id)
             or not isinstance(identity, tuple)
             or len(identity) != 2
-            or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in identity)
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in identity
+            )
             or not isinstance(created, bool)
+            or not isinstance(recover_unbound, bool)
             or not isinstance(allow_missing, bool)
         ):
             raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT) from None
@@ -90,7 +95,7 @@ class RetentionRepository:
                     raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT)
                 marker = await session.get(BatchLockMarkerRecord, batch_id)
                 if marker is None:
-                    if not created:
+                    if not (created or recover_unbound):
                         raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
                     session.add(
                         BatchLockMarkerRecord(batch_id=batch_id, identity=encoded)
@@ -410,6 +415,11 @@ class RetentionRepository:
                 await session.execute(delete(ArtifactRecord).where(ArtifactRecord.batch_id == claim.batch_id))
                 await session.execute(delete(StageEventRecord).where(StageEventRecord.file_id.in_(file_ids)))
                 await session.execute(delete(FileTaskRecord).where(FileTaskRecord.batch_id == claim.batch_id))
+                await session.execute(
+                    delete(BatchLockMarkerRecord).where(
+                        BatchLockMarkerRecord.batch_id == claim.batch_id
+                    )
+                )
                 await session.execute(delete(RetentionRecord).where(RetentionRecord.batch_id == claim.batch_id))
                 await session.execute(delete(BatchRecord).where(BatchRecord.id == claim.batch_id))
                 await session.commit()

@@ -104,7 +104,7 @@ class FileStorage:
 
             def lock_unchanged() -> bool:
                 try:
-                    if lock_dir is None:
+                    if root is None or lock_dir is None:
                         return False
                     info = (
                         os.stat(
@@ -116,7 +116,8 @@ class FileStorage:
                         else os.lstat(lock_dir.path / lock_name)
                     )
                     return (
-                        self._directory_unchanged(lock_dir)
+                        self._directory_unchanged(root)
+                        and self._directory_unchanged(lock_dir)
                         and not self._is_reparse(info)
                         and stat.S_ISREG(info.st_mode)
                         and self._identity(info) == lock_identity
@@ -126,33 +127,73 @@ class FileStorage:
 
             if not lock_unchanged():
                 raise OSError("unsafe batch lock")
-            if created:
-                self._write_all(descriptor, b"\0")
-                os.fsync(descriptor)
-            elif os.fstat(descriptor).st_size == 0:
-                raise OSError("unknown empty batch lock")
-            while not acquired:
-                acquired = self._try_batch_lock(descriptor)
-                if not acquired:
-                    await asyncio.sleep(0.01)
-            if not lock_unchanged():
-                raise OSError("unsafe batch lock")
+
+            def read_locked_marker() -> bytes:
+                info = os.fstat(descriptor)
+                if (
+                    self._is_reparse(info)
+                    or not stat.S_ISREG(info.st_mode)
+                    or info.st_nlink != 1
+                    or self._identity(info) != lock_identity
+                    or not lock_unchanged()
+                ):
+                    raise OSError("unsafe batch lock")
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                marker = os.read(descriptor, 2)
+                after = os.fstat(descriptor)
+                if (
+                    self._is_reparse(after)
+                    or not stat.S_ISREG(after.st_mode)
+                    or after.st_nlink != 1
+                    or self._identity(after) != lock_identity
+                    or after.st_size != len(marker)
+                    or not lock_unchanged()
+                ):
+                    raise OSError("unsafe batch lock")
+                return marker
+
+            initialization_attempts = 0
+            while True:
+                while not acquired:
+                    acquired = self._try_batch_lock(descriptor)
+                    if not acquired:
+                        await asyncio.sleep(0.01)
+                if not lock_unchanged():
+                    raise OSError("unsafe batch lock")
+                marker = read_locked_marker()
+                if created:
+                    if marker:
+                        raise OSError("invalid new batch lock")
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    self._write_all(descriptor, b"\0")
+                    os.fsync(descriptor)
+                    marker = read_locked_marker()
+                    break
+                if marker:
+                    break
+                initialization_attempts += 1
+                if initialization_attempts >= 100:
+                    raise OSError("uninitialized batch lock")
+                self._release_batch_lock(descriptor)
+                acquired = False
+                await asyncio.sleep(0.01)
+
+            recover_unbound = not created and marker == b"\x00"
             await marker_registry.bind_lock_marker(
                 canonical_batch_id,
                 lock_identity,
                 created=created,
+                recover_unbound=recover_unbound,
                 allow_missing=allow_missing_marker,
             )
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            marker = os.read(descriptor, 1)
+            marker = read_locked_marker()
+            if (created or recover_unbound) and marker != b"\x00":
+                raise OSError("batch lock changed during binding")
             if marker == b"\x01":
                 if not allow_retired:
                     raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
-            else:
-                os.lseek(descriptor, 0, os.SEEK_SET)
-                self._write_all(descriptor, b"\0")
-                os.ftruncate(descriptor, 1)
-                os.fsync(descriptor)
+            elif marker != b"\x00":
+                raise OSError("invalid batch lock marker")
             yield BatchLockLease(descriptor, lock_unchanged)
             if not lock_unchanged():
                 raise OSError("unsafe batch lock")
