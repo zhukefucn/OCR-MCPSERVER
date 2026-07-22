@@ -203,6 +203,22 @@ def test_upload_rejects_duplicate_transport_headers_before_gateway() -> None:
         assert gateway.upload_called is False
 
 
+def test_upload_rejects_duplicate_content_length_before_gateway() -> None:
+    gateway = FakeGateway()
+    headers = [
+        ("X-API-Key", KEY),
+        ("X-Document-Name", "statement.pdf"),
+        ("Content-Type", "application/pdf"),
+        ("Content-Length", "4"),
+        ("Content-Length", "4"),
+    ]
+    with client(gateway) as api:
+        response = api.post("/v1/uploads", headers=headers, content=b"%PDF")
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert gateway.upload_called is False
+
+
 def test_rest_workflow_uses_strict_contracts_and_explicit_operation_ids() -> None:
     gateway = FakeGateway()
     file_id = str(uuid4())

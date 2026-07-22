@@ -88,7 +88,10 @@ async def upload_document(request: Request) -> UploadReceipt:
     media_type = raw_media_type.partition(";")[0].strip().lower()
     if media_type not in _MEDIA_TYPES:
         raise GatewayUnsupportedMediaType()
-    raw_length = request.headers.get("content-length")
+    content_lengths = _raw_header_values(request, b"content-length")
+    if len(content_lengths) > 1:
+        raise GatewayInvalidRequest()
+    raw_length = content_lengths[0] if content_lengths else None
     try:
         content_length = None if raw_length is None else int(raw_length)
     except ValueError:

@@ -125,8 +125,6 @@ def _require_gateway(gateway: DocumentGateway | None) -> DocumentGateway:
 async def _safe_call(awaitable):
     try:
         return await awaitable
-    except ToolError:
-        raise
     except GatewayFailure as exc:
         raise ToolError(f"{exc.code}: {exc.safe_message}") from None
     except Exception:

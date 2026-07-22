@@ -84,6 +84,13 @@ class LeakyOutputGateway(FakeGateway):
         }
 
 
+class ToolErrorGateway(FakeGateway):
+    async def parse_documents(self, request, *, progress=None):
+        from fastmcp.exceptions import ToolError
+
+        raise ToolError("private-customer-filename.pdf")
+
+
 def test_project_pins_fastmcp_2_without_heavy_ocr_dependencies() -> None:
     metadata = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     dependencies = metadata["project"]["dependencies"]
@@ -263,6 +270,23 @@ async def test_mcp_protocol_masks_schema_validation_unknown_tool_and_output() ->
                 await client.call_tool(tool_name, arguments)
         assert str(exc_info.value) == expected
         assert sensitive not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_mcp_masks_tool_error_raised_by_gateway_implementation() -> None:
+    from fastmcp import Client
+    from fastmcp.exceptions import ToolError
+    from ocr_mcp_server.api.mcp import create_mcp_server
+
+    async with Client(create_mcp_server(ToolErrorGateway())) as client:
+        with pytest.raises(ToolError) as exc_info:
+            await client.call_tool(
+                "parse_documents", {"sources": [{"file_id": str(uuid4())}]}
+            )
+    assert str(exc_info.value) == (
+        "internal_error: The request could not be completed."
+    )
+    assert "private-customer-filename.pdf" not in str(exc_info.value)
 
 
 @pytest.mark.asyncio
