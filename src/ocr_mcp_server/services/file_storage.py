@@ -1,4 +1,11 @@
-"""Symlink-resistant, server-named storage for validated incoming files."""
+"""Handle-anchored, server-named storage for validated incoming files.
+
+``data_root`` is the trust anchor and must be writable only by the service
+account. POSIX descendants are opened component-by-component with ``dir_fd``
+and ``O_NOFOLLOW``. Windows keeps directory and staged-file handles open,
+publishes through ``SetFileInformationByHandle``, and fails safely whenever
+the configured pathname no longer identifies the held directory.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +13,7 @@ import asyncio
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 import ctypes
+from ctypes import wintypes
 from dataclasses import dataclass
 import errno
 import hashlib
@@ -31,6 +39,7 @@ class BatchUsage:
 class _OpenedDirectory:
     path: Path
     descriptor: int | None
+    windows_handle: int | None
     identity: tuple[int, int]
 
 
@@ -51,60 +60,50 @@ class FileStorage:
         """Hold a process-shared exclusive lock for one canonical batch UUID."""
 
         canonical_batch_id = self._canonical_uuid(batch_id)
-        lock_dir = self._data_root / ".locks"
-        self._assert_contained(lock_dir)
-        self._ensure_directory(lock_dir)
-        self._assert_safe_chain(lock_dir)
-        lock_path = lock_dir / f"{canonical_batch_id}.lock"
-        flags = os.O_RDWR | os.O_CREAT
-        flags |= getattr(os, "O_BINARY", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        open_failure: FileIntakeFailure | None = None
+        root: _OpenedDirectory | None = None
+        lock_dir: _OpenedDirectory | None = None
         descriptor: int | None = None
-        try:
-            if os.path.lexists(lock_path) and self._is_reparse(os.lstat(lock_path)):
-                raise OSError("reparse lock file")
-            descriptor = os.open(lock_path, flags, 0o600)
-            lock_info = os.stat(lock_path, follow_symlinks=False)
-            if self._is_reparse(lock_info) or self._identity(
-                lock_info
-            ) != self._identity(os.fstat(descriptor)):
-                raise OSError("lock identity changed")
-            if os.fstat(descriptor).st_size == 0:
-                os.write(descriptor, b"\0")
-                os.fsync(descriptor)
-        except OSError:
-            open_failure = FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
-        if open_failure is not None:
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-            raise open_failure
-
         acquired = False
         primary: BaseException | None = None
+        cleanup_failed = False
         try:
+            root = self._open_data_root(create=True)
+            if root is None:
+                raise OSError("data root unavailable")
+            lock_dir = self._open_child_directory(root, ".locks", create=True)
+            if lock_dir is None:
+                raise OSError("lock directory unavailable")
+            descriptor = self._open_lock_file(
+                lock_dir, f"{canonical_batch_id}.lock"
+            )
+            if os.fstat(descriptor).st_size == 0:
+                self._write_all(descriptor, b"\0")
+                os.fsync(descriptor)
             while not acquired:
                 acquired = self._try_batch_lock(descriptor)
                 if not acquired:
                     await asyncio.sleep(0.01)
             yield
+        except FileIntakeFailure as exc:
+            primary = exc
         except OSError:
             primary = FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
         except BaseException as exc:
             primary = exc
-        cleanup_failed = False
-        if acquired:
+
+        if descriptor is not None and acquired:
             try:
                 self._release_batch_lock(descriptor)
             except OSError:
                 cleanup_failed = True
-        try:
-            os.close(descriptor)
-        except OSError:
-            cleanup_failed = True
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                cleanup_failed = True
+        self._close_directory(lock_dir)
+        self._close_directory(root)
+
         if primary is not None:
             if isinstance(primary, FileIntakeFailure):
                 self._clear_exception_context(primary)
@@ -120,21 +119,23 @@ class FileStorage:
         max_file_size_bytes: int,
         validator: FileValidator,
     ) -> StoredFile:
-        input_dir = self._input_dir(batch_id)
-        self._ensure_directory(input_dir)
-        self._assert_safe_chain(input_dir)
-        directory = self._open_directory(input_dir)
-        part_name = f".{uuid4()}.part"
-        part_path = input_dir / part_name
-        digest = hashlib.sha256()
-        size_bytes = 0
+        directory: _OpenedDirectory | None = None
         descriptor: int | None = None
         staged_identity: tuple[int, int] | None = None
+        part_name = f".{uuid4()}.part"
+        published = False
         result: StoredFile | None = None
         failure: BaseException | None = None
+        digest = hashlib.sha256()
+        size_bytes = 0
+
         try:
+            directory = self._open_input_directory(batch_id, create=True)
+            if directory is None:
+                raise OSError("input directory unavailable")
             descriptor = self._open_part(directory, part_name)
             staged_identity = self._identity(os.fstat(descriptor))
+
             async for chunk in incoming.content:
                 if not isinstance(chunk, (bytes, bytearray, memoryview)):
                     raise FileIntakeFailure(FileIntakeErrorCode.INVALID_DOCUMENT)
@@ -153,14 +154,14 @@ class FileStorage:
                 declared_mime=incoming.declared_mime,
             )
             sha256 = digest.hexdigest()
-            if self._id_factory is None:
-                file_id = str(uuid5(UUID(batch_id), sha256))
-            else:
-                file_id = self._canonical_uuid(str(self._id_factory()))
-            if not self._directory_unchanged(directory):
-                raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+            file_id = (
+                str(uuid5(UUID(batch_id), sha256))
+                if self._id_factory is None
+                else self._canonical_uuid(str(self._id_factory()))
+            )
+
             duplicate = self._find_duplicate(
-                input_dir,
+                directory,
                 sha256=sha256,
                 size_bytes=size_bytes,
                 metadata=metadata,
@@ -169,19 +170,31 @@ class FileStorage:
                 result = duplicate
             else:
                 target_name = f"{file_id}{metadata.extension}"
-                target = input_dir / target_name
-                self._assert_contained(target)
-                self._assert_staged_identity(directory, part_name, descriptor)
-                if os.name == "nt":
-                    os.close(descriptor)
-                    descriptor = None
-                self._publish_no_replace(directory, part_name, target_name)
+                self._assert_staged_identity(
+                    directory, part_name, descriptor, staged_identity
+                )
+                self._publish_no_replace(
+                    directory,
+                    part_name,
+                    target_name,
+                    descriptor=descriptor,
+                )
+                published = True
                 if not self._directory_unchanged(directory):
-                    self._unlink_name(directory, target_name, missing_ok=True)
+                    self._unlink_name(
+                        directory,
+                        target_name,
+                        descriptor=descriptor if os.name == "nt" else None,
+                        missing_ok=True,
+                    )
+                    published = False
                     raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+                self._assert_published_identity(
+                    directory, target_name, descriptor, staged_identity
+                )
                 result = StoredFile(
                     file_id=file_id,
-                    path=target,
+                    path=directory.path / target_name,
                     sha256=sha256,
                     size_bytes=size_bytes,
                     media_type=metadata.media_type,
@@ -194,265 +207,331 @@ class FileStorage:
             failure = exc
         except Exception:
             failure = FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
-        finally:
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    if failure is None:
-                        failure = FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
-            if staged_identity is not None:
-                self._cleanup_staged_name(directory, part_name, staged_identity)
-            if directory.descriptor is not None:
-                try:
-                    os.close(directory.descriptor)
-                except OSError:
-                    if failure is None and result is None:
-                        failure = FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+
+        cleanup_failed = False
+        if descriptor is not None and not published and staged_identity is not None:
+            cleanup_failed = not self._cleanup_staged_name(
+                directory,
+                part_name,
+                staged_identity,
+                descriptor=descriptor,
+            )
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                cleanup_failed = True
+        self._close_directory(directory)
 
         if failure is not None:
             if isinstance(failure, FileIntakeFailure):
                 self._clear_exception_context(failure)
             raise failure
-        if result is None:
+        if cleanup_failed or result is None:
             raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
         return result
 
     def batch_usage(self, batch_id: str) -> BatchUsage:
-        input_dir = self._input_dir(batch_id)
-        self._assert_safe_existing_chain(input_dir)
-        if not input_dir.exists():
-            return BatchUsage(file_count=0, total_bytes=0)
-        if not input_dir.is_dir() or input_dir.is_symlink():
-            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
-
+        directory: _OpenedDirectory | None = None
+        failure: FileIntakeFailure | None = None
         file_count = 0
         total_bytes = 0
-        scan_failed = False
         try:
-            with os.scandir(input_dir) as entries:
-                for entry in entries:
-                    if not entry.is_file(follow_symlinks=False):
-                        continue
-                    path = Path(entry.path)
-                    if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-                        continue
-                    try:
-                        if self._canonical_uuid(path.stem) != path.stem:
-                            continue
-                    except FileIntakeFailure:
+            directory = self._open_input_directory(batch_id, create=False)
+            if directory is None:
+                return BatchUsage(file_count=0, total_bytes=0)
+            for name in self._list_names(directory):
+                path = Path(name)
+                if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                    continue
+                try:
+                    self._canonical_uuid(path.stem)
+                except FileIntakeFailure:
+                    continue
+                descriptor = self._open_existing_file(directory, name)
+                try:
+                    info = os.fstat(descriptor)
+                    if not stat.S_ISREG(info.st_mode):
                         continue
                     file_count += 1
-                    total_bytes += entry.stat(follow_symlinks=False).st_size
+                    total_bytes += info.st_size
+                finally:
+                    os.close(descriptor)
+            if not self._directory_unchanged(directory):
+                raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+        except FileIntakeFailure as exc:
+            failure = exc
         except OSError:
-            scan_failed = True
-        if scan_failed:
-            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+            failure = FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+        finally:
+            self._close_directory(directory)
+
+        if failure is not None:
+            self._clear_exception_context(failure)
+            raise failure
         return BatchUsage(file_count=file_count, total_bytes=total_bytes)
 
     def _find_duplicate(
         self,
-        input_dir: Path,
+        directory: _OpenedDirectory,
         *,
         sha256: str,
         size_bytes: int,
         metadata: ValidatedFileMetadata,
     ) -> StoredFile | None:
-        try:
-            with os.scandir(input_dir) as entries:
-                for entry in entries:
-                    if not entry.is_file(follow_symlinks=False):
-                        continue
-                    candidate = Path(entry.path)
-                    if candidate.suffix.lower() not in SUPPORTED_EXTENSIONS:
-                        continue
-                    try:
-                        candidate_id = self._canonical_uuid(candidate.stem)
-                    except FileIntakeFailure:
-                        continue
-                    info = entry.stat(follow_symlinks=False)
-                    if info.st_size != size_bytes:
-                        continue
-                    if self._hash_file(candidate) != sha256:
-                        continue
-                    return StoredFile(
-                        file_id=candidate_id,
-                        path=candidate,
-                        sha256=sha256,
-                        size_bytes=size_bytes,
-                        media_type=metadata.media_type,
-                        extension=candidate.suffix.lower(),
-                        page_count=metadata.page_count,
-                        width=metadata.width,
-                        height=metadata.height,
-                    )
-        except FileIntakeFailure:
-            raise
-        except OSError:
-            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH) from None
+        if not self._directory_unchanged(directory):
+            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+        for name in self._list_names(directory):
+            candidate = Path(name)
+            if candidate.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                continue
+            try:
+                candidate_id = self._canonical_uuid(candidate.stem)
+            except FileIntakeFailure:
+                continue
+            descriptor = self._open_existing_file(directory, name)
+            try:
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode) or info.st_size != size_bytes:
+                    continue
+                if self._hash_descriptor(descriptor) != sha256:
+                    continue
+                self._assert_name_identity(directory, name, self._identity(info))
+                if not self._directory_unchanged(directory):
+                    raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+                return StoredFile(
+                    file_id=candidate_id,
+                    path=directory.path / name,
+                    sha256=sha256,
+                    size_bytes=size_bytes,
+                    media_type=metadata.media_type,
+                    extension=candidate.suffix.lower(),
+                    page_count=metadata.page_count,
+                    width=metadata.width,
+                    height=metadata.height,
+                )
+            finally:
+                os.close(descriptor)
+        if not self._directory_unchanged(directory):
+            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
         return None
 
-    @staticmethod
-    def _hash_file(path: Path) -> str:
-        digest = hashlib.sha256()
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(path, flags)
-        with os.fdopen(descriptor, "rb") as stream:
-            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-                raise OSError("not a regular file")
-            while chunk := stream.read(1024 * 1024):
-                digest.update(chunk)
-        return digest.hexdigest()
+    def _open_data_root(self, *, create: bool) -> _OpenedDirectory | None:
+        if not os.path.lexists(self._data_root):
+            if not create:
+                return None
+            self._ensure_directory(self._data_root)
+        return self._open_directory(self._data_root)
 
-    def _input_dir(self, batch_id: str) -> Path:
+    def _open_input_directory(
+        self,
+        batch_id: str,
+        *,
+        create: bool,
+    ) -> _OpenedDirectory | None:
         canonical_batch_id = self._canonical_uuid(batch_id)
-        candidate = self._data_root / canonical_batch_id / "input"
-        self._assert_contained(candidate)
-        return candidate
-
-    @staticmethod
-    def _canonical_uuid(value: str) -> str:
-        invalid = False
+        root = self._open_data_root(create=create)
+        if root is None:
+            return None
+        batch: _OpenedDirectory | None = None
         try:
-            canonical = str(UUID(value))
-        except (ValueError, AttributeError, TypeError):
-            invalid = True
-            canonical = ""
-        if invalid:
-            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
-        if canonical != value:
-            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
-        return canonical
+            batch = self._open_child_directory(
+                root, canonical_batch_id, create=create
+            )
+            if batch is None:
+                return None
+            return self._open_child_directory(batch, "input", create=create)
+        finally:
+            self._close_directory(batch)
+            self._close_directory(root)
 
-    def _assert_contained(self, candidate: Path) -> None:
-        invalid = False
-        try:
-            common = os.path.commonpath((self._data_root, candidate.absolute()))
-        except (OSError, ValueError):
-            invalid = True
-            common = ""
-        if invalid:
-            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
-        if Path(common) != self._data_root:
-            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+    def _open_child_directory(
+        self,
+        parent: _OpenedDirectory,
+        name: str,
+        *,
+        create: bool,
+    ) -> _OpenedDirectory | None:
+        child_path = parent.path / name
+        if parent.descriptor is not None:
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(name, flags, dir_fd=parent.descriptor)
+            except FileNotFoundError:
+                if not create:
+                    return None
+                try:
+                    os.mkdir(name, mode=0o700, dir_fd=parent.descriptor)
+                except FileExistsError:
+                    pass
+                descriptor = os.open(name, flags, dir_fd=parent.descriptor)
+            info = os.fstat(descriptor)
+            if not stat.S_ISDIR(info.st_mode):
+                os.close(descriptor)
+                raise OSError("child is not a directory")
+            return _OpenedDirectory(
+                path=child_path,
+                descriptor=descriptor,
+                windows_handle=None,
+                identity=self._identity(info),
+            )
 
-    def _ensure_directory(self, directory: Path) -> None:
-        failure: FileIntakeFailure | None = None
-        current = Path(directory.anchor)
-        try:
-            for part in directory.parts[1:]:
-                current /= part
-                if os.path.lexists(current):
-                    info = os.lstat(current)
-                    if self._is_reparse(info) or not stat.S_ISDIR(info.st_mode):
-                        raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
-                else:
-                    current.mkdir(mode=0o700)
-        except FileIntakeFailure as exc:
-            failure = exc
-        except OSError:
-            failure = FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
-        if failure is not None:
-            self._clear_exception_context(failure)
-            raise failure
-
-    @classmethod
-    def _assert_safe_existing_chain(cls, path: Path) -> None:
-        failure: FileIntakeFailure | None = None
-        current = Path(path.anchor)
-        try:
-            for part in path.parts[1:]:
-                current /= part
-                if not os.path.lexists(current):
-                    return
-                if cls._is_reparse(os.lstat(current)):
-                    raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
-        except FileIntakeFailure as exc:
-            failure = exc
-        except OSError:
-            failure = FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
-        if failure is not None:
-            cls._clear_exception_context(failure)
-            raise failure
-
-    def _assert_safe_chain(self, path: Path) -> None:
-        self._assert_safe_existing_chain(path)
+        if not self._directory_unchanged(parent):
+            raise OSError("parent identity changed")
+        if not os.path.lexists(child_path):
+            if not create:
+                return None
+            try:
+                child_path.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+        child = self._open_directory(child_path)
+        if not self._directory_unchanged(parent):
+            self._close_directory(child)
+            raise OSError("parent identity changed")
+        return child
 
     def _open_directory(self, path: Path) -> _OpenedDirectory:
-        failure: FileIntakeFailure | None = None
-        try:
-            path_info = os.stat(path, follow_symlinks=False)
-            if self._is_reparse(path_info) or not stat.S_ISDIR(path_info.st_mode):
-                raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
-            descriptor: int | None = None
-            if os.name != "nt":
-                flags = os.O_RDONLY
-                flags |= getattr(os, "O_DIRECTORY", 0)
-                flags |= getattr(os, "O_NOFOLLOW", 0)
-                descriptor = os.open(path, flags)
-                descriptor_info = os.fstat(descriptor)
-                if self._identity(descriptor_info) != self._identity(path_info):
-                    os.close(descriptor)
-                    raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+        if os.name == "nt":
+            handle = self._windows_open_directory_handle(path)
+            try:
+                identity = self._windows_handle_identity(handle)
+            except BaseException:
+                self._windows_close_handle(handle)
+                raise
             return _OpenedDirectory(
                 path=path,
-                descriptor=descriptor,
-                identity=self._identity(path_info),
+                descriptor=None,
+                windows_handle=handle,
+                identity=identity,
             )
-        except FileIntakeFailure as exc:
-            failure = exc
-        except OSError:
-            failure = FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
-        if failure is not None:
-            self._clear_exception_context(failure)
-            raise failure
 
-    @staticmethod
-    def _open_part(directory: _OpenedDirectory, name: str) -> int:
-        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
-        flags |= getattr(os, "O_BINARY", 0)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode):
+            os.close(descriptor)
+            raise OSError("not a directory")
+        return _OpenedDirectory(
+            path=path,
+            descriptor=descriptor,
+            windows_handle=None,
+            identity=self._identity(info),
+        )
+
+    def _open_part(self, directory: _OpenedDirectory, name: str) -> int:
         if directory.descriptor is not None:
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_NOFOLLOW", 0)
             return os.open(name, flags, 0o600, dir_fd=directory.descriptor)
-        return os.open(directory.path / name, flags, 0o600)
+        if not self._directory_unchanged(directory):
+            raise OSError("directory identity changed")
+        descriptor = self._windows_open_file_descriptor(
+            directory.path / name,
+            create=True,
+            delete_access=True,
+        )
+        if not self._directory_unchanged(directory):
+            self._unlink_name(
+                directory, name, descriptor=descriptor, missing_ok=True
+            )
+            os.close(descriptor)
+            raise OSError("directory identity changed")
+        return descriptor
 
-    @staticmethod
-    def _write_all(descriptor: int, chunk: bytes | bytearray | memoryview) -> None:
-        remaining = memoryview(chunk)
-        while remaining:
-            written = os.write(descriptor, remaining)
-            if written < 1:
-                raise OSError("short write")
-            remaining = remaining[written:]
+    def _open_lock_file(self, directory: _OpenedDirectory, name: str) -> int:
+        if directory.descriptor is not None:
+            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+            return os.open(name, flags, 0o600, dir_fd=directory.descriptor)
+        if not self._directory_unchanged(directory):
+            raise OSError("directory identity changed")
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
+        descriptor = os.open(directory.path / name, flags, 0o600)
+        if not self._directory_unchanged(directory):
+            os.close(descriptor)
+            raise OSError("directory identity changed")
+        return descriptor
 
-    @staticmethod
-    def _duplicate_reader(descriptor: int):
-        duplicate = os.dup(descriptor)
-        os.lseek(duplicate, 0, os.SEEK_SET)
-        return os.fdopen(duplicate, "rb")
+    def _open_existing_file(self, directory: _OpenedDirectory, name: str) -> int:
+        if directory.descriptor is not None:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            return os.open(name, flags, dir_fd=directory.descriptor)
+        if not self._directory_unchanged(directory):
+            raise OSError("directory identity changed")
+        descriptor = self._windows_open_file_descriptor(
+            directory.path / name,
+            create=False,
+            delete_access=False,
+        )
+        if not self._directory_unchanged(directory):
+            os.close(descriptor)
+            raise OSError("directory identity changed")
+        return descriptor
+
+    def _list_names(self, directory: _OpenedDirectory) -> list[str]:
+        if directory.descriptor is not None:
+            return [os.fsdecode(name) for name in os.listdir(directory.descriptor)]
+        if not self._directory_unchanged(directory):
+            raise OSError("directory identity changed")
+        with os.scandir(directory.path) as entries:
+            names = [entry.name for entry in entries]
+        if not self._directory_unchanged(directory):
+            raise OSError("directory identity changed")
+        return names
 
     def _assert_staged_identity(
         self,
         directory: _OpenedDirectory,
         name: str,
         descriptor: int,
+        expected_identity: tuple[int, int],
     ) -> None:
-        failure: FileIntakeFailure | None = None
-        try:
-            current = self._stat_name(directory, name)
-            if self._is_reparse(current):
-                raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
-            if self._identity(current) != self._identity(os.fstat(descriptor)):
-                raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
-        except FileIntakeFailure as exc:
-            failure = exc
-        except OSError:
-            failure = FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
-        if failure is not None:
-            self._clear_exception_context(failure)
-            raise failure
+        self._assert_name_identity(directory, name, expected_identity)
+        if self._identity(os.fstat(descriptor)) != expected_identity:
+            raise OSError("staged descriptor identity changed")
+
+    def _assert_published_identity(
+        self,
+        directory: _OpenedDirectory,
+        name: str,
+        descriptor: int,
+        expected_identity: tuple[int, int],
+    ) -> None:
+        self._assert_name_identity(directory, name, expected_identity)
+        if self._identity(os.fstat(descriptor)) != expected_identity:
+            raise OSError("published descriptor identity changed")
+
+    def _assert_name_identity(
+        self,
+        directory: _OpenedDirectory,
+        name: str,
+        expected_identity: tuple[int, int],
+    ) -> None:
+        if directory.descriptor is not None:
+            info = os.stat(name, dir_fd=directory.descriptor, follow_symlinks=False)
+        else:
+            if not self._directory_unchanged(directory):
+                raise OSError("directory identity changed")
+            info = os.stat(directory.path / name, follow_symlinks=False)
+            if self._is_reparse(info) or not self._directory_unchanged(directory):
+                raise OSError("name is reparse or directory changed")
+        if self._identity(info) != expected_identity:
+            raise OSError("name identity changed")
 
     def _directory_unchanged(self, directory: _OpenedDirectory) -> bool:
+        if directory.windows_handle is not None:
+            try:
+                current = self._windows_open_directory_handle(directory.path)
+            except OSError:
+                return False
+            try:
+                return self._windows_handle_identity(current) == directory.identity
+            except OSError:
+                return False
+            finally:
+                self._windows_close_handle(current)
         try:
             current = os.stat(directory.path, follow_symlinks=False)
         except OSError:
@@ -468,9 +547,15 @@ class FileStorage:
         directory: _OpenedDirectory,
         source_name: str,
         target_name: str,
+        *,
+        descriptor: int | None = None,
     ) -> None:
-        if os.name == "nt":
-            os.rename(directory.path / source_name, directory.path / target_name)
+        if directory.windows_handle is not None:
+            if descriptor is None:
+                raise OSError("staged handle required")
+            self._windows_rename_open_file(
+                descriptor, directory.windows_handle, target_name
+            )
             return
         if sys.platform.startswith("linux") and directory.descriptor is not None:
             if self._linux_rename_noreplace(
@@ -527,6 +612,8 @@ class FileStorage:
                 follow_symlinks=False,
             )
         else:
+            if not self._directory_unchanged(directory):
+                raise OSError("directory identity changed")
             os.link(
                 directory.path / source_name,
                 directory.path / target_name,
@@ -546,44 +633,108 @@ class FileStorage:
 
     def _cleanup_staged_name(
         self,
-        directory: _OpenedDirectory,
+        directory: _OpenedDirectory | None,
         name: str,
         expected_identity: tuple[int, int],
-    ) -> None:
-        try:
-            current = self._stat_name(directory, name)
-        except FileNotFoundError:
-            return
-        except OSError:
-            return
-        if self._is_reparse(current) or self._identity(current) != expected_identity:
-            return
-        try:
-            self._unlink_name(directory, name, missing_ok=True)
-        except OSError:
-            pass
+        *,
+        descriptor: int,
+    ) -> bool:
+        if directory is None:
+            return False
+        if directory.windows_handle is None:
+            try:
+                info = os.stat(
+                    name, dir_fd=directory.descriptor, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                return True
+            except OSError:
+                return False
+            if self._is_reparse(info) or self._identity(info) != expected_identity:
+                return False
+        for _ in range(2):
+            try:
+                self._unlink_name(
+                    directory,
+                    name,
+                    descriptor=descriptor if os.name == "nt" else None,
+                    missing_ok=True,
+                )
+                return True
+            except OSError:
+                continue
+        return False
 
-    @staticmethod
-    def _stat_name(directory: _OpenedDirectory, name: str) -> os.stat_result:
-        if directory.descriptor is not None:
-            return os.stat(name, dir_fd=directory.descriptor, follow_symlinks=False)
-        return os.stat(directory.path / name, follow_symlinks=False)
-
-    @staticmethod
     def _unlink_name(
+        self,
         directory: _OpenedDirectory,
         name: str,
         *,
+        descriptor: int | None = None,
         missing_ok: bool = False,
     ) -> None:
+        if directory.windows_handle is not None and descriptor is not None:
+            self._windows_delete_open_file(descriptor)
+            return
         try:
             if directory.descriptor is not None:
                 os.unlink(name, dir_fd=directory.descriptor)
             else:
+                if not self._directory_unchanged(directory):
+                    raise OSError("directory identity changed")
                 os.unlink(directory.path / name)
         except FileNotFoundError:
             if not missing_ok:
                 raise
+
+    @staticmethod
+    def _write_all(descriptor: int, chunk: bytes | bytearray | memoryview) -> None:
+        remaining = memoryview(chunk)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written < 1:
+                raise OSError("short write")
+            remaining = remaining[written:]
+
+    @staticmethod
+    def _duplicate_reader(descriptor: int):
+        duplicate = os.dup(descriptor)
+        os.lseek(duplicate, 0, os.SEEK_SET)
+        return os.fdopen(duplicate, "rb")
+
+    @staticmethod
+    def _hash_descriptor(descriptor: int) -> str:
+        digest = hashlib.sha256()
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        return digest.hexdigest()
+
+    def _ensure_directory(self, directory: Path) -> None:
+        current = Path(directory.anchor)
+        for part in directory.parts[1:]:
+            current /= part
+            if os.path.lexists(current):
+                info = os.lstat(current)
+                if self._is_reparse(info) or not stat.S_ISDIR(info.st_mode):
+                    raise OSError("unsafe directory component")
+                continue
+            try:
+                current.mkdir(mode=0o700)
+            except FileExistsError:
+                info = os.lstat(current)
+                if self._is_reparse(info) or not stat.S_ISDIR(info.st_mode):
+                    raise OSError("unsafe directory race")
+
+    @staticmethod
+    def _canonical_uuid(value: str) -> str:
+        try:
+            canonical = str(UUID(value))
+        except (ValueError, AttributeError, TypeError):
+            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH) from None
+        if canonical != value:
+            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+        return canonical
 
     @staticmethod
     def _identity(info: os.stat_result) -> tuple[int, int]:
@@ -592,8 +743,21 @@ class FileStorage:
     @staticmethod
     def _is_reparse(info: os.stat_result) -> bool:
         reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-        file_attributes = getattr(info, "st_file_attributes", 0)
-        return stat.S_ISLNK(info.st_mode) or bool(file_attributes & reparse_flag)
+        return stat.S_ISLNK(info.st_mode) or bool(
+            getattr(info, "st_file_attributes", 0) & reparse_flag
+        )
+
+    @staticmethod
+    def _close_directory(directory: _OpenedDirectory | None) -> None:
+        if directory is None:
+            return
+        try:
+            if directory.descriptor is not None:
+                os.close(directory.descriptor)
+            elif directory.windows_handle is not None:
+                FileStorage._windows_close_handle(directory.windows_handle)
+        except OSError:
+            pass
 
     @staticmethod
     def _clear_exception_context(failure: FileIntakeFailure) -> None:
@@ -612,7 +776,6 @@ class FileStorage:
             except OSError:
                 return False
             return True
-
         import fcntl
 
         try:
@@ -629,7 +792,235 @@ class FileStorage:
 
             msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
             return
-
         import fcntl
 
         fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+    @staticmethod
+    def _windows_kernel32():
+        return ctypes.WinDLL("kernel32", use_last_error=True)
+
+    @classmethod
+    def _windows_open_directory_handle(cls, path: Path) -> int:
+        kernel32 = cls._windows_kernel32()
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        handle = create_file(
+            str(path),
+            0x80 | 0x0001,
+            0x1 | 0x2 | 0x4,
+            None,
+            3,
+            0x02000000 | 0x00200000,
+            None,
+        )
+        if handle == wintypes.HANDLE(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        attributes = wintypes.DWORD()
+        get_attributes = kernel32.GetFileInformationByHandleEx
+
+        class _AttributeTagInfo(ctypes.Structure):
+            _fields_ = (
+                ("FileAttributes", wintypes.DWORD),
+                ("ReparseTag", wintypes.DWORD),
+            )
+
+        attribute_info = _AttributeTagInfo()
+        get_attributes.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        get_attributes.restype = wintypes.BOOL
+        if not get_attributes(
+            handle,
+            9,
+            ctypes.byref(attribute_info),
+            ctypes.sizeof(attribute_info),
+        ):
+            cls._windows_close_handle(handle)
+            raise ctypes.WinError(ctypes.get_last_error())
+        if attribute_info.FileAttributes & 0x400:
+            cls._windows_close_handle(handle)
+            raise OSError("reparse directory")
+        return int(handle)
+
+    @classmethod
+    def _windows_handle_identity(cls, handle: int) -> tuple[int, int]:
+        kernel32 = cls._windows_kernel32()
+
+        class _ByHandleInfo(ctypes.Structure):
+            _fields_ = (
+                ("FileAttributes", wintypes.DWORD),
+                ("CreationTimeLow", wintypes.DWORD),
+                ("CreationTimeHigh", wintypes.DWORD),
+                ("LastAccessTimeLow", wintypes.DWORD),
+                ("LastAccessTimeHigh", wintypes.DWORD),
+                ("LastWriteTimeLow", wintypes.DWORD),
+                ("LastWriteTimeHigh", wintypes.DWORD),
+                ("VolumeSerialNumber", wintypes.DWORD),
+                ("FileSizeHigh", wintypes.DWORD),
+                ("FileSizeLow", wintypes.DWORD),
+                ("NumberOfLinks", wintypes.DWORD),
+                ("FileIndexHigh", wintypes.DWORD),
+                ("FileIndexLow", wintypes.DWORD),
+            )
+
+        info = _ByHandleInfo()
+        function = kernel32.GetFileInformationByHandle
+        function.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ByHandleInfo))
+        function.restype = wintypes.BOOL
+        if not function(handle, ctypes.byref(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        file_index = (info.FileIndexHigh << 32) | info.FileIndexLow
+        return info.VolumeSerialNumber, file_index
+
+    @classmethod
+    def _windows_open_file_descriptor(
+        cls,
+        path: Path,
+        *,
+        create: bool,
+        delete_access: bool,
+    ) -> int:
+        import msvcrt
+
+        kernel32 = cls._windows_kernel32()
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        access = 0x80000000
+        if create:
+            access |= 0x40000000
+        if delete_access:
+            access |= 0x00010000
+        handle = create_file(
+            str(path),
+            access,
+            0x1 | 0x2 | 0x4,
+            None,
+            1 if create else 3,
+            0x00200000,
+            None,
+        )
+        if handle == wintypes.HANDLE(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        flags = os.O_BINARY | (os.O_RDWR if create else os.O_RDONLY)
+        try:
+            return msvcrt.open_osfhandle(int(handle), flags)
+        except BaseException:
+            cls._windows_close_handle(int(handle))
+            raise
+
+    @classmethod
+    def _windows_rename_open_file(
+        cls,
+        descriptor: int,
+        directory_handle: int,
+        target_name: str,
+    ) -> None:
+        import msvcrt
+
+        stable_directory_path = cls._windows_final_path(directory_handle)
+        encoded_name = str(Path(stable_directory_path) / target_name).encode(
+            "utf-16-le"
+        )
+
+        class _RenameInfo(ctypes.Structure):
+            _fields_ = (
+                ("ReplaceIfExists", wintypes.BOOLEAN),
+                ("RootDirectory", wintypes.HANDLE),
+                ("FileNameLength", wintypes.DWORD),
+                ("FileName", wintypes.WCHAR * 1),
+            )
+
+        name_offset = _RenameInfo.FileName.offset
+        buffer = ctypes.create_string_buffer(name_offset + len(encoded_name) + 2)
+        info = ctypes.cast(buffer, ctypes.POINTER(_RenameInfo)).contents
+        info.ReplaceIfExists = False
+        info.RootDirectory = None
+        info.FileNameLength = len(encoded_name)
+        ctypes.memmove(
+            ctypes.addressof(buffer) + name_offset,
+            encoded_name,
+            len(encoded_name),
+        )
+        function = cls._windows_kernel32().SetFileInformationByHandle
+        function.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        function.restype = wintypes.BOOL
+        handle = msvcrt.get_osfhandle(descriptor)
+        if not function(handle, 3, buffer, len(buffer)):
+            error_number = ctypes.get_last_error()
+            if error_number in (80, 183):
+                raise FileExistsError(error_number, "target exists")
+            raise ctypes.WinError(error_number)
+
+    @classmethod
+    def _windows_final_path(cls, handle: int) -> str:
+        function = cls._windows_kernel32().GetFinalPathNameByHandleW
+        function.argtypes = (
+            wintypes.HANDLE,
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        )
+        function.restype = wintypes.DWORD
+        required = function(handle, None, 0, 0)
+        if required == 0:
+            raise ctypes.WinError(ctypes.get_last_error())
+        buffer = ctypes.create_unicode_buffer(required + 1)
+        written = function(handle, buffer, len(buffer), 0)
+        if written == 0 or written >= len(buffer):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return buffer.value
+
+    @classmethod
+    def _windows_delete_open_file(cls, descriptor: int) -> None:
+        import msvcrt
+
+        class _DispositionInfo(ctypes.Structure):
+            _fields_ = (("DeleteFile", wintypes.BOOLEAN),)
+
+        info = _DispositionInfo(True)
+        function = cls._windows_kernel32().SetFileInformationByHandle
+        function.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        function.restype = wintypes.BOOL
+        handle = msvcrt.get_osfhandle(descriptor)
+        if not function(handle, 4, ctypes.byref(info), ctypes.sizeof(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    @staticmethod
+    def _windows_close_handle(handle: int) -> None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        if not kernel32.CloseHandle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())

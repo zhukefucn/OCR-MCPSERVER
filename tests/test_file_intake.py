@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 import hashlib
 from io import BytesIO
+import multiprocessing
 from pathlib import Path
 from uuid import UUID, uuid4, uuid5
 
@@ -55,6 +56,35 @@ def _service(
         max_file_size_bytes=max_file_size_bytes,
         max_batch_size_bytes=max_batch_size_bytes,
     )
+
+
+def _subprocess_ingest(
+    data_root: str,
+    batch_id: str,
+    payload: bytes,
+    display_name: str,
+    start_event,
+    ready_queue,
+    result_queue,
+) -> None:
+    async def content() -> AsyncIterator[bytes]:
+        yield payload
+
+    ready_queue.put("ready")
+    start_event.wait(timeout=10)
+    try:
+        stored = asyncio.run(
+            _service(Path(data_root), max_files=1).ingest_upload(
+                batch_id,
+                IncomingFile(display_name, "application/pdf", content()),
+            )
+        )
+    except FileIntakeFailure as failure:
+        result_queue.put(("error", failure.code))
+    except BaseException as failure:
+        result_queue.put(("unexpected", type(failure).__name__))
+    else:
+        result_queue.put(("stored", stored.file_id))
 
 
 @pytest.mark.parametrize(
@@ -247,4 +277,55 @@ async def test_concurrent_equal_hash_uses_batch_scoped_deterministic_uuid(
 
     assert first == second
     assert first.file_id == expected_id
+    assert len(list((data_root / batch_id / "input").glob("*.pdf"))) == 1
+
+
+def test_process_shared_lock_prevents_cross_process_file_limit_race(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    start_event = context.Event()
+    ready_queue = context.Queue()
+    result_queue = context.Queue()
+    data_root = tmp_path / "data"
+    batch_id = str(uuid4())
+    first_payload = _pdf_bytes()
+    second_payload = first_payload + b"\n% distinct subprocess payload"
+    processes = [
+        context.Process(
+            target=_subprocess_ingest,
+            args=(
+                str(data_root),
+                batch_id,
+                payload,
+                display_name,
+                start_event,
+                ready_queue,
+                result_queue,
+            ),
+        )
+        for payload, display_name in (
+            (first_payload, "first.pdf"),
+            (second_payload, "second.pdf"),
+        )
+    ]
+    try:
+        for process in processes:
+            process.start()
+        assert [ready_queue.get(timeout=10) for _ in processes] == ["ready", "ready"]
+        start_event.set()
+        results = [result_queue.get(timeout=15) for _ in processes]
+        for process in processes:
+            process.join(timeout=15)
+            assert process.exitcode == 0
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    assert sorted(result[0] for result in results) == ["error", "stored"]
+    assert next(result[1] for result in results if result[0] == "error") == (
+        "batch_capacity_exceeded"
+    )
     assert len(list((data_root / batch_id / "input").glob("*.pdf"))) == 1

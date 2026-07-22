@@ -260,34 +260,153 @@ async def test_storage_never_validates_or_publishes_replaced_staged_name(
 async def test_publication_cleanup_fault_never_escapes_raw_oserror_or_leaves_part(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    original_unlink = Path.unlink
-    failed_once = False
+    storage = FileStorage(tmp_path / "data")
+    original_unlink = storage._unlink_name
+    fault_triggered = False
 
-    def fail_first_part_unlink(path: Path, *args, **kwargs):
-        nonlocal failed_once
-        if path.suffix == ".part" and not failed_once:
-            failed_once = True
+    def fail_first_part_unlink(
+        directory,
+        name: str,
+        *,
+        descriptor: int | None = None,
+        missing_ok: bool = False,
+    ):
+        nonlocal fault_triggered
+        if name.endswith(".part") and not fault_triggered:
+            fault_triggered = True
             raise OSError("sensitive cleanup filesystem detail")
-        return original_unlink(path, *args, **kwargs)
+        return original_unlink(
+            directory,
+            name,
+            descriptor=descriptor,
+            missing_ok=missing_ok,
+        )
 
-    monkeypatch.setattr(Path, "unlink", fail_first_part_unlink)
+    monkeypatch.setattr(storage, "_unlink_name", fail_first_part_unlink)
     data_root = tmp_path / "data"
     batch_id = str(uuid4())
-    try:
-        stored = await FileStorage(data_root).store(
+    with pytest.raises(FileIntakeFailure) as exc_info:
+        await storage.store(
             batch_id,
-            IncomingFile("document.pdf", "application/pdf", _chunks(_pdf_bytes())),
+            IncomingFile("document.pdf", "application/pdf", _chunks(b"invalid")),
             max_file_size_bytes=10_000,
             validator=_validator(),
         )
-    except FileIntakeFailure as failure:
-        assert failure.code == "path_unsafe"
-        assert failure.__context__ is None
-    else:
-        assert stored.path.exists()
 
+    assert exc_info.value.__context__ is None
+    assert fault_triggered is True
     input_dir = data_root / batch_id / "input"
     assert not list(input_dir.glob("*.part"))
+    assert not list(input_dir.glob("*.pdf"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle publication regression")
+async def test_windows_publication_uses_open_handle_after_staged_name_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root = tmp_path / "data"
+    batch_id = str(uuid4())
+    input_dir = data_root / batch_id / "input"
+    payload = _pdf_bytes()
+    storage = FileStorage(data_root)
+    original_publish = storage._windows_rename_open_file
+    swap_observed = False
+
+    def swap_name_then_publish(
+        descriptor: int, directory_handle: int, target_name: str
+    ) -> None:
+        nonlocal swap_observed
+        [part_path] = input_dir.glob("*.part")
+        held_path = input_dir / ".held-original"
+        part_path.rename(held_path)
+        part_path.write_bytes(b"attacker-controlled replacement")
+        swap_observed = True
+        original_publish(descriptor, directory_handle, target_name)
+        part_path.unlink()
+
+    monkeypatch.setattr(storage, "_windows_rename_open_file", swap_name_then_publish)
+
+    stored = await storage.store(
+        batch_id,
+        IncomingFile("document.pdf", "application/pdf", _chunks(payload)),
+        max_file_size_bytes=10_000,
+        validator=_validator(),
+    )
+
+    assert swap_observed is True
+    assert stored.path.read_bytes() == payload
+    assert not list(input_dir.glob("*.part"))
+    assert not (input_dir / ".held-original").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX anchored directory scan")
+def test_posix_batch_usage_never_uses_pathname_scandir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root = tmp_path / "data"
+    batch_id = str(uuid4())
+    input_dir = data_root / batch_id / "input"
+    input_dir.mkdir(parents=True)
+    (input_dir / f"{uuid4()}.pdf").write_bytes(b"123")
+
+    def forbidden_path_scan(path):
+        raise AssertionError("pathname scandir is forbidden")
+
+    monkeypatch.setattr(os, "scandir", forbidden_path_scan)
+
+    usage = FileStorage(data_root).batch_usage(batch_id)
+    assert (usage.file_count, usage.total_bytes) == (1, 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="POSIX anchored duplicate return")
+async def test_posix_duplicate_return_rejects_path_replaced_after_fd_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root = tmp_path / "data"
+    batch_id = str(uuid4())
+    input_dir = data_root / batch_id / "input"
+    moved_dir = data_root / batch_id / "input-held"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    payload = _pdf_bytes()
+    storage = FileStorage(data_root)
+    first = await storage.store(
+        batch_id,
+        IncomingFile("first.pdf", "application/pdf", _chunks(payload)),
+        max_file_size_bytes=10_000,
+        validator=_validator(),
+    )
+    original_listdir = os.listdir
+    swap_observed = False
+
+    def swap_after_fd_list(path):
+        nonlocal swap_observed
+        names = original_listdir(path)
+        if isinstance(path, int) and not swap_observed:
+            input_dir.rename(moved_dir)
+            os.symlink(outside, input_dir, target_is_directory=True)
+            swap_observed = True
+        return names
+
+    monkeypatch.setattr(os, "listdir", swap_after_fd_list)
+    try:
+        with pytest.raises(FileIntakeFailure) as exc_info:
+            await storage.store(
+                batch_id,
+                IncomingFile("second.pdf", "application/pdf", _chunks(payload)),
+                max_file_size_bytes=10_000,
+                validator=_validator(),
+            )
+        assert exc_info.value.code == "path_unsafe"
+        assert swap_observed is True
+        assert first.path.name in original_listdir(moved_dir)
+    finally:
+        if input_dir.is_symlink():
+            input_dir.unlink()
+        if moved_dir.exists() and not input_dir.exists():
+            moved_dir.rename(input_dir)
 
 
 @pytest.mark.asyncio
