@@ -39,6 +39,17 @@ from .artifacts import (
     validate_content_free_model_versions,
 )
 from .progress import ProgressCounters, ProgressUnit, map_stage_progress
+from .orientation import (
+    OrientationDecision,
+    OrientationErrorCode,
+    OrientationEvidence,
+    OrientationFailure,
+    RecoveryClaim,
+    RecoverySnapshot,
+    RecoveryState,
+    RecoveryTokenBinding,
+    RecoveryTokenIssue,
+)
 from .retention import (
     ContentWriteGuard,
     RetentionClaim,
@@ -118,6 +129,10 @@ __all__ = [
     "MinerUSubmission",
     "MinerUImageFormat",
     "OrthogonalAngle",
+    "OrientationDecision",
+    "OrientationErrorCode",
+    "OrientationEvidence",
+    "OrientationFailure",
     "PersistenceError",
     "ProcessingStage",
     "ProgressCounters",
@@ -128,6 +143,11 @@ __all__ = [
     "validate_content_free_model_versions",
     "ReplacementDecision",
     "ReplacementReason",
+    "RecoveryClaim",
+    "RecoverySnapshot",
+    "RecoveryState",
+    "RecoveryTokenBinding",
+    "RecoveryTokenIssue",
     "RetentionClaim",
     "RetentionErrorCode",
     "RetentionFailure",

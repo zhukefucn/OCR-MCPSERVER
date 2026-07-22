@@ -199,3 +199,65 @@ class RetentionRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+
+class OrientationRecoveryRecord(Base):
+    __tablename__ = "orientation_recoveries"
+    __table_args__ = (
+        CheckConstraint("length(token_digest) = 64"),
+        CheckConstraint("token_digest NOT GLOB '*[^0-9a-f]*'"),
+        CheckConstraint(
+            "request_fingerprint IS NULL OR (length(request_fingerprint) = 64 "
+            "AND request_fingerprint NOT GLOB '*[^0-9a-f]*')"
+        ),
+        CheckConstraint("claim_id IS NULL OR claim_id GLOB 'claim-[0-9a-f]*'"),
+        CheckConstraint(
+            "state IN ('issued', 'claimed', 'completed', 'failed', 'uncertain', 'deleted')"
+        ),
+        CheckConstraint(
+            "state = 'deleted' OR "
+            "(state = 'issued' AND selected_pages IS NULL AND request_fingerprint IS NULL "
+            "AND claim_id IS NULL AND corrected_input_version IS NULL "
+            "AND result_batch_id IS NULL AND result_version IS NULL AND error_code IS NULL) OR "
+            "(state = 'claimed' AND selected_pages IS NOT NULL "
+            "AND request_fingerprint IS NOT NULL AND claim_id IS NOT NULL "
+            "AND corrected_input_version IS NULL AND result_batch_id IS NULL "
+            "AND result_version IS NULL AND error_code IS NULL) OR "
+            "(state = 'completed' AND selected_pages IS NOT NULL "
+            "AND request_fingerprint IS NOT NULL AND claim_id IS NOT NULL "
+            "AND corrected_input_version IS NOT NULL AND result_batch_id IS NOT NULL "
+            "AND result_version IS NOT NULL AND error_code IS NULL) OR "
+            "(state IN ('failed', 'uncertain') AND selected_pages IS NOT NULL "
+            "AND request_fingerprint IS NOT NULL AND claim_id IS NOT NULL "
+            "AND corrected_input_version IS NULL AND result_batch_id IS NULL "
+            "AND result_version IS NULL AND error_code IS NOT NULL)"
+        ),
+        CheckConstraint("source_result_version >= 1"),
+        CheckConstraint("page_count >= 1"),
+        CheckConstraint("corrected_input_version IS NULL OR corrected_input_version >= 1"),
+        CheckConstraint("result_version IS NULL OR result_version >= 1"),
+        CheckConstraint("version >= 1"),
+    )
+
+    token_digest: Mapped[str] = mapped_column(String(64), primary_key=True)
+    file_id: Mapped[str] = mapped_column(
+        String(512), ForeignKey("file_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    batch_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("batches.id", ondelete="CASCADE"), nullable=False
+    )
+    source_result_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    page_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    suspected_pages: Mapped[str] = mapped_column(String(2048), nullable=False)
+    selected_pages: Mapped[str | None] = mapped_column(String(2048))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    state: Mapped[str] = mapped_column(String(24), nullable=False)
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    claim_id: Mapped[str | None] = mapped_column(String(64), unique=True)
+    corrected_input_version: Mapped[int | None] = mapped_column(Integer)
+    result_batch_id: Mapped[str | None] = mapped_column(String(36))
+    result_version: Mapped[int | None] = mapped_column(Integer)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
