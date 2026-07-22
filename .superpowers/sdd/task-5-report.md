@@ -179,3 +179,50 @@ An independent controller review after the initial Task 5 delivery found three I
 
 - The 8.3 alias regression is deterministic through mocked canonical Win32 path results. Normal Windows handle containment and real symlink escape tests continue to run natively.
 - No remaining controller-review blocker was identified.
+
+## Interrupt-cleanup follow-up
+
+A subsequent review found that four cleanup-and-rethrow handlers had been narrowed from `BaseException` to `Exception`, allowing interruption signals to bypass descriptor/HANDLE cleanup. The focused fix range is `a1ad8b95916b2ab68d5ebb80b21fd902a25204d3..5cd91d029ab1a3f3ce37e541505268b2c0144a4b`.
+
+- Focused fix commit: `5cd91d0 fix: close candidate handles on interruption`
+- Files changed: `src/ocr_mcp_server/services/candidate_collection.py`, `tests/test_candidate_collection.py`.
+
+### Boundary design
+
+- Exactly four `BaseException` catches remain, all limited to resource-ownership cleanup followed by bare re-raise:
+  - POSIX child-directory descriptor validation cleanup;
+  - POSIX final-file descriptor/name-stat cleanup;
+  - POSIX current parent descriptor cleanup;
+  - Windows native HANDLE cleanup when ownership transfer to a Python file descriptor is interrupted.
+- These blocks close the owned resource and preserve the original `KeyboardInterrupt`, `SystemExit`, or cancellation exception unchanged.
+- Business boundaries are intentionally different: manifest parsing and Pillow decoding still preserve `CandidateCollectionFailure` and normalize only ordinary `Exception`. They do not catch `BaseException`.
+
+### RED/GREEN evidence
+
+- RED selected run: two failures and one pass.
+  - POSIX `KeyboardInterrupt` left both parent and child descriptors unclosed.
+  - Windows HANDLE conversion lacked a cleanup ownership helper.
+  - The business-boundary non-swallowing test already passed.
+- GREEN selected run: 3 passed.
+- GREEN focused command: `.venv\Scripts\python.exe -m pytest tests\test_secondary_ocr_domain.py tests\test_candidate_collection.py -q`
+- GREEN focused result: 83 passed.
+- Read-only re-review confirmed exactly four cleanup-only `BaseException` catches, unchanged interruption identity, closed POSIX/Windows resources, ordinary-`Exception` business boundaries, no blocker, `READY`.
+
+### Full verification
+
+1. `python -m pytest`
+   - Exit code: 0
+   - Result: `338 passed, 5 skipped in 3.11s`
+2. `python -m pip check`
+   - Exit code: 0
+   - Result: `No broken requirements found.`
+3. `python -m compileall -q src tests`
+   - Exit code: 0
+   - Result: no output.
+4. `git diff --check`
+   - Exit code: 0
+   - Result: no whitespace errors; only Windows LF-to-CRLF working-copy notices for the two focused files.
+
+### Remaining concerns
+
+- None blocking. POSIX cleanup is covered deterministically with fake descriptors on Windows; Windows HANDLE ownership cleanup is tested independently of the Win32 open call.
