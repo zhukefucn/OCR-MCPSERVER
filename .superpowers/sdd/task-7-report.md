@@ -177,4 +177,10 @@ Ubuntu RED 结果：两项均稳定失败，错误均为 `DID NOT RAISE MergeFai
 - compileall：退出码 0
 - diff-check：退出码 0，仅 Git LF/CRLF 提示
 
-Linux GREEN 与 Linux 全套结果等待 controller 同步上述修复提交后复验。
+Controller 在 Ubuntu 同步 `424699f` 后的最终验证结果：
+
+- 两项定向回归：`2 passed`
+- Full：`531 passed, 4 skipped`
+- pip check：`No broken requirements found.`
+- compileall：退出码 0
+- remote diff-check：退出码 0
