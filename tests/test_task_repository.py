@@ -95,23 +95,70 @@ async def test_concurrent_create_batch_converges_on_one_batch(repository) -> Non
 
 @pytest.mark.asyncio
 async def test_claim_order_is_stable_and_active_task_is_not_reclaimed(repository) -> None:
-    repo, _ = repository
-    await repo.create_batch("batch-one", ["a", "b"])
-    await asyncio.sleep(0.002)
-    await repo.create_batch("batch-two", ["c"])
+    repo, engine = repository
+    first_batch = await repo.create_batch("batch-one", ["a", "b"])
+    second_batch = await repo.create_batch("batch-two", ["c", "d"])
     now = datetime(2026, 1, 1, tzinfo=UTC)
+    async with engine.begin() as connection:
+        await connection.execute(
+            text("UPDATE batches SET created_at = :created_at"),
+            {"created_at": now},
+        )
+    expected_ids = [
+        file.id
+        for result in sorted(
+            (first_batch, second_batch), key=lambda result: result.batch.id
+        )
+        for file in result.files
+    ]
 
     first = await repo.claim_next("worker-1", now=now, lease_seconds=30)
     second = await repo.claim_next("worker-2", now=now, lease_seconds=30)
     third = await repo.claim_next("worker-3", now=now, lease_seconds=30)
-    empty = await repo.claim_next("worker-4", now=now, lease_seconds=30)
+    fourth = await repo.claim_next("worker-4", now=now, lease_seconds=30)
+    empty = await repo.claim_next("worker-5", now=now, lease_seconds=30)
 
-    assert [first.file.id, second.file.id, third.file.id] == ["a", "b", "c"]
-    assert len({first.lease_token, second.lease_token, third.lease_token}) == 3
+    claims = [first, second, third, fourth]
+    assert [claim.file.id for claim in claims] == expected_ids
+    assert len({claim.lease_token for claim in claims}) == 4
     assert first.file.status is FileStatus.PROCESSING
     assert first.file.attempt_count == 1
+    assert first.file.lease_owner == "worker-1"
+    assert first.file.lease_token == first.lease_token
+    assert first.file.lease_expires_at is not None
     assert first.expires_at == now + timedelta(seconds=30)
     assert empty is None
+
+
+@pytest.mark.asyncio
+async def test_transition_cannot_bypass_claim_to_create_unleased_processing_task(
+    repository,
+) -> None:
+    repo, engine = repository
+    created = await repo.create_batch("claim-only", ["claim-only-file"])
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+
+    with pytest.raises(StateTransitionError) as exc_info:
+        await repo.transition_file(
+            created.files[0].id,
+            "not-a-lease",
+            status=FileStatus.PROCESSING,
+            stage=ProcessingStage.QUEUED,
+            progress=0,
+            now=now,
+        )
+
+    persisted = await repo.get_file(created.files[0].id)
+    async with engine.connect() as connection:
+        event_count = (
+            await connection.execute(text("SELECT count(*) FROM stage_events"))
+        ).scalar_one()
+    assert exc_info.value.code == "state_transition_invalid"
+    assert persisted.status is FileStatus.QUEUED
+    assert persisted.lease_owner is None
+    assert persisted.lease_token is None
+    assert persisted.lease_expires_at is None
+    assert event_count == 0
 
 
 @pytest.mark.asyncio

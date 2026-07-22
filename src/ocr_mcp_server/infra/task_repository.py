@@ -15,6 +15,7 @@ from ..domain.errors import (
     InputValidationError,
     LeaseConflictError,
     PersistenceError,
+    StateTransitionError,
 )
 from ..domain.models import (
     BatchStatus,
@@ -179,7 +180,11 @@ class TaskRepository:
                     select(FileTaskRecord)
                     .join(BatchRecord, FileTaskRecord.batch_id == BatchRecord.id)
                     .where(FileTaskRecord.status == FileStatus.QUEUED.value)
-                    .order_by(BatchRecord.created_at, FileTaskRecord.position)
+                    .order_by(
+                        BatchRecord.created_at,
+                        BatchRecord.id,
+                        FileTaskRecord.position,
+                    )
                     .limit(1)
                 )
                 if record is None:
@@ -247,6 +252,11 @@ class TaskRepository:
                     raise PersistenceError()
                 old_status = FileStatus(record.status)
                 old_stage = ProcessingStage(record.stage)
+                if (
+                    old_status is FileStatus.QUEUED
+                    and status is FileStatus.PROCESSING
+                ):
+                    raise StateTransitionError()
                 if old_status is FileStatus.PROCESSING:
                     self._require_lease(record, lease_token, now)
                 validate_file_transition(
