@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import Future
 from dataclasses import dataclass
+import gc
 from pathlib import Path
 import threading
 from queue import Queue
@@ -230,6 +231,87 @@ async def test_cancelled_queued_call_does_not_corrupt_future_or_queue_accounting
     assert worker.queue_depth == 0
     await worker.close()
     assert [entry[2] for entry in events if entry[0] == "recognize"] == ["one", "two"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_active_failure_is_consumed_without_event_loop_warning(
+    tmp_path: Path,
+) -> None:
+    from ocr_mcp_server.infra.secondary_ocr import SingleOwnerSecondaryOcrWorker
+
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    contexts: list[dict[str, object]] = []
+
+    class FailingBackend:
+        def recognize(self, candidate: ImageCandidate) -> SecondaryOcrResult:
+            entered.set()
+            assert release.wait(5)
+            finished.set()
+            raise RuntimeError("private path and recognized text")
+
+        def close(self) -> None:
+            return None
+
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+    try:
+        worker = SingleOwnerSecondaryOcrWorker(
+            lambda: FailingBackend(), queue_capacity=1
+        )
+        await worker.start()
+        call = asyncio.create_task(worker.recognize(_candidate(tmp_path)))
+        assert await asyncio.to_thread(entered.wait, 2)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        del call
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+        await worker.close()
+        gc.collect()
+        await asyncio.sleep(0)
+        assert contexts == []
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_queued_close_rejection_is_consumed_without_warning(
+    tmp_path: Path,
+) -> None:
+    from ocr_mcp_server.infra.secondary_ocr import SingleOwnerSecondaryOcrWorker
+
+    entered = threading.Event()
+    release = threading.Event()
+    contexts: list[dict[str, object]] = []
+    backend = _Backend(entered, release, [])
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+    try:
+        worker = SingleOwnerSecondaryOcrWorker(lambda: backend, queue_capacity=1)
+        await worker.start()
+        active = asyncio.create_task(worker.recognize(_candidate(tmp_path, "one")))
+        assert await asyncio.to_thread(entered.wait, 2)
+        queued = asyncio.create_task(worker.recognize(_candidate(tmp_path, "two")))
+        await asyncio.sleep(0)
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+        del queued
+        close = asyncio.create_task(worker.close())
+        await asyncio.sleep(0)
+        release.set()
+        await active
+        await close
+        gc.collect()
+        await asyncio.sleep(0)
+        assert contexts == []
+    finally:
+        loop.set_exception_handler(previous_handler)
 
 
 @pytest.mark.asyncio

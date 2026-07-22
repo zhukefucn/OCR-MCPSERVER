@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 from typing import Any, Mapping
 
@@ -127,8 +128,12 @@ def normalize_pp_structure_v3_result(
         if not isinstance(raw_result, list) or len(raw_result) != 1:
             raise ValueError
         page = raw_result[0]
-        if not isinstance(page, Mapping):
+        missing = object()
+        json_contract = inspect.getattr_static(page, "json", missing)
+        if json_contract is not missing:
             page = page.json
+        elif not isinstance(page, Mapping):
+            raise ValueError
         if not isinstance(page, Mapping):
             raise ValueError
         response = page.get("res")
@@ -148,7 +153,7 @@ def normalize_pp_structure_v3_result(
             raise ValueError
 
         raw_angle = preprocessor.get("angle")
-        if isinstance(raw_angle, bool) or raw_angle not in (0, 90, 180, 270):
+        if type(raw_angle) is not int or raw_angle not in (0, 90, 180, 270):
             raise ValueError
         angle = OrthogonalAngle(raw_angle)
         boxes = layout.get("boxes")

@@ -66,6 +66,14 @@ class _JsonResult:
         self.json = value
 
 
+class _MappingJsonResult(dict):
+    """Real PaddleX results are dict subclasses whose JSON contract is a property."""
+
+    def __init__(self, raw_value, json_value):
+        super().__init__(raw_value)
+        self.json = json_value
+
+
 def test_module_import_does_not_import_paddle(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delitem(sys.modules, "paddleocr", raising=False)
     sys.modules.pop("ocr_mcp_server.infra.pp_structure_v3", None)
@@ -141,6 +149,28 @@ def test_backend_lazy_imports_and_uses_fixed_constructor_and_predict_options(
         "pipeline": "PP-StructureV3",
         "formula": "Trusted-Formula",
     }
+
+
+def test_mapping_result_prefers_json_property_over_raw_mapping() -> None:
+    from ocr_mcp_server.infra.pp_structure_v3 import normalize_pp_structure_v3_result
+
+    json_contract = _response(
+        angle=90,
+        boxes=[{"label": "formula", "score": 0.93}],
+        formulas=[{"rec_formula": "x^2"}],
+    )[0]
+    raw_internal_mapping = {"res": {"unsafe_internal_shape": object()}}
+
+    result = normalize_pp_structure_v3_result(
+        [_MappingJsonResult(raw_internal_mapping, json_contract)],
+        threshold=0.8,
+        model_versions={"pipeline": "PP-StructureV3"},
+    )
+
+    assert result.kind is SecondaryResultKind.FORMULA
+    assert result.state is SecondaryResultState.VALID
+    assert result.angle is OrthogonalAngle.DEG_90
+    assert result.content == "x^2"
 
 
 def test_factory_refuses_vl_and_missing_paddle_is_safe(
@@ -328,6 +358,7 @@ def test_normalization_decisions(
         [{}, {}],
         [{"res": []}],
         _response(angle=45),
+        _response(angle=90.0),
         _response(angle=True),
         _response(boxes={}),
         _response(boxes=[{"label": "", "score": 0.9}]),

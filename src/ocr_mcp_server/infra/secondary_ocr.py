@@ -65,6 +65,7 @@ class SingleOwnerSecondaryOcrWorker:
         self._thread: threading.Thread | None = None
         self._bootstrap: Future[None] | None = None
         self._done: Future[None] | None = None
+        self._detached_outcomes: set[asyncio.Future[SecondaryOcrResult]] = set()
 
     @property
     def lifecycle(self) -> SecondaryOcrWorkerLifecycle:
@@ -125,7 +126,23 @@ class SingleOwnerSecondaryOcrWorker:
                 saturated = True
         if saturated:
             raise SecondaryOcrFailure(SecondaryOcrErrorCode.QUEUE_SATURATED)
-        return await asyncio.shield(asyncio.wrap_future(outcome))
+        wrapped = asyncio.wrap_future(outcome)
+        try:
+            return await asyncio.shield(wrapped)
+        except asyncio.CancelledError:
+            self._detached_outcomes.add(wrapped)
+            wrapped.add_done_callback(self._consume_detached_outcome)
+            raise
+
+    def _consume_detached_outcome(
+        self, outcome: asyncio.Future[SecondaryOcrResult]
+    ) -> None:
+        self._detached_outcomes.discard(outcome)
+        if not outcome.cancelled():
+            try:
+                outcome.exception()
+            except BaseException:
+                pass
 
     async def close(self) -> None:
         with self._lock:
