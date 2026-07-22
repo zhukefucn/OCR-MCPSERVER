@@ -12,6 +12,8 @@ from .errors import (
     MinerUErrorCode,
     MinerUFailure,
     PersistenceError,
+    SecondaryOcrErrorCode,
+    SecondaryOcrFailure,
     StateTransitionError,
 )
 from .files import IncomingFile, StoredFile, SupportedMediaType
@@ -77,6 +79,8 @@ __all__ = [
     "PersistenceError",
     "ProcessingStage",
     "SecondaryOCREngine",
+    "SecondaryOcrErrorCode",
+    "SecondaryOcrFailure",
     "SecondaryContentFormat",
     "SecondaryOcrProvider",
     "SecondaryOcrResult",

@@ -45,3 +45,8 @@ mineru:
 
 secondary_ocr:
   engine: pp_structure_v3
+  device: cpu
+  queue_capacity: 8
+  classification_threshold: 0.8
+  paddlex_config: null
+  formula_model_name: PP-FormulaNet_plus-S

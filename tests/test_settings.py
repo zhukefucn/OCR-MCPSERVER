@@ -39,6 +39,11 @@ def test_settings_defaults_match_domain_constraints() -> None:
     assert settings.mineru.max_uncompressed_bytes == 2 * 1024**3
     assert settings.mineru.max_archive_entries == 10_000
     assert settings.secondary_ocr.engine is SecondaryOCREngine.PP_STRUCTURE_V3
+    assert settings.secondary_ocr.device == "cpu"
+    assert settings.secondary_ocr.queue_capacity == 8
+    assert settings.secondary_ocr.classification_threshold == 0.8
+    assert settings.secondary_ocr.paddlex_config is None
+    assert settings.secondary_ocr.formula_model_name == "PP-FormulaNet_plus-S"
     assert settings.database.url == "sqlite+aiosqlite:///data/ocr.sqlite3"
     assert settings.database.busy_timeout_ms == 5000
     assert settings.remote_import.allowed_hosts == []
@@ -252,6 +257,63 @@ def test_example_yaml_documents_mineru_adapter_defaults() -> None:
     assert mineru.max_compressed_bytes == 512 * 1024 * 1024
     assert mineru.max_uncompressed_bytes == 2 * 1024**3
     assert mineru.max_archive_entries == 10_000
+
+
+def test_secondary_ocr_settings_load_from_yaml_and_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_file = tmp_path / "ocr.yaml"
+    config_file.write_text(
+        "secondary_ocr:\n"
+        "  device: cpu\n"
+        "  queue_capacity: 3\n"
+        "  classification_threshold: 0.7\n"
+        "  paddlex_config: /models/pipeline.yaml\n"
+        "  formula_model_name: PP-FormulaNet_plus-M\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OCR_SECONDARY_OCR__DEVICE", "gpu")
+    monkeypatch.setenv("OCR_SECONDARY_OCR__QUEUE_CAPACITY", "4")
+
+    settings = load_settings(config_file=config_file).secondary_ocr
+
+    assert settings.device == "gpu"
+    assert settings.queue_capacity == 4
+    assert settings.classification_threshold == 0.7
+    assert settings.paddlex_config == Path("/models/pipeline.yaml")
+    assert settings.formula_model_name == "PP-FormulaNet_plus-M"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("device", "cuda"),
+        ("queue_capacity", 0),
+        ("queue_capacity", True),
+        ("classification_threshold", 0),
+        ("classification_threshold", True),
+        ("classification_threshold", 1.01),
+        ("classification_threshold", float("nan")),
+        ("formula_model_name", ""),
+        ("unexpected_runtime_option", True),
+    ],
+)
+def test_secondary_ocr_settings_reject_invalid_or_unknown_values(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(secondary_ocr={field: value})
+
+
+def test_example_yaml_documents_secondary_ocr_deployment_defaults() -> None:
+    settings = load_settings(config_file=Path("config/example.yaml")).secondary_ocr
+
+    assert settings.engine is SecondaryOCREngine.PP_STRUCTURE_V3
+    assert settings.device == "cpu"
+    assert settings.queue_capacity == 8
+    assert settings.classification_threshold == 0.8
+    assert settings.paddlex_config is None
+    assert settings.formula_model_name == "PP-FormulaNet_plus-S"
 
 
 def test_project_metadata_has_no_local_mineru_or_torch_dependency() -> None:

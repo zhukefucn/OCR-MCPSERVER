@@ -133,6 +133,26 @@ class MinerUSettings(_SettingsSection):
 
 class SecondaryOCRSettings(_SettingsSection):
     engine: SecondaryOCREngine = SecondaryOCREngine.PP_STRUCTURE_V3
+    device: Literal["cpu", "gpu"] = "cpu"
+    queue_capacity: int = Field(default=8, ge=1, le=1024)
+    classification_threshold: float = Field(default=0.8, gt=0, le=1)
+    paddlex_config: Path | None = None
+    formula_model_name: str = "PP-FormulaNet_plus-S"
+
+    @field_validator("queue_capacity", "classification_threshold", mode="before")
+    @classmethod
+    def reject_boolean_numeric_values(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("boolean values are not numeric deployment settings")
+        return value
+
+    @field_validator("formula_model_name")
+    @classmethod
+    def require_formula_model_identity(cls, value: str) -> str:
+        identity = value.strip()
+        if not identity:
+            raise ValueError("formula model identity is required")
+        return identity
 
 
 class DatabaseSettings(_SettingsSection):

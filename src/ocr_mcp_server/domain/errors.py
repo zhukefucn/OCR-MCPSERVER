@@ -171,3 +171,35 @@ class CandidateCollectionFailure(DomainError):
         self.code = code.value
         self.safe_message = _CANDIDATE_COLLECTION_SAFE_MESSAGES[code]
         Exception.__init__(self, self.safe_message)
+
+
+class SecondaryOcrErrorCode(StrEnum):
+    """Stable machine codes for the secondary OCR execution boundary."""
+
+    INITIALIZATION_UNAVAILABLE = "secondary_ocr_initialization_unavailable"
+    QUEUE_SATURATED = "secondary_ocr_queue_saturated"
+    NOT_STARTED = "secondary_ocr_not_started"
+    INTERNAL_WORKER_FAILURE = "secondary_ocr_internal_worker_failure"
+
+
+_SECONDARY_OCR_SAFE_MESSAGES = {
+    SecondaryOcrErrorCode.INITIALIZATION_UNAVAILABLE: "The secondary OCR provider is unavailable.",
+    SecondaryOcrErrorCode.QUEUE_SATURATED: "The secondary OCR queue is at capacity.",
+    SecondaryOcrErrorCode.NOT_STARTED: "The secondary OCR provider is not accepting work.",
+    SecondaryOcrErrorCode.INTERNAL_WORKER_FAILURE: "The secondary OCR worker failed safely.",
+}
+
+
+class SecondaryOcrFailure(DomainError):
+    """A safe secondary-OCR failure that discards all backend details."""
+
+    def __init__(
+        self,
+        code: SecondaryOcrErrorCode,
+        *,
+        cause: BaseException | None = None,
+    ) -> None:
+        del cause
+        self.code = code.value
+        self.safe_message = _SECONDARY_OCR_SAFE_MESSAGES[code]
+        Exception.__init__(self, self.safe_message)
