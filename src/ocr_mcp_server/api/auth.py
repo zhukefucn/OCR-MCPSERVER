@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import hashlib
 import json
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -21,7 +22,10 @@ class ApiKeyAuthMiddleware:
 
     def __init__(self, app: ASGIApp, *, settings: AuthenticationSettings) -> None:
         self.app = app
-        self._keys = tuple(key.get_secret_value() for key in settings.api_keys)
+        self._key_digests = tuple(
+            _digest(key.get_secret_value().encode("ascii"))
+            for key in settings.api_keys
+        )
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] not in {"http", "websocket"}:
@@ -31,7 +35,7 @@ class ApiKeyAuthMiddleware:
         if path == "/health/live":
             await self.app(scope, receive, send)
             return
-        if not self._keys:
+        if not self._key_digests:
             await _send_error(
                 send,
                 503,
@@ -57,8 +61,10 @@ class ApiKeyAuthMiddleware:
                 return
             bearer = authorization[0][len(prefix) :]
         header_key = api_keys[0] if api_keys else None
-        if bearer is not None and header_key is not None and not hmac.compare_digest(
-            bearer, header_key
+        if (
+            bearer is not None
+            and header_key is not None
+            and not hmac.compare_digest(_digest(bearer), _digest(header_key))
         ):
             await _authentication_failed(send)
             return
@@ -66,18 +72,18 @@ class ApiKeyAuthMiddleware:
         if presented_bytes is None:
             await _authentication_failed(send)
             return
-        try:
-            presented = presented_bytes.decode("ascii")
-        except UnicodeDecodeError:
-            await _authentication_failed(send)
-            return
+        presented_digest = _digest(presented_bytes)
         matched = False
-        for configured in self._keys:
-            matched |= hmac.compare_digest(presented, configured)
+        for configured_digest in self._key_digests:
+            matched |= hmac.compare_digest(presented_digest, configured_digest)
         if not matched:
             await _authentication_failed(send)
             return
         await self.app(scope, receive, send)
+
+
+def _digest(value: bytes) -> bytes:
+    return hashlib.sha256(value).digest()
 
 
 async def _authentication_failed(send) -> None:

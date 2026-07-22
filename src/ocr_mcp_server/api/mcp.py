@@ -1,11 +1,12 @@
 """Three curated FastMCP tools over the shared document gateway port."""
 
 import math
+from typing import Annotated
 
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
 from .contracts import (
     BatchStatusResponse,
@@ -17,6 +18,18 @@ from .contracts import (
     ParseSubmission,
 )
 from .gateway import DocumentGateway, GatewayFailure, GatewayUnavailable
+
+
+McpSources = Annotated[
+    list[DocumentSource], Field(min_length=1, max_length=20)
+]
+McpIdempotencyKey = Annotated[
+    str, Field(min_length=1, max_length=128, pattern=r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+]
+McpRecoveryToken = Annotated[str, Field(min_length=8, max_length=256)]
+McpPages = Annotated[
+    list[Annotated[int, Field(gt=0)]], Field(min_length=1, max_length=500)
+]
 
 
 def create_mcp_server(gateway: DocumentGateway | None) -> FastMCP:
@@ -34,8 +47,8 @@ def create_mcp_server(gateway: DocumentGateway | None) -> FastMCP:
         description="Submit 1 to 20 uploaded files or approved HTTPS URLs for OCR.",
     )
     async def parse_documents(
-        sources: list[DocumentSource],
-        idempotency_key: str | None = None,
+        sources: McpSources,
+        idempotency_key: McpIdempotencyKey | None = None,
         ctx: Context | None = None,
     ) -> ParseSubmission:
         request = ParseDocumentsRequest(
@@ -59,8 +72,8 @@ def create_mcp_server(gateway: DocumentGateway | None) -> FastMCP:
         description="Reparse approved pages using an existing recovery token.",
     )
     async def reparse_with_page_orientation(
-        recovery_token: str,
-        pages: list[int] | None = None,
+        recovery_token: McpRecoveryToken,
+        pages: McpPages | None = None,
         ctx: Context | None = None,
     ) -> OrientationReparseSubmission:
         request = OrientationReparseRequest(

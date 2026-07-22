@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 import re
+from typing import Awaitable, TypeVar
 
 from fastapi import APIRouter, Request, status
 
@@ -18,6 +19,7 @@ from .contracts import (
 )
 from .gateway import (
     DocumentGateway,
+    GatewayFailure,
     GatewayCapacityExceeded,
     GatewayInvalidRequest,
     GatewayUploadTooLarge,
@@ -30,6 +32,7 @@ router = APIRouter(prefix="/v1")
 _MEDIA_TYPES = frozenset({"application/pdf", "image/png", "image/jpeg"})
 _DISPLAY_NAME_RE = re.compile(r"[^/\\\x00-\x1f\x7f]{1,255}\Z")
 _IDEMPOTENCY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_ResultT = TypeVar("_ResultT")
 
 
 def _gateway(request: Request) -> DocumentGateway:
@@ -37,6 +40,15 @@ def _gateway(request: Request) -> DocumentGateway:
     if gateway is None:
         raise GatewayUnavailable()
     return gateway
+
+
+async def _safe_gateway_call(awaitable: Awaitable[_ResultT]) -> _ResultT:
+    try:
+        return await awaitable
+    except GatewayFailure:
+        raise
+    except Exception:
+        raise GatewayFailure() from None
 
 
 @router.post(
@@ -94,12 +106,14 @@ async def upload_document(request: Request) -> UploadReceipt:
                 raise GatewayUploadTooLarge()
             yield chunk
 
-    return await _gateway(request).upload_document(
-        bounded_content(),
-        display_name=display_name,
-        media_type=media_type,
-        content_length=content_length,
-        idempotency_key=idempotency_key,
+    return await _safe_gateway_call(
+        _gateway(request).upload_document(
+            bounded_content(),
+            display_name=display_name,
+            media_type=media_type,
+            content_length=content_length,
+            idempotency_key=idempotency_key,
+        )
     )
 
 
@@ -112,7 +126,7 @@ async def upload_document(request: Request) -> UploadReceipt:
 async def parse_documents(
     payload: ParseDocumentsRequest, request: Request
 ) -> ParseSubmission:
-    return await _gateway(request).parse_documents(payload)
+    return await _safe_gateway_call(_gateway(request).parse_documents(payload))
 
 
 @router.get(
@@ -121,7 +135,7 @@ async def parse_documents(
     operation_id="getTaskStatus",
 )
 async def get_task_status(batch_id: CanonicalId, request: Request) -> BatchStatusResponse:
-    return await _gateway(request).get_task_status(batch_id)
+    return await _safe_gateway_call(_gateway(request).get_task_status(batch_id))
 
 
 @router.post(
@@ -133,4 +147,6 @@ async def get_task_status(batch_id: CanonicalId, request: Request) -> BatchStatu
 async def reparse_with_page_orientation(
     payload: OrientationReparseRequest, request: Request
 ) -> OrientationReparseSubmission:
-    return await _gateway(request).reparse_with_page_orientation(payload)
+    return await _safe_gateway_call(
+        _gateway(request).reparse_with_page_orientation(payload)
+    )

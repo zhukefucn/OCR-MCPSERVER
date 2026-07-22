@@ -60,3 +60,10 @@ exit 0, no output
 - 审查 READY 后再 push、bundle/checksum 同步 Ubuntu、Linux 全套、镜像构建、立即启动和认证 REST/MCP smoke、不可变版本固定。
 
 本 worker 未 push、未 SSH、未部署、未修改父实施计划完成状态。
+
+## 最终安全自审收口
+
+- RED 证明：使用默认 `TestClient(raise_server_exceptions=True)` 时，gateway 抛出的包含业务文本的未知异常虽生成 500 响应，仍被 Starlette `ServerErrorMiddleware` 重抛，存在服务器日志记录 cause 的风险。REST 现在在每个 gateway await 边界捕获未知异常并 `raise GatewayFailure() from None`；同一回归返回安全 `internal_error` 且不再重抛。
+- MCP list-tools schema 原先没有显示 sources/page 数量约束。新增 schema 断言先以 `KeyError: minItems` 失败；工具签名现显式发布 sources `1..20` 和 pages `1..500`，运行时仍复用严格 DTO 处理唯一页码等不易用 JSON Schema 表达的约束。
+- 鉴权不再保存/比较可变长度原始 key。配置 key 与来访凭据先计算固定 32-byte SHA-256 digest，再对每个已配置 digest 执行 `hmac.compare_digest`；冲突的双凭据也使用固定长度 digest 比较。
+- 最终 focused API/MCP/settings/app：`119 passed`。

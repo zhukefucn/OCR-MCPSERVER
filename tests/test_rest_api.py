@@ -261,3 +261,20 @@ def test_gateway_failures_map_to_stable_safe_http_errors() -> None:
         assert response.status_code == expected_status
         assert response.json()["error"]["code"] == expected_code
         assert "recognized private business text" not in response.text
+
+
+def test_unexpected_gateway_exception_is_contained_at_the_route_boundary() -> None:
+    settings = AppSettings(auth={"api_keys": [KEY]})
+    api = TestClient(
+        create_app(
+            settings,
+            gateway=FakeGateway(
+                failure=RuntimeError("recognized private business text")
+            ),
+        )
+    )
+    with api:
+        response = api.get(f"/v1/tasks/{uuid4()}", headers=AUTH)
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    assert "recognized private business text" not in response.text

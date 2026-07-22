@@ -107,6 +107,15 @@ async def test_mcp_lists_exactly_three_curated_tools_with_safe_schemas() -> None
         "reparse_with_page_orientation",
     }
     assert len(tools) == 3
+    by_name = {tool.name: tool.inputSchema for tool in tools}
+    assert by_name["parse_documents"]["properties"]["sources"]["minItems"] == 1
+    assert by_name["parse_documents"]["properties"]["sources"]["maxItems"] == 20
+    assert (
+        by_name["reparse_with_page_orientation"]["properties"]["pages"][
+            "anyOf"
+        ][0]["maxItems"]
+        == 500
+    )
     serialized = str([tool.inputSchema for tool in tools])
     for forbidden in (
         "engine",
