@@ -405,6 +405,12 @@ class ArtifactRepository:
             or expected_audit_digest != bundle.audit_metadata_sha256
             or _utc(bundle.expires_at) <= _utc(bundle.created_at)
             or bundle.storage_key != _expected_storage_key(bundle)
+            or not isinstance(bundle.publication_identity, tuple)
+            or len(bundle.publication_identity) != 2
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in bundle.publication_identity
+            )
             or any(not isinstance(record, ReplacementAuditRecord) for record in records)
             or len(records) != bundle.replacement_count + bundle.retained_count
             or any(

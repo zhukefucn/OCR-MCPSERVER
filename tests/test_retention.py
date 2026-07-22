@@ -277,8 +277,6 @@ async def test_content_cleanup_retires_the_batch_lock_with_a_content_free_marker
     (data_root / batch_id).mkdir(parents=True)
     (artifact_root / batch_id).mkdir(parents=True)
     lock_path = data_root / ".locks" / f"{batch_id}.lock"
-    lock_path.parent.mkdir()
-    lock_path.write_bytes(b"private bytes must not survive retention")
 
     result = await RetentionService(repository, data_root, artifact_root).run_once(
         "worker", now=NOW + timedelta(hours=24), lease_seconds=60, limit=1
@@ -316,6 +314,68 @@ async def test_retired_lock_name_swap_preserves_replacement_and_fails_closed(
 
     assert lock_path.read_bytes() == b"replacement"
     assert moved.read_bytes() == b"\x01"
+    assert (await repository.get(batch_id)).content_deleted_at is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_retry_never_adopts_or_mutates_a_lock_name_replacement(
+    tmp_path: Path, retention_repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, tasks, _, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "lock-retry-name-swap")
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    (data_root / batch_id).mkdir(parents=True)
+    (artifact_root / batch_id).mkdir(parents=True)
+    lock_path = data_root / ".locks" / f"{batch_id}.lock"
+    moved = lock_path.with_name("moved-original.lock")
+    original_retire = BatchLockLease.retire
+    swapped = False
+
+    def swap_once(lease):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            __import__("os").rename(lock_path, moved)
+            lock_path.write_bytes(b"attacker-replacement")
+        original_retire(lease)
+
+    monkeypatch.setattr(BatchLockLease, "retire", swap_once)
+    service = RetentionService(repository, data_root, artifact_root)
+    with pytest.raises(RetentionFailure):
+        await service.delete_task(batch_id, now=NOW, worker_id="cleanup")
+    assert lock_path.read_bytes() == b"attacker-replacement"
+
+    monkeypatch.setattr(BatchLockLease, "retire", original_retire)
+    with pytest.raises(RetentionFailure):
+        await service.delete_task(
+            batch_id, now=NOW + timedelta(seconds=1), worker_id="cleanup"
+        )
+    assert lock_path.read_bytes() == b"attacker-replacement"
+    assert (await repository.get(batch_id)).content_deleted_at is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_rejects_an_unknown_preexisting_lock_without_mutation(
+    tmp_path: Path, retention_repository,
+) -> None:
+    repository, tasks, _, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "unknown-lock")
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    (data_root / batch_id).mkdir(parents=True)
+    (artifact_root / batch_id).mkdir(parents=True)
+    lock_path = data_root / ".locks" / f"{batch_id}.lock"
+    lock_path.parent.mkdir()
+    planted = b"unknown preexisting marker"
+    lock_path.write_bytes(planted)
+
+    with pytest.raises(RetentionFailure):
+        await RetentionService(repository, data_root, artifact_root).delete_task(
+            batch_id, now=NOW, worker_id="cleanup"
+        )
+
+    assert lock_path.read_bytes() == planted
     assert (await repository.get(batch_id)).content_deleted_at is None
 
 
@@ -636,7 +696,94 @@ def test_owned_root_deletion_leaks_and_preserves_a_concurrent_name_replacement(
     replacements = [path for path in root.rglob("result.zip")]
     assert len(replacements) == 1
     assert replacements[0].read_bytes() == b"replacement"
-    assert moved_paths[0].read_bytes() == b""
+    assert moved_paths[0].read_bytes() == b"owned-original"
+
+
+@pytest.mark.skipif(__import__("os").name != "nt", reason="Windows parent pinning")
+def test_windows_exclusive_parent_handle_blocks_directory_replacement(
+    tmp_path: Path,
+) -> None:
+    parent = (tmp_path / "parent").absolute()
+    parent.mkdir()
+    handle = FileStorage._windows_open_directory_handle(
+        parent, deny_delete_share=True
+    )
+    try:
+        with pytest.raises(OSError):
+            __import__("os").rename(parent, tmp_path / "replacement-target")
+    finally:
+        FileStorage._windows_close_handle(handle)
+
+
+@pytest.mark.skipif(__import__("os").name != "nt", reason="Windows parent pinning")
+def test_windows_parent_replacement_is_blocked_or_preserved_before_child_scrub(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "owned").absolute()
+    batch_id = str(uuid4())
+    batch = root / batch_id
+    batch.mkdir(parents=True)
+    (batch / "content.bin").write_bytes(b"owned-original")
+    moved_parent = root / "moved-original-parent"
+    replacement_bytes = b"replacement parent bytes must survive"
+    swap_blocked: list[bool] = []
+    replacement_paths: list[Path] = []
+
+    class SwapParentAfterEnumeration(OwnedBatchRootDeleter):
+        def _windows_names(self, path, expected):
+            names = super()._windows_names(path, expected)
+            if path.parent == root and path.name.startswith(".retention-") and not replacement_paths:
+                try:
+                    __import__("os").rename(path, moved_parent)
+                except OSError:
+                    swap_blocked.append(True)
+                else:
+                    path.mkdir()
+                    replacement = path / "content.bin"
+                    replacement.write_bytes(replacement_bytes)
+                    replacement_paths.append(replacement)
+            return names
+
+    try:
+        SwapParentAfterEnumeration().delete(root, batch_id)
+    except RetentionFailure:
+        pass
+
+    if replacement_paths:
+        assert replacement_paths[0].read_bytes() == replacement_bytes
+    else:
+        assert swap_blocked and all(swap_blocked)
+
+
+@pytest.mark.asyncio
+async def test_hardlinked_descendant_is_rejected_without_touching_external_bytes(
+    tmp_path: Path, retention_repository,
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, file_id = await _create_batch(tasks, "hardlink-confinement")
+    await _insert_artifact(sessions, batch_id, file_id)
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    batch = data_root / batch_id
+    batch.mkdir(parents=True)
+    artifact_root.joinpath(batch_id).mkdir(parents=True)
+    external = tmp_path / "external-private.bin"
+    external_bytes = b"external bytes must never be scrubbed"
+    external.write_bytes(external_bytes)
+    try:
+        __import__("os").link(external, batch / "linked.bin")
+    except OSError:
+        pytest.skip("hard links are unavailable")
+
+    result = await RetentionService(repository, data_root, artifact_root).run_once(
+        "cleanup", now=NOW + timedelta(hours=24), lease_seconds=60, limit=1
+    )
+
+    assert result.failed == 1
+    assert external.read_bytes() == external_bytes
+    async with sessions() as session:
+        artifact = await session.get(ArtifactRecord, "artifact-" + "a" * 64)
+        assert artifact.available is True
 
 
 def test_owned_root_deletion_discards_planted_exception_text_and_chain(
@@ -675,18 +822,31 @@ def test_owned_root_deletion_does_not_remove_directory_replaced_at_final_delete(
             pinned = super()._open_directory(path, **kwargs)
             if path.name == "nested" and not moved_paths:
                 moved = path.with_name("held-original")
-                __import__("os").rename(path, moved)
+                try:
+                    __import__("os").rename(path, moved)
+                except OSError:
+                    return pinned
                 path.mkdir()
                 (path / "replacement.bin").write_bytes(b"replacement")
                 moved_paths.append(moved)
             return pinned
 
-    with pytest.raises(RetentionFailure):
+    failure = None
+    try:
         SwapOpenedDirectory().delete(root, batch_id)
-    assert moved_paths[0].joinpath("original.bin").read_bytes() == b"owned"
-    replacements = list(root.rglob("replacement.bin"))
-    assert len(replacements) == 1
-    assert replacements[0].read_bytes() == b"replacement"
+    except RetentionFailure as caught:
+        failure = caught
+    if moved_paths:
+        assert failure is not None
+        assert moved_paths[0].joinpath("original.bin").read_bytes() == b"owned"
+        replacements = list(root.rglob("replacement.bin"))
+        assert len(replacements) == 1
+        assert replacements[0].read_bytes() == b"replacement"
+    else:
+        assert failure is None
+        originals = list(root.rglob("original.bin"))
+        assert len(originals) == 1
+        assert originals[0].read_bytes() == b""
 
 
 def test_owned_root_scrubbing_never_unlinks_or_rmdirs_descendant_names(

@@ -99,12 +99,14 @@ class ArtifactBundle:
     created_at: datetime
     expires_at: datetime
     path: Path
+    publication_identity: tuple[int, int]
     warning_codes: tuple[str, ...]
     replacement_count: int
     retained_count: int
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "warning_codes", tuple(self.warning_codes))
+        object.__setattr__(self, "publication_identity", tuple(self.publication_identity))
 
 
 @dataclass(frozen=True, slots=True)

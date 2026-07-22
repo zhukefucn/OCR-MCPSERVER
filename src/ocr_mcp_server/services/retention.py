@@ -25,6 +25,12 @@ def _is_reparse(info: os.stat_result) -> bool:
     )
 
 
+def _same_path(first: Path | str, second: Path | str) -> bool:
+    return os.path.normcase(os.path.abspath(first)) == os.path.normcase(
+        os.path.abspath(second)
+    )
+
+
 class OwnedBatchRootDeleter:
     """Isolate one owned batch root, then scrub bytes through pinned handles.
 
@@ -37,6 +43,7 @@ class OwnedBatchRootDeleter:
     ) -> None:
         failure: RetentionFailure | None = None
         pinned = None
+        pinned_root = None
         try:
             root = Path(root)
             canonical = str(UUID(batch_id))
@@ -55,6 +62,9 @@ class OwnedBatchRootDeleter:
             if _is_reparse(root_info) or not stat.S_ISDIR(root_info.st_mode):
                 raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
             root_identity = _identity(root_info)
+            pinned_root = self._open_directory(root)
+            if pinned_root[2] != root_identity:
+                raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
             target = root / canonical
             tombstone = root / tombstone_name
             target_info = self._lstat_optional(target)
@@ -67,7 +77,15 @@ class OwnedBatchRootDeleter:
             if self._lstat_optional(selected) is None:
                 self._assert_identity(root, root_identity, directory=True)
                 return
-            pinned = self._open_directory(selected)
+            pinned = self._open_directory(
+                selected,
+                parent_descriptor=pinned_root[0],
+                name=selected.name,
+                allow_rename=selected == target,
+            )
+            selected_info = target_info if selected == target else tombstone_info
+            if selected_info is None or pinned[2] != _identity(selected_info):
+                raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
             if selected == target:
                 os.rename(target, tombstone)
                 try:
@@ -76,6 +94,15 @@ class OwnedBatchRootDeleter:
                 except RetentionFailure:
                     self._restore_replacement(tombstone, target)
                     raise
+                isolated_identity = pinned[2]
+                self._close_directory(pinned)
+                pinned = self._open_directory(
+                    tombstone,
+                    parent_descriptor=pinned_root[0],
+                    name=tombstone.name,
+                )
+                if pinned[2] != isolated_identity:
+                    raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
             self._scrub_directory(tombstone, pinned)
             self._assert_identity(root, root_identity, directory=True)
             self._assert_identity(tombstone, pinned[2], directory=True)
@@ -89,6 +116,7 @@ class OwnedBatchRootDeleter:
             failure = RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
         finally:
             self._close_directory(pinned)
+            self._close_directory(pinned_root)
         if failure is not None:
             failure.__context__ = None
             failure.__cause__ = None
@@ -97,6 +125,10 @@ class OwnedBatchRootDeleter:
 
     def _scrub_directory(self, path: Path, pinned):
         descriptor, windows_handle, expected = pinned
+        if windows_handle is not None and not _same_path(
+            FileStorage._windows_handle_path(windows_handle), path
+        ):
+            raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
         self._assert_identity(path, expected, directory=True)
         names = (
             sorted(os.fsdecode(name) for name in os.listdir(descriptor))
@@ -167,15 +199,46 @@ class OwnedBatchRootDeleter:
     def _scrub_open_regular(
         self, descriptor: int, expected: tuple[int, int], path: Path
     ) -> None:
-        del path
         info = os.fstat(descriptor)
-        if _is_reparse(info) or not stat.S_ISREG(info.st_mode) or _identity(info) != expected:
+        if (
+            _is_reparse(info)
+            or not stat.S_ISREG(info.st_mode)
+            or _identity(info) != expected
+            or info.st_nlink != 1
+        ):
             raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
+        if os.name == "nt":
+            import msvcrt
+
+            if not _same_path(
+                FileStorage._windows_handle_path(msvcrt.get_osfhandle(descriptor)),
+                path,
+            ):
+                raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
         os.ftruncate(descriptor, 0)
         os.fsync(descriptor)
+        final = os.fstat(descriptor)
+        if (
+            _identity(final) != expected
+            or final.st_nlink != 1
+            or final.st_size != 0
+        ):
+            raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
+        if os.name == "nt":
+            import msvcrt
+
+            if not _same_path(
+                FileStorage._windows_handle_path(msvcrt.get_osfhandle(descriptor)),
+                path,
+            ):
+                raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
 
     def _verify_directory(self, path: Path, pinned, expected_entries) -> None:
-        descriptor, _, expected = pinned
+        descriptor, windows_handle, expected = pinned
+        if windows_handle is not None and not _same_path(
+            FileStorage._windows_handle_path(windows_handle), path
+        ):
+            raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
         self._assert_identity(path, expected, directory=True)
         names = (
             sorted(os.fsdecode(name) for name in os.listdir(descriptor))
@@ -215,9 +278,15 @@ class OwnedBatchRootDeleter:
         *,
         parent_descriptor: int | None = None,
         name: str | None = None,
+        allow_rename: bool = False,
     ):
         if os.name == "nt":
-            handle = FileStorage._windows_open_directory_handle(path)
+            handle = FileStorage._windows_open_directory_handle(
+                path, deny_delete_share=not allow_rename
+            )
+            if not _same_path(FileStorage._windows_handle_path(handle), path):
+                FileStorage._windows_close_handle(handle)
+                raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
             return None, handle, FileStorage._windows_handle_identity(handle)
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -304,7 +373,9 @@ class RetentionService:
     async def _delete_content(self, claim, *, now: datetime) -> None:
         try:
             async with self._storage.batch_lock(
-                claim.batch_id, allow_retired=True
+                claim.batch_id,
+                marker_registry=self._repository,
+                allow_retired=True,
             ) as batch_lock:
                 await self._repository.require_content_write_quiescent(claim, now=now)
                 data_tombstone = await self._repository.prepare_tombstone(

@@ -164,6 +164,13 @@ class ReplacementAuditMetadataRecord(Base):
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class BatchLockMarkerRecord(Base):
+    __tablename__ = "batch_lock_markers"
+
+    batch_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    identity: Mapped[str] = mapped_column(String(80), nullable=False)
+
+
 class RetentionRecord(Base):
     __tablename__ = "retention"
     __table_args__ = (

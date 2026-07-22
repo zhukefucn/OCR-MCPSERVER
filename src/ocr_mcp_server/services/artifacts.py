@@ -1633,6 +1633,9 @@ class ArtifactBundler:
                     or not _same_object(root_identity, os.lstat(artifact_root))
                 ):
                     _fail(ArtifactErrorCode.PUBLISH_FAILED)
+                final_identity = pinned._named_stat(artifact_name)
+                if not stat.S_ISREG(final_identity.st_mode) or final_identity.st_size != size:
+                    _fail(ArtifactErrorCode.PUBLISH_FAILED)
                 return ArtifactBundle(
                     artifact_id=artifact_id,
                     batch_id=batch_id,
@@ -1649,6 +1652,7 @@ class ArtifactBundler:
                     created_at=created_at,
                     expires_at=expires_at,
                     path=target,
+                    publication_identity=(final_identity.st_dev, final_identity.st_ino),
                     warning_codes=rendered.warning_codes,
                     replacement_count=publication.replacement_count,
                     retained_count=publication.retained_count,
@@ -1711,7 +1715,29 @@ class ArtifactBundler:
                         write_access=True,
                     )
                 opened = os.fstat(descriptor)
-                if not _same_object(expected, opened):
+                if (
+                    not _same_object(expected, opened)
+                    or (opened.st_dev, opened.st_ino) != bundle.publication_identity
+                    or opened.st_size != bundle.size_bytes
+                    or opened.st_nlink != 1
+                ):
+                    _fail(ArtifactErrorCode.PUBLISH_FAILED)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                digest = sha256()
+                size = 0
+                while chunk := os.read(descriptor, _CHUNK_SIZE):
+                    size += len(chunk)
+                    if size > bundle.size_bytes:
+                        _fail(ArtifactErrorCode.PUBLISH_FAILED)
+                    digest.update(chunk)
+                before_scrub = os.fstat(descriptor)
+                if (
+                    size != bundle.size_bytes
+                    or digest.hexdigest() != bundle.sha256
+                    or not _same_object(opened, before_scrub)
+                    or before_scrub.st_size != bundle.size_bytes
+                    or before_scrub.st_nlink != 1
+                ):
                     _fail(ArtifactErrorCode.PUBLISH_FAILED)
                 os.ftruncate(descriptor, 0)
                 os.fsync(descriptor)
@@ -1763,11 +1789,17 @@ class ArtifactPackagingStep:
         bundler: ArtifactBundler,
         repository: ArtifactRepositoryProtocol,
         *,
+        batch_locks: FileStorage,
+        marker_registry,
         now_factory=utc_now,
+        write_lease_seconds: int = 300,
     ) -> None:
         self._bundler = bundler
         self._repository = repository
+        self._batch_locks = batch_locks
+        self._marker_registry = marker_registry
         self._now_factory = now_factory
+        self._write_lease_seconds = write_lease_seconds
 
     async def run(
         self,
@@ -1781,41 +1813,47 @@ class ArtifactPackagingStep:
         progress,
         cancellation,
     ) -> ArtifactSnapshot:
-        guard = await self._repository.acquire_content_write(
+        async with self._batch_locks.batch_lock(
             batch_id,
-            result.file_task_id,
-            now=self._now_factory(),
-            lease_seconds=300,
-        )
-        bundle: ArtifactBundle | None = None
-        try:
-            cancellation.checkpoint()
-            await progress.report(ProcessingStage.PACKAGING, ProgressCounters(0, None, ProgressUnit.BYTES))
-            bundle = self._bundler.publish(
-                result,
-                publication,
-                artifact_root=artifact_root,
-                batch_id=batch_id,
-                created_at=created_at,
-                expires_at=expires_at,
+            marker_registry=self._marker_registry,
+        ):
+            guard = await self._repository.acquire_content_write(
+                batch_id,
+                result.file_task_id,
+                now=self._now_factory(),
+                lease_seconds=self._write_lease_seconds,
             )
-            cancellation.checkpoint()
-            await progress.report(
-                ProcessingStage.PACKAGING,
-                ProgressCounters(bundle.size_bytes, bundle.size_bytes, ProgressUnit.BYTES),
-            )
-            await progress.report(ProcessingStage.PUBLISHING, ProgressCounters(0, 1, ProgressUnit.ITEMS))
-            snapshot = await self._repository.register(
-                bundle,
-                publication.records,
-                write_guard=guard,
-            )
-            cancellation.checkpoint()
-            await progress.report(ProcessingStage.PUBLISHING, ProgressCounters(1, 1, ProgressUnit.ITEMS))
-            return snapshot
-        except BaseException:
-            if bundle is not None:
-                self._bundler.scrub_published(bundle)
-            raise
-        finally:
-            await self._repository.release_content_write(guard)
+            bundle: ArtifactBundle | None = None
+            registered = False
+            try:
+                cancellation.checkpoint()
+                await progress.report(ProcessingStage.PACKAGING, ProgressCounters(0, None, ProgressUnit.BYTES))
+                bundle = self._bundler.publish(
+                    result,
+                    publication,
+                    artifact_root=artifact_root,
+                    batch_id=batch_id,
+                    created_at=created_at,
+                    expires_at=expires_at,
+                )
+                cancellation.checkpoint()
+                await progress.report(
+                    ProcessingStage.PACKAGING,
+                    ProgressCounters(bundle.size_bytes, bundle.size_bytes, ProgressUnit.BYTES),
+                )
+                await progress.report(ProcessingStage.PUBLISHING, ProgressCounters(0, 1, ProgressUnit.ITEMS))
+                snapshot = await self._repository.register(
+                    bundle,
+                    publication.records,
+                    write_guard=guard,
+                )
+                registered = True
+                cancellation.checkpoint()
+                await progress.report(ProcessingStage.PUBLISHING, ProgressCounters(1, 1, ProgressUnit.ITEMS))
+                return snapshot
+            except BaseException:
+                if bundle is not None and not registered:
+                    self._bundler.scrub_published(bundle)
+                raise
+            finally:
+                await self._repository.release_content_write(guard)

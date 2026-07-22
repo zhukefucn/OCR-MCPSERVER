@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -42,11 +43,17 @@ from ocr_mcp_server.services.artifacts import (
     render_markdown,
 )
 from ocr_mcp_server.services.retention import RetentionService
+from ocr_mcp_server.services.file_storage import FileStorage
 from ocr_mcp_server.settings import ArtifactSettings
 
 
 NOW = datetime(2026, 7, 22, 8, 0, tzinfo=UTC)
 BATCH_ID = "00000000-0000-4000-8000-000000000009"
+
+
+class _MarkerRegistry:
+    async def bind_lock_marker(self, *_args, **_kwargs):
+        return None
 
 
 def _canonical(value: object) -> bytes:
@@ -1108,7 +1115,7 @@ async def test_early_delete_and_artifact_write_guard_have_atomic_ordering(
 
 @pytest.mark.asyncio
 async def test_packaging_step_reports_exact_packaging_then_publishing_counters(tmp_path: Path, artifact_repository) -> None:
-    repository, _, batch_id = artifact_repository
+    repository, engine, batch_id = artifact_repository
     result, publication, _, _ = _inputs(tmp_path)
     bundler = ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000))
     events = []
@@ -1139,7 +1146,12 @@ async def test_packaging_step_reports_exact_packaging_then_publishing_counters(t
             guard_events.append(("release", guard))
             await repository.release_content_write(guard)
 
-    step = ArtifactPackagingStep(bundler, GuardedRepository())
+    step = ArtifactPackagingStep(
+        bundler,
+        GuardedRepository(),
+        batch_locks=FileStorage((tmp_path / "data").absolute()),
+        marker_registry=RetentionRepository(create_session_factory(engine)),
+    )
     artifact = await step.run(
         result, publication, artifact_root=(tmp_path / "artifacts").absolute(), batch_id=batch_id,
         created_at=NOW, expires_at=NOW + timedelta(hours=24), progress=Progress(), cancellation=Cancellation(),
@@ -1153,6 +1165,125 @@ async def test_packaging_step_reports_exact_packaging_then_publishing_counters(t
     assert [name for name, _ in guard_events] == ["acquire", "register", "release"]
     assert len({guard.token for _, guard in guard_events}) == 1
     assert artifact == (await repository.list_for_file("file-a"))[0]
+
+
+@pytest.mark.asyncio
+async def test_expired_artifact_guard_cannot_bypass_the_shared_batch_lock(
+    tmp_path: Path, artifact_repository
+) -> None:
+    repository, engine, batch_id = artifact_repository
+    retention = RetentionRepository(create_session_factory(engine))
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    result, publication, _, _ = _inputs(tmp_path)
+    packaging_holds_lock = asyncio.Event()
+    resume_packaging = asyncio.Event()
+    early_delete_requested = asyncio.Event()
+
+    class Progress:
+        async def report(self, stage, counters=None):
+            if stage.value == "packaging" and counters.completed_units == 0:
+                packaging_holds_lock.set()
+                await resume_packaging.wait()
+
+    class Cancellation:
+        def checkpoint(self):
+            return None
+
+    class ObservedRetention:
+        def __getattr__(self, name):
+            return getattr(retention, name)
+
+        async def request_early_delete(self, selected_batch_id, *, now):
+            result = await retention.request_early_delete(selected_batch_id, now=now)
+            early_delete_requested.set()
+            return result
+
+    step = ArtifactPackagingStep(
+        ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)),
+        repository,
+        batch_locks=FileStorage(data_root),
+        marker_registry=retention,
+        now_factory=lambda: NOW,
+        write_lease_seconds=1,
+    )
+    packaging = asyncio.create_task(
+        step.run(
+            result,
+            publication,
+            artifact_root=artifact_root,
+            batch_id=batch_id,
+            created_at=NOW,
+            expires_at=NOW + timedelta(hours=24),
+            progress=Progress(),
+            cancellation=Cancellation(),
+        )
+    )
+    await packaging_holds_lock.wait()
+    cleanup = asyncio.create_task(
+        RetentionService(
+            ObservedRetention(), data_root, artifact_root
+        ).delete_task(
+            batch_id,
+            now=NOW + timedelta(seconds=1),
+            worker_id="cleanup",
+        )
+    )
+    await early_delete_requested.wait()
+    await asyncio.sleep(0)
+    assert cleanup.done() is False
+
+    resume_packaging.set()
+    with pytest.raises(ArtifactFailure):
+        await packaging
+    assert await cleanup is True
+    assert all(path.read_bytes() == b"" for path in artifact_root.rglob("*.zip"))
+
+
+@pytest.mark.asyncio
+async def test_post_register_cancellation_never_scrubs_an_available_artifact(
+    tmp_path: Path, artifact_repository
+) -> None:
+    repository, engine, batch_id = artifact_repository
+    artifact_root = (tmp_path / "artifacts").absolute()
+    result, publication, _, _ = _inputs(tmp_path)
+
+    class Progress:
+        async def report(self, *_args, **_kwargs):
+            return None
+
+    class Cancellation:
+        calls = 0
+
+        def checkpoint(self):
+            self.calls += 1
+            if self.calls == 3:
+                raise RuntimeError("post-register cancellation")
+
+    step = ArtifactPackagingStep(
+        ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)),
+        repository,
+        batch_locks=FileStorage((tmp_path / "data").absolute()),
+        marker_registry=RetentionRepository(create_session_factory(engine)),
+        now_factory=lambda: NOW,
+    )
+    with pytest.raises(RuntimeError, match="post-register cancellation"):
+        await step.run(
+            result,
+            publication,
+            artifact_root=artifact_root,
+            batch_id=batch_id,
+            created_at=NOW,
+            expires_at=NOW + timedelta(hours=24),
+            progress=Progress(),
+            cancellation=Cancellation(),
+        )
+
+    snapshot = (await repository.list_for_file("file-a"))[0]
+    archive = next(artifact_root.rglob("*.zip"))
+    assert snapshot.available is True
+    assert archive.stat().st_size == snapshot.size_bytes
+    assert sha256(archive.read_bytes()).hexdigest() == snapshot.sha256
 
 
 @pytest.mark.asyncio
@@ -1196,6 +1327,8 @@ async def test_packaging_scrubs_published_archive_when_registration_fails(
     step = ArtifactPackagingStep(
         ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)),
         repository,
+        batch_locks=FileStorage((tmp_path / "data").absolute()),
+        marker_registry=_MarkerRegistry(),
     )
     with pytest.raises(RuntimeError, match="planted registration failure"):
         await step.run(
@@ -1213,6 +1346,32 @@ async def test_packaging_scrubs_published_archive_when_registration_fails(
     assert len(archives) == 1
     assert archives[0].read_bytes() == b""
     assert repository.released is True
+
+
+def test_artifact_rollback_preserves_a_same_name_replacement(
+    tmp_path: Path,
+) -> None:
+    result, publication, _, _ = _inputs(tmp_path)
+    bundler = ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000))
+    bundle = bundler.publish(
+        result,
+        publication,
+        artifact_root=(tmp_path / "artifacts").absolute(),
+        batch_id=BATCH_ID,
+        created_at=NOW,
+        expires_at=NOW + timedelta(hours=24),
+    )
+    moved_original = bundle.path.with_name("moved-original.zip")
+    os.rename(bundle.path, moved_original)
+    replacement = b"replacement ZIP bytes must survive"
+    bundle.path.write_bytes(replacement)
+
+    with pytest.raises(ArtifactFailure) as caught:
+        bundler.scrub_published(bundle)
+
+    assert caught.value.code == ArtifactErrorCode.PUBLISH_FAILED.value
+    assert bundle.path.read_bytes() == replacement
+    assert moved_original.stat().st_size == bundle.size_bytes
 
 
 @pytest.mark.asyncio
@@ -1273,6 +1432,8 @@ async def test_exact_retry_requires_fsync_before_repository_registration(
     step = ArtifactPackagingStep(
         ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)),
         repository,
+        batch_locks=FileStorage((tmp_path / "data").absolute()),
+        marker_registry=_MarkerRegistry(),
     )
     arguments = dict(
         artifact_root=artifact_root,

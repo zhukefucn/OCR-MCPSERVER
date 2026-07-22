@@ -72,7 +72,14 @@ class FileStorage:
         self._id_factory = id_factory
 
     @asynccontextmanager
-    async def batch_lock(self, batch_id: str, *, allow_retired: bool = False):
+    async def batch_lock(
+        self,
+        batch_id: str,
+        *,
+        marker_registry,
+        allow_missing_marker: bool = False,
+        allow_retired: bool = False,
+    ):
         """Hold a process-shared exclusive lock for one canonical batch UUID."""
 
         canonical_batch_id = self._canonical_uuid(batch_id)
@@ -89,7 +96,7 @@ class FileStorage:
             lock_dir = self._open_child_directory(root, ".locks", create=True)
             if lock_dir is None:
                 raise OSError("lock directory unavailable")
-            descriptor = self._open_lock_file(
+            descriptor, created = self._open_lock_file(
                 lock_dir, f"{canonical_batch_id}.lock"
             )
             lock_name = f"{canonical_batch_id}.lock"
@@ -119,15 +126,23 @@ class FileStorage:
 
             if not lock_unchanged():
                 raise OSError("unsafe batch lock")
-            if os.fstat(descriptor).st_size == 0:
+            if created:
                 self._write_all(descriptor, b"\0")
                 os.fsync(descriptor)
+            elif os.fstat(descriptor).st_size == 0:
+                raise OSError("unknown empty batch lock")
             while not acquired:
                 acquired = self._try_batch_lock(descriptor)
                 if not acquired:
                     await asyncio.sleep(0.01)
             if not lock_unchanged():
                 raise OSError("unsafe batch lock")
+            await marker_registry.bind_lock_marker(
+                canonical_batch_id,
+                lock_identity,
+                created=created,
+                allow_missing=allow_missing_marker,
+            )
             os.lseek(descriptor, 0, os.SEEK_SET)
             marker = os.read(descriptor, 1)
             if marker == b"\x01":
@@ -498,10 +513,14 @@ class FileStorage:
             raise OSError("directory identity changed")
         return descriptor
 
-    def _open_lock_file(self, directory: _OpenedDirectory, name: str) -> int:
+    def _open_lock_file(self, directory: _OpenedDirectory, name: str) -> tuple[int, bool]:
         if directory.descriptor is not None:
-            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-            return os.open(name, flags, 0o600, dir_fd=directory.descriptor)
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                return os.open(name, flags, 0o600, dir_fd=directory.descriptor), True
+            except FileExistsError:
+                flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+                return os.open(name, flags, dir_fd=directory.descriptor), False
         if not self._directory_unchanged(directory):
             raise OSError("directory identity changed")
         path = directory.path / name
@@ -512,6 +531,7 @@ class FileStorage:
                 delete_access=False,
                 write_access=True,
             )
+            created = True
         except OSError as failure:
             if getattr(failure, "winerror", None) not in {80, 183}:
                 raise
@@ -521,10 +541,11 @@ class FileStorage:
                 delete_access=False,
                 write_access=True,
             )
+            created = False
         if not self._directory_unchanged(directory):
             os.close(descriptor)
             raise OSError("directory identity changed")
-        return descriptor
+        return descriptor, created
 
     def _open_existing_file(self, directory: _OpenedDirectory, name: str) -> int:
         if directory.descriptor is not None:
@@ -874,7 +895,11 @@ class FileStorage:
 
     @classmethod
     def _windows_open_directory_handle(
-        cls, path: Path, *, delete_access: bool = False
+        cls,
+        path: Path,
+        *,
+        delete_access: bool = False,
+        deny_delete_share: bool = False,
     ) -> int:
         kernel32 = cls._windows_kernel32()
         create_file = kernel32.CreateFileW
@@ -894,7 +919,7 @@ class FileStorage:
         handle = create_file(
             str(path),
             access,
-            0x1 | 0x2 | 0x4,
+            0x1 | 0x2 | (0 if deny_delete_share else 0x4),
             None,
             3,
             0x02000000 | 0x00200000,
@@ -931,6 +956,27 @@ class FileStorage:
             cls._windows_close_handle(handle)
             raise OSError("reparse directory")
         return int(handle)
+
+    @classmethod
+    def _windows_handle_path(cls, handle: int) -> str:
+        kernel32 = cls._windows_kernel32()
+        function = kernel32.GetFinalPathNameByHandleW
+        function.argtypes = (
+            wintypes.HANDLE,
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        )
+        function.restype = wintypes.DWORD
+        size = function(handle, None, 0, 0)
+        if not size:
+            raise ctypes.WinError(ctypes.get_last_error())
+        buffer = ctypes.create_unicode_buffer(size + 1)
+        written = function(handle, buffer, len(buffer), 0)
+        if not written or written >= len(buffer):
+            raise ctypes.WinError(ctypes.get_last_error())
+        value = buffer.value
+        return value[4:] if value.startswith("\\\\?\\") else value
 
     @classmethod
     def _windows_handle_identity(cls, handle: int) -> tuple[int, int]:

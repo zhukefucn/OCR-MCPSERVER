@@ -23,6 +23,9 @@ from ocr_mcp_server.services.file_validation import FileValidator
 
 
 class _FreshBatchGuards:
+    async def bind_lock_marker(self, *_args, **_kwargs):
+        return None
+
     async def acquire_content_write(self, *_args, **_kwargs):
         return None
 

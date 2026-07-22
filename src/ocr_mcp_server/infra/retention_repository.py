@@ -19,6 +19,7 @@ from ..domain.retention import (
 from .database import SessionFactory
 from .task_models import (
     ArtifactRecord,
+    BatchLockMarkerRecord,
     BatchRecord,
     FileTaskRecord,
     ReplacementAuditMetadataRecord,
@@ -60,6 +61,45 @@ class RetentionRepository:
             async with self._sessions() as session:
                 record = await session.get(RetentionRecord, batch_id)
                 return None if record is None else self._snapshot(record)
+        except SQLAlchemyError:
+            raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT) from None
+
+    async def bind_lock_marker(
+        self,
+        batch_id: str,
+        identity: tuple[int, int],
+        *,
+        created: bool,
+        allow_missing: bool,
+    ) -> None:
+        if (
+            not _valid_batch_id(batch_id)
+            or not isinstance(identity, tuple)
+            or len(identity) != 2
+            or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in identity)
+            or not isinstance(created, bool)
+            or not isinstance(allow_missing, bool)
+        ):
+            raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT) from None
+        encoded = f"{identity[0]:x}:{identity[1]:x}"
+        try:
+            async with self._sessions() as session:
+                await session.execute(text("BEGIN IMMEDIATE"))
+                retention = await session.get(RetentionRecord, batch_id)
+                if retention is None and not allow_missing:
+                    raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT)
+                marker = await session.get(BatchLockMarkerRecord, batch_id)
+                if marker is None:
+                    if not created:
+                        raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
+                    session.add(
+                        BatchLockMarkerRecord(batch_id=batch_id, identity=encoded)
+                    )
+                elif marker.identity != encoded:
+                    raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
+                await session.commit()
+        except RetentionFailure:
+            raise
         except SQLAlchemyError:
             raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT) from None
 

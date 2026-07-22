@@ -80,7 +80,11 @@ class FileIntakeService:
         batch_id: str,
         incoming: IncomingFile,
     ) -> StoredFile:
-        async with self._storage.batch_lock(batch_id):
+        async with self._storage.batch_lock(
+            batch_id,
+            marker_registry=self._content_write_guards,
+            allow_missing_marker=True,
+        ):
             guard = await self._content_write_guards.acquire_content_write(
                 batch_id,
                 "file-intake",
