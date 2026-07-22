@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 from collections.abc import Mapping
 import shutil
@@ -420,19 +421,25 @@ def test_idempotent_retry_rejects_publication_root_swap_between_checks(tmp_path,
     alternate = tmp_path / "alternate-publication"
     shutil.copytree(root, alternate)
     saved = tmp_path / "saved-publication"
-    original_check = __import__("ocr_mcp_server.services.merge_publication", fromlist=["_existing_target_is_unsafe"])._existing_target_is_unsafe
+    module = __import__("ocr_mcp_server.services.merge_publication", fromlist=["_assert_target_binding_path"])
+    binding_check_name = (
+        "_assert_target_binding_path"
+        if os.name == "nt"
+        else "_assert_target_binding_anchored"
+    )
+    original_check = getattr(module, binding_check_name)
     swapped = False
 
-    def swap_after_first_check(target):
+    def swap_after_final_binding(*args, **kwargs):
         nonlocal swapped
-        answer = original_check(target)
+        answer = original_check(*args, **kwargs)
         if not swapped:
             root.rename(saved)
             alternate.rename(root)
             swapped = True
         return answer
 
-    monkeypatch.setattr("ocr_mcp_server.services.merge_publication._existing_target_is_unsafe", swap_after_first_check)
+    monkeypatch.setattr(module, binding_check_name, swap_after_final_binding)
     with pytest.raises(MergeFailure) as raised:
         merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, **kwargs)
     assert raised.value.code == MergeErrorCode.UNSAFE_PUBLICATION_PATH.value
@@ -452,19 +459,37 @@ def test_idempotent_retry_rejects_target_swap_after_byte_match(tmp_path, limits,
     content_path.write_bytes(bytes(altered))
     saved = root / "saved-version"
     module = __import__("ocr_mcp_server.services.merge_publication", fromlist=["_existing_matches"])
-    original_match = module._existing_matches
     swapped = False
 
-    def swap_after_match(path, expected):
-        nonlocal swapped
-        answer = original_match(path, expected)
-        if answer and not swapped:
-            path.rename(saved)
-            alternate.rename(path)
-            swapped = True
-        return answer
+    if os.name == "nt":
+        original_match = module._existing_matches
 
-    monkeypatch.setattr("ocr_mcp_server.services.merge_publication._existing_matches", swap_after_match)
+        def swap_after_match(path, expected):
+            nonlocal swapped
+            answer = original_match(path, expected)
+            if answer and not swapped:
+                path.rename(saved)
+                alternate.rename(path)
+                swapped = True
+            return answer
+
+        monkeypatch.setattr(module, "_existing_matches", swap_after_match)
+    else:
+        original_open = module.os.open
+        target_open_count = 0
+
+        def swap_after_final_target_open(path, *args, **kwargs):
+            nonlocal swapped, target_open_count
+            descriptor = original_open(path, *args, **kwargs)
+            if path == target.name and kwargs.get("dir_fd") is not None:
+                target_open_count += 1
+                if target_open_count == 2 and not swapped:
+                    target.rename(saved)
+                    alternate.rename(target)
+                    swapped = True
+            return descriptor
+
+        monkeypatch.setattr(module.os, "open", swap_after_final_target_open)
     with pytest.raises(MergeFailure) as raised:
         merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, **kwargs)
     assert raised.value.code == MergeErrorCode.UNSAFE_PUBLICATION_PATH.value
