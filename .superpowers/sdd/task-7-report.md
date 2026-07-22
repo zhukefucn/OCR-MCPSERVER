@@ -137,3 +137,44 @@ GREEN focused 结果：`123 passed in 2.0s`。
 - pip check：`No broken requirements found.`
 - compileall：退出码 0
 - diff-check：退出码 0，仅 Git LF/CRLF 提示
+
+## Ubuntu 幂等发布绑定跟进（2026-07-22）
+
+Ubuntu 首轮门禁为 `2 failed, 529 passed, 4 skipped`。两项失败最初均显示 `DID NOT RAISE MergeFailure`。系统化调用链检查确认：
+
+- 原测试只 monkeypatch 了 Windows 路径的 `_existing_target_is_unsafe` 和 `_existing_matches`；POSIX 现有目标路径使用 `_classify_existing_target_anchored`，因此 Ubuntu 上测试根本没有执行交换动作。
+- 将故障注入移动到 POSIX 实际边界后，确认存在两个真实的最终绑定窗口：
+  - root 路径完成唯一一次 identity 检查后被替换，后续 target 校验仍绑定旧 root fd，最终却返回指向新 root 的路径；
+  - target 名称首次校验并打开 fd 后被替换，后续文件校验仍绑定旧 target fd，但没有再次校验 target 名称。
+
+TDD 测试提交：
+
+- `50c5a2344b944aec5295b0f89805adc81642c715` — `test: reproduce idempotent publication swaps`
+
+Ubuntu RED 命令：
+
+```text
+.venv/bin/python -m pytest tests/test_merge_publication.py::test_idempotent_retry_rejects_publication_root_swap_between_checks tests/test_merge_publication.py::test_idempotent_retry_rejects_target_swap_after_byte_match -q
+```
+
+Ubuntu RED 结果：两项均稳定失败，错误均为 `DID NOT RAISE MergeFailure`。本地 Windows 对公共 root 最终绑定窗口也得到预期 RED：`1 failed, 1 passed`；另一项使用 Linux 专用 `openat` 注入。
+
+最小生产修复提交：
+
+- `c7a83119ece27d7bf4774e394091e5a5b172732e` — `fix: recheck idempotent publication bindings`
+
+修复内容：
+
+- path 与 anchored target binding 在文件校验完成后再次校验 target 名称 identity；
+- 所有现有目标和 `FileExistsError` 幂等返回前再次校验 publication root 路径 identity。
+
+本地 Windows GREEN 与门禁：
+
+- 两项定向回归：`2 passed`
+- Task 7 focused：`123 passed`
+- Full：`530 passed, 5 skipped`
+- pip check：`No broken requirements found.`
+- compileall：退出码 0
+- diff-check：退出码 0，仅 Git LF/CRLF 提示
+
+Linux GREEN 与 Linux 全套结果等待 controller 同步上述修复提交后复验。
