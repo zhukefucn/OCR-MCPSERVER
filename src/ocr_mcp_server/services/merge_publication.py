@@ -842,7 +842,7 @@ def _verify_new_publication(
     *,
     original_stage_identity: os.stat_result,
     root_descriptor: int | None,
-) -> None:
+) -> _TargetBinding:
     if root_descriptor is not None:
         status, binding = _classify_existing_target_anchored(
             root_descriptor, target.name, contents
@@ -858,7 +858,7 @@ def _verify_new_publication(
         _assert_target_binding_anchored(
             root_descriptor, target.name, binding
         )
-        return
+        return binding
     if _existing_target_is_unsafe(target):
         _fail(MergeErrorCode.UNSAFE_PUBLICATION_PATH)
     binding = _existing_matches(target, contents)
@@ -870,6 +870,25 @@ def _verify_new_publication(
     ):
         _fail(MergeErrorCode.UNSAFE_PUBLICATION_PATH)
     _assert_target_binding_path(target, binding)
+    return binding
+
+
+def _finalize_publication_return(
+    root: Path,
+    root_identity: os.stat_result,
+    target: Path,
+    binding: _TargetBinding,
+    root_descriptor: int | None,
+) -> Path:
+    _assert_publication_root_identity(root, root_identity)
+    if root_descriptor is not None:
+        _assert_target_binding_anchored(
+            root_descriptor, target.name, binding
+        )
+    else:
+        _assert_target_binding_path(target, binding)
+    _assert_publication_root_identity(root, root_identity)
+    return target
 
 
 def _publish(root: Path, output_version: int, contents: Mapping[str, bytes], max_artifact_bytes: int) -> Path:
@@ -900,11 +919,13 @@ def _publish(root: Path, output_version: int, contents: Mapping[str, bytes], max
                     _fail(MergeErrorCode.UNSAFE_PUBLICATION_PATH)
                 if existing_status == "match":
                     assert existing_binding is not None
-                    _assert_target_binding_anchored(
-                        root_descriptor, target.name, existing_binding
+                    return _finalize_publication_return(
+                        root,
+                        root_identity,
+                        target,
+                        existing_binding,
+                        root_descriptor,
                     )
-                    _assert_publication_root_identity(root, root_identity)
-                    return target
                 _fail(MergeErrorCode.PUBLICATION_CONFLICT)
             finally:
                 os.close(root_descriptor)
@@ -914,10 +935,13 @@ def _publish(root: Path, output_version: int, contents: Mapping[str, bytes], max
         _assert_publication_root_identity(root, root_identity)
         existing_binding = _existing_matches(target, contents)
         if existing_binding is not None:
-            _assert_publication_root_identity(root, root_identity)
-            _assert_target_binding_path(target, existing_binding)
-            _assert_publication_root_identity(root, root_identity)
-            return target
+            return _finalize_publication_return(
+                root,
+                root_identity,
+                target,
+                existing_binding,
+                root_descriptor,
+            )
         _fail(MergeErrorCode.PUBLICATION_CONFLICT)
     try:
         stage = Path(tempfile.mkdtemp(prefix=".merge-stage-", dir=root))
@@ -966,7 +990,7 @@ def _publish(root: Path, output_version: int, contents: Mapping[str, bytes], max
         ):
             _fail(MergeErrorCode.UNSAFE_PUBLICATION_PATH)
         _publish_stage_anchored(stage, target, root_descriptor)
-        _verify_new_publication(
+        publication_binding = _verify_new_publication(
             target,
             contents,
             original_stage_identity=(
@@ -992,7 +1016,13 @@ def _publish(root: Path, output_version: int, contents: Mapping[str, bytes], max
         except OSError:
             if os.name != "nt":
                 raise
-        return target
+        return _finalize_publication_return(
+            root,
+            root_identity,
+            target,
+            publication_binding,
+            root_descriptor,
+        )
     except FileExistsError:
         if root_descriptor is not None:
             existing_status, existing_binding = _classify_existing_target_anchored(
@@ -1003,21 +1033,26 @@ def _publish(root: Path, output_version: int, contents: Mapping[str, bytes], max
                 _fail(MergeErrorCode.UNSAFE_PUBLICATION_PATH)
             if existing_status == "match":
                 assert existing_binding is not None
-                _assert_target_binding_anchored(
-                    root_descriptor, target.name, existing_binding
+                return _finalize_publication_return(
+                    root,
+                    root_identity,
+                    target,
+                    existing_binding,
+                    root_descriptor,
                 )
-                _assert_publication_root_identity(root, root_identity)
-                return target
         else:
             if _existing_target_is_unsafe(target):
                 _fail(MergeErrorCode.UNSAFE_PUBLICATION_PATH)
             _assert_publication_root_identity(root, root_identity)
             existing_binding = _existing_matches(target, contents)
             if existing_binding is not None:
-                _assert_publication_root_identity(root, root_identity)
-                _assert_target_binding_path(target, existing_binding)
-                _assert_publication_root_identity(root, root_identity)
-                return target
+                return _finalize_publication_return(
+                    root,
+                    root_identity,
+                    target,
+                    existing_binding,
+                    root_descriptor,
+                )
         _fail(MergeErrorCode.PUBLICATION_CONFLICT)
     except MergeFailure:
         raise

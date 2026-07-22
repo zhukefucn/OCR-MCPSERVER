@@ -445,6 +445,63 @@ def test_idempotent_retry_rejects_publication_root_swap_between_checks(tmp_path,
     assert raised.value.code == MergeErrorCode.UNSAFE_PUBLICATION_PATH.value
 
 
+def test_first_publication_rejects_root_swap_after_root_fsync(tmp_path, limits, monkeypatch):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    root = tmp_path / "published"
+    alternate = tmp_path / "alternate-publication"; alternate.mkdir()
+    saved = tmp_path / "saved-publication"
+    module = __import__("ocr_mcp_server.services.merge_publication", fromlist=["_same_object_identity"])
+    original_fsync = module.os.fsync
+    original_verify = module._verify_new_publication
+    swapped = False
+    verified = False
+
+    def swap_root():
+        nonlocal swapped
+        root.rename(saved)
+        alternate.rename(root)
+        swapped = True
+
+    def mark_publication_verified(*args, **kwargs):
+        nonlocal verified
+        answer = original_verify(*args, **kwargs)
+        verified = True
+        if os.name == "nt":
+            # Windows cannot reliably fsync a directory descriptor, so inject at
+            # the equivalent final boundary immediately after verification.
+            swap_root()
+        return answer
+
+    def swap_after_root_fsync(descriptor):
+        nonlocal swapped
+        try:
+            return original_fsync(descriptor)
+        finally:
+            if (
+                not swapped
+                and verified
+                and root.exists()
+            ):
+                swap_root()
+
+    monkeypatch.setattr(module, "_verify_new_publication", mark_publication_verified)
+    if os.name != "nt":
+        monkeypatch.setattr(module.os, "fsync", swap_after_root_fsync)
+    with pytest.raises(MergeFailure) as raised:
+        merge_and_publish(
+            result,
+            collection,
+            {candidate.candidate_id: _ocr()},
+            publication_root=root,
+            output_version=2,
+            timestamp=NOW,
+            limits=limits,
+        )
+    assert swapped
+    assert raised.value.code == MergeErrorCode.UNSAFE_PUBLICATION_PATH.value
+
+
 def test_idempotent_retry_rejects_target_swap_after_byte_match(tmp_path, limits, monkeypatch):
     node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
     result, collection, candidate, _ = _setup(tmp_path, [node])
@@ -462,18 +519,33 @@ def test_idempotent_retry_rejects_target_swap_after_byte_match(tmp_path, limits,
     swapped = False
 
     if os.name == "nt":
-        original_match = module._existing_matches
+        original_assert = module._assert_target_binding_path
+        original_lstat = module.os.lstat
+        validation = {"armed": False, "last_file": None}
 
-        def swap_after_match(path, expected):
+        def assert_with_swap_armed(path, binding):
+            validation["armed"] = True
+            validation["last_file"] = path / next(reversed(binding.file_identities))
+            try:
+                return original_assert(path, binding)
+            finally:
+                validation["armed"] = False
+
+        def swap_after_last_file_identity_check(path, *args, **kwargs):
             nonlocal swapped
-            answer = original_match(path, expected)
-            if answer and not swapped:
-                path.rename(saved)
-                alternate.rename(path)
+            answer = original_lstat(path, *args, **kwargs)
+            if (
+                validation["armed"]
+                and Path(path) == validation["last_file"]
+                and not swapped
+            ):
+                target.rename(saved)
+                alternate.rename(target)
                 swapped = True
             return answer
 
-        monkeypatch.setattr(module, "_existing_matches", swap_after_match)
+        monkeypatch.setattr(module, "_assert_target_binding_path", assert_with_swap_armed)
+        monkeypatch.setattr(module.os, "lstat", swap_after_last_file_identity_check)
     else:
         original_open = module.os.open
         target_open_count = 0
@@ -492,6 +564,7 @@ def test_idempotent_retry_rejects_target_swap_after_byte_match(tmp_path, limits,
         monkeypatch.setattr(module.os, "open", swap_after_final_target_open)
     with pytest.raises(MergeFailure) as raised:
         merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, **kwargs)
+    assert swapped
     assert raised.value.code == MergeErrorCode.UNSAFE_PUBLICATION_PATH.value
 
 
