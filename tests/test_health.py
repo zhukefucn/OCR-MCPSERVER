@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import gc
+import threading
 import time
 import weakref
 
@@ -330,20 +331,20 @@ async def test_cancellation_suppressing_probe_cannot_delay_timeout_or_metrics() 
 
     sink = Sink()
     started = time.monotonic()
-    pending = asyncio.create_task(
-        service(
-            Probe(DependencyName.SQLITE, refuses_cancellation),
-            Probe(DependencyName.MINERU, lambda: ready(DependencyName.MINERU)),
-            Probe(DependencyName.PADDLE, lambda: ready(DependencyName.PADDLE)),
-            timeout=0.01,
-            observability=sink,
-        ).check()
+    readiness = service(
+        Probe(DependencyName.SQLITE, refuses_cancellation),
+        Probe(DependencyName.MINERU, lambda: ready(DependencyName.MINERU)),
+        Probe(DependencyName.PADDLE, lambda: ready(DependencyName.PADDLE)),
+        timeout=0.01,
+        observability=sink,
     )
+    pending = asyncio.create_task(readiness.check())
     try:
         await asyncio.wait_for(cancelled.wait(), timeout=0.1)
         await asyncio.sleep(0.02)
         assert pending.done()
         snapshot = await pending
+        assert readiness.drain_observations()
         assert time.monotonic() - started < 0.1
         assert snapshot.dependencies[0].code is ProbeCode.TIMEOUT
         assert sink.calls == [
@@ -562,6 +563,7 @@ async def test_pending_probe_does_not_retain_service_or_metrics_sink() -> None:
             del dependency, ready
 
     sink = Sink()
+    prior_threads = set(threading.enumerate())
     readiness = service(
         Probe(DependencyName.SQLITE, resistant_sqlite),
         Probe(DependencyName.MINERU, lambda: ready(DependencyName.MINERU)),
@@ -570,6 +572,8 @@ async def test_pending_probe_does_not_retain_service_or_metrics_sink() -> None:
         observability=sink,
     )
     await readiness.check()
+    observation_workers = set(threading.enumerate()) - prior_threads
+    assert len(observation_workers) == 1
     readiness_reference = weakref.ref(readiness)
     sink_reference = weakref.ref(sink)
     del readiness, sink
@@ -577,6 +581,13 @@ async def test_pending_probe_does_not_retain_service_or_metrics_sink() -> None:
     try:
         assert readiness_reference() is None
         assert sink_reference() is None
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline and not observation_workers.isdisjoint(
+            set(threading.enumerate())
+        ):
+            gc.collect()
+            await asyncio.sleep(0.005)
+        assert observation_workers.isdisjoint(set(threading.enumerate()))
     finally:
         release.set()
         await asyncio.sleep(0)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
-from queue import Full, Queue
+from queue import Empty, Full, Queue
 import re
 import threading
 import time
@@ -197,11 +197,77 @@ def best_effort(observation: Callable[[], None]) -> None:
         return
 
 
-_DISPATCH_STOP = object()
+class _ObservationDispatchState:
+    """Worker-owned state that deliberately has no dispatcher back-reference."""
+
+    def __init__(self, sink: ObservabilitySink, capacity: int) -> None:
+        try:
+            self.sink_reference = weakref.ref(sink)
+            self.sink_strong = None
+        except TypeError:
+            self.sink_reference = None
+            self.sink_strong = sink
+        self.queue: Queue[tuple[str, tuple[object, ...]] | object] = Queue(
+            maxsize=capacity
+        )
+        self.lock = threading.Lock()
+        self.closed = False
+        self.dropped = 0
+        self.stop_token = object()
+
+
+def _stop_dispatch_state(state: _ObservationDispatchState) -> None:
+    """Stop exactly one dispatch state and discard its bounded queued payloads."""
+
+    with state.lock:
+        if state.closed:
+            return
+        state.closed = True
+    while True:
+        try:
+            state.queue.get_nowait()
+        except Empty:
+            break
+        else:
+            state.queue.task_done()
+    try:
+        state.queue.put_nowait(state.stop_token)
+    except Full:
+        return
+
+
+def _run_dispatch_state(state: _ObservationDispatchState) -> None:
+    """Run without retaining the public dispatcher owner."""
+
+    while True:
+        try:
+            item = state.queue.get(timeout=0.05)
+        except Empty:
+            with state.lock:
+                if state.closed:
+                    return
+            continue
+        try:
+            if item is state.stop_token:
+                return
+            with state.lock:
+                closed = state.closed
+            if closed:
+                continue
+            method, args = item
+            sink = (
+                state.sink_strong
+                if state.sink_reference is None
+                else state.sink_reference()
+            )
+            if sink is not None:
+                best_effort(lambda: getattr(sink, method)(*args))
+        finally:
+            state.queue.task_done()
 
 
 class ObservationDispatcher(NullObservability):
-    """Bounded asynchronous adapter for synchronous observation sinks."""
+    """Bounded asynchronous adapter with exactly one FIFO sink worker."""
 
     def __init__(
         self,
@@ -217,40 +283,30 @@ class ObservationDispatcher(NullObservability):
             or capacity < 1
             or isinstance(worker_count, bool)
             or not isinstance(worker_count, int)
-            or not 1 <= worker_count <= 4
+            or worker_count != 1
         ):
             raise _invalid()
-        try:
-            self._sink_reference = weakref.ref(sink)
-            self._sink_strong = None
-        except TypeError:
-            self._sink_reference = None
-            self._sink_strong = sink
-        self._queue: Queue[tuple[str, tuple[object, ...]] | object] = Queue(
-            maxsize=capacity
-        )
-        self._closed = False
-        self._lock = threading.Lock()
-        self._dropped = 0
-        self._threads = tuple(
+        self._state = _ObservationDispatchState(sink, capacity)
+        self._threads = (
             threading.Thread(
-                target=self._run,
-                name=f"ocr-observation-{number}",
+                target=_run_dispatch_state,
+                args=(self._state,),
+                name=f"ocr-observation-{id(self._state):x}",
                 daemon=True,
-            )
-            for number in range(worker_count)
+            ),
         )
+        self._finalizer = weakref.finalize(self, _stop_dispatch_state, self._state)
         for thread in self._threads:
             thread.start()
 
     @property
     def pending(self) -> int:
-        return self._queue.qsize()
+        return self._state.queue.qsize()
 
     @property
     def dropped(self) -> int:
-        with self._lock:
-            return self._dropped
+        with self._state.lock:
+            return self._state.dropped
 
     @property
     def worker_count(self) -> int:
@@ -294,34 +350,14 @@ class ObservationDispatcher(NullObservability):
         self._submit("set_dependency_ready", dependency, ready)
 
     def _submit(self, method: str, *args: object) -> None:
-        with self._lock:
-            if self._closed:
-                self._dropped += 1
+        with self._state.lock:
+            if self._state.closed:
+                self._state.dropped += 1
                 return
             try:
-                self._queue.put_nowait((method, args))
+                self._state.queue.put_nowait((method, args))
             except Full:
-                self._dropped += 1
-
-    def _run(self) -> None:
-        while True:
-            item = self._queue.get()
-            try:
-                if item is _DISPATCH_STOP:
-                    return
-                method, args = item
-                sink = (
-                    self._sink_strong
-                    if self._sink_reference is None
-                    else self._sink_reference()
-                )
-                if sink is not None:
-                    best_effort(lambda: getattr(sink, method)(*args))
-            finally:
-                self._queue.task_done()
-            with self._lock:
-                if self._closed and self._queue.empty():
-                    return
+                self._state.dropped += 1
 
     def drain(self, timeout: float = 1.0) -> bool:
         if (
@@ -331,24 +367,23 @@ class ObservationDispatcher(NullObservability):
         ):
             raise _invalid()
         deadline = time.monotonic() + float(timeout)
-        while self._queue.unfinished_tasks:
+        while self._state.queue.unfinished_tasks:
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.001)
         return True
 
     def close(self, *, timeout: float = 0.1) -> None:
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or timeout < 0
+        ):
+            raise _invalid()
+        timeout = float(timeout)
         deadline = time.monotonic() + timeout
         self.drain(timeout)
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-        for _ in self._threads:
-            try:
-                self._queue.put_nowait(_DISPATCH_STOP)
-            except Full:
-                break
+        self._finalizer()
         for thread in self._threads:
             remaining = deadline - time.monotonic()
             if remaining <= 0:

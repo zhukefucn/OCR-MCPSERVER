@@ -204,7 +204,7 @@ issues. They were addressed as one coordinated TDD wave.
   or Paddle-lock paths.
 - GREEN: `ObservationDispatcher` validates finite observation arguments before
   bounded `put_nowait` admission. Defaults are capacity 256 and one daemon worker;
-  worker count is validated from 1 through 4. Full queues and closed dispatchers
+  worker count is exactly one. Full queues and closed dispatchers
   increment a drop counter without blocking business work.
 - Sink execution occurs only on fixed worker threads. Ordinary errors and
   sink-originated `CancelledError` are contained. Queue payloads contain only the
@@ -240,6 +240,63 @@ issues. They were addressed as one coordinated TDD wave.
 - Ultimate isolated full suite after deterministic worker-exit verification:
   `990 passed, 20 skipped in 20.47s` using basetemp
   `.pytest-tmp/final-review-full-ultimate`.
+- `pip check` reports no broken requirements, `compileall` exits 0, and
+  `git diff --check` exits 0 with informational Windows LF/CRLF notices only.
+
+No push, sync, image build, deployment, production fault control, heavy dependency,
+or new telemetry backend was added.
+
+## Final dispatcher ordering, ownership, and scrape remediation
+
+The last dispatcher review identified three lifecycle/concurrency gaps. They were
+closed with focused RED/GREEN tests before the final suite.
+
+### FIFO metric application
+
+- RED: constructor values `worker_count=2` and `4` were accepted, allowing a
+  delayed first gauge write to be overtaken by a later write.
+- GREEN: `worker_count` now accepts only exact integer `1`. A delayed-first gauge
+  test proves sink calls remain `[1, 2]` and the final gauge value is the last
+  submitted value. Counters and histograms share the same FIFO worker.
+
+### Owner collection and dispatcher shutdown
+
+- RED: the thread target was the bound method `self._run`; an idle unclosed
+  dispatcher remained strongly reachable and its worker was still alive after
+  repeated GC. Readiness and unstarted app owners collected, but leaked the same
+  worker.
+- GREEN: the worker runs a module-level function over a private state object with
+  no dispatcher back-reference. A per-dispatcher stop-token and
+  `weakref.finalize` close only that state, discard its bounded finite-argument
+  queue, and wake an idle worker. Explicit `close()` invokes the identical
+  identity-safe finalizer path.
+- Tests prove idle dispatcher, readiness owner, and unstarted app collection stop
+  their workers promptly. A queued-owner test proves the public owner collects
+  immediately, queued payloads are discarded, and a worker already inside a
+  blocking user sink exits after that sink is released.
+- App lifespan closes an injected `ReadinessService` dispatcher only through the
+  service's ownership-aware close hook. If readiness received an externally owned
+  dispatcher, that hook is a no-op; the app does not double-close it.
+
+### Non-blocking metrics scraping
+
+- RED: three concurrent `/metrics` scrapes called synchronous `drain()` and
+  blocked the event loop for about 0.344 seconds behind a forever-blocking sink.
+- GREEN: scrape-time draining was removed. Metrics are eventually consistent and
+  remain self-excluded. Deterministic accounting tests drain the owning dispatcher
+  before issuing a scrape, outside the endpoint.
+- The concurrent regression proves repeated unauthenticated scrapes, an unrelated
+  live request, and an event-loop tick complete within the bounded threshold while
+  the observation sink remains blocked.
+
+### Final evidence
+
+- Dispatcher/health/HTTP component set: `86 passed in 2.40s`; after the queued
+  owner addition the dispatcher file alone is `44 passed in 0.66s`.
+- Final Task 12 focused set: `278 passed in 10.98s` using basetemp
+  `.pytest-tmp/task12-final-focused`.
+- Final isolated full suite: `1001 passed, 20 skipped in 21.26s` using basetemp
+  `.pytest-tmp/task12-final-full`.
 - `pip check` reports no broken requirements, `compileall` exits 0, and
   `git diff --check` exits 0 with informational Windows LF/CRLF notices only.
 

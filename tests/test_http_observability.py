@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import threading
+import time
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
+import httpx
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 from fastapi.testclient import TestClient
@@ -15,7 +20,18 @@ from ocr_mcp_server.api.observability import HttpObservabilityMiddleware
 from ocr_mcp_server.app import create_app
 from ocr_mcp_server.infra.prometheus_observability import PrometheusObservability
 from ocr_mcp_server.infra.safe_logging import SafeLogEvent, SafeLogEventName
-from ocr_mcp_server.services.observability import HttpObservation
+from ocr_mcp_server.services.health import (
+    DependencyStatus,
+    ProbeCode,
+    ProbeResult,
+    ReadinessService,
+)
+from ocr_mcp_server.services.observability import (
+    DependencyName,
+    HttpObservation,
+    NullObservability,
+    ObservationDispatcher,
+)
 from ocr_mcp_server.settings import AppSettings
 
 
@@ -115,10 +131,10 @@ def test_metrics_uses_injected_registry_content_type_and_excludes_its_scrape() -
     registry = CollectorRegistry()
     sink = PrometheusObservability(registry)
     settings = AppSettings(auth={"api_keys": []})
-    with TestClient(
-        create_app(settings, registry=registry, observability=sink)
-    ) as client:
+    app = create_app(settings, registry=registry, observability=sink)
+    with TestClient(app) as client:
         live = client.get("/health/live")
+        assert app.state.observability_dispatcher.drain(0.2)
         metrics = client.get("/metrics")
     assert live.status_code == 200
     assert metrics.status_code == 200
@@ -127,6 +143,102 @@ def test_metrics_uses_injected_registry_content_type_and_excludes_its_scrape() -
     text = metrics.text
     assert 'route="/health/live"' in text
     assert 'route="/metrics"' not in text
+
+
+@pytest.mark.asyncio
+async def test_blocked_sink_does_not_make_metrics_scrapes_block_the_event_loop() -> None:
+    release = threading.Event()
+
+    class BlockingSink(RecordingSink):
+        def observe_http(self, observation: HttpObservation) -> None:
+            release.wait()
+            super().observe_http(observation)
+
+    app = create_app(AppSettings(auth={"api_keys": []}), observability=BlockingSink())
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            assert (await client.get("/health/live")).status_code == 200
+            started = time.monotonic()
+            ticked = False
+
+            async def tick() -> None:
+                nonlocal ticked
+                await asyncio.sleep(0)
+                ticked = True
+
+            responses = await asyncio.gather(
+                *(client.get("/metrics") for _ in range(3)),
+                client.get("/health/live"),
+                tick(),
+            )
+            elapsed = time.monotonic() - started
+        assert ticked
+        assert elapsed < 0.2
+        assert all(response.status_code == 200 for response in responses[:-1])
+    finally:
+        release.set()
+        app.state.observability_dispatcher.close()
+
+
+def test_app_lifespan_closes_only_dispatcher_owned_by_injected_readiness() -> None:
+    class Probe:
+        def __init__(self, dependency: DependencyName) -> None:
+            self.dependency = dependency
+
+        async def check(self) -> ProbeResult:
+            return ProbeResult(self.dependency, DependencyStatus.READY, ProbeCode.READY)
+
+    probes = tuple(Probe(dependency) for dependency in DependencyName)
+    readiness = ReadinessService(probes, 0.1, observability=RecordingSink())
+    owned = readiness._owned_observability
+    assert owned is not None
+    with TestClient(
+        create_app(
+            AppSettings(auth={"api_keys": []}),
+            observability=NullObservability(),
+            readiness=readiness,
+        )
+    ) as client:
+        assert client.get("/health/live").status_code == 200
+    assert owned.wait_closed(0.2)
+
+    external = ObservationDispatcher(NullObservability())
+    externally_owned_readiness = ReadinessService(
+        probes, 0.1, observability=external
+    )
+    with TestClient(
+        create_app(
+            AppSettings(auth={"api_keys": []}),
+            observability=NullObservability(),
+            readiness=externally_owned_readiness,
+        )
+    ) as client:
+        assert client.get("/health/live").status_code == 200
+    assert external.alive_workers == 1
+    external.close()
+    assert external.wait_closed(0.2)
+
+
+def test_unstarted_unclosed_app_is_collectible_and_terminates_owned_dispatcher() -> None:
+    prior_threads = set(threading.enumerate())
+    app = create_app(
+        AppSettings(auth={"api_keys": []}), observability=RecordingSink()
+    )
+    app_reference = weakref.ref(app)
+    workers = set(threading.enumerate()) - prior_threads
+    assert len(workers) == 1
+
+    del app
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        gc.collect()
+        if app_reference() is None and workers.isdisjoint(set(threading.enumerate())):
+            break
+        time.sleep(0.005)
+
+    assert app_reference() is None
+    assert workers.isdisjoint(set(threading.enumerate()))
 
 
 def test_metrics_render_failure_is_content_free_503(monkeypatch: pytest.MonkeyPatch) -> None:

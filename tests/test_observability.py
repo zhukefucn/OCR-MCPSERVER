@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import math
+import threading
+import time
+import weakref
 
 import pytest
 from prometheus_client import CollectorRegistry, generate_latest
@@ -36,9 +40,6 @@ def test_best_effort_contains_sink_cancelled_error_but_not_process_exit():
 
 
 def test_dispatcher_is_bounded_nonblocking_and_close_never_waits_for_blocked_sink():
-    import threading
-    import time
-
     blocked = threading.Event()
 
     class Sink(NullObservability):
@@ -60,6 +61,90 @@ def test_dispatcher_is_bounded_nonblocking_and_close_never_waits_for_blocked_sin
     blocked.set()
     assert dispatcher.wait_closed(0.2)
     assert dispatcher.alive_workers == 0
+
+
+@pytest.mark.parametrize("worker_count", [0, 2, 4, True, 1.0])
+def test_dispatcher_requires_exactly_one_integer_worker(worker_count):
+    with pytest.raises(ValueError, match="^invalid observation$"):
+        ObservationDispatcher(NullObservability(), worker_count=worker_count)
+
+
+def test_dispatcher_preserves_gauge_submission_order_when_first_write_is_delayed():
+    first_started = threading.Event()
+    release_first = threading.Event()
+    values: list[int] = []
+
+    class Sink(NullObservability):
+        def set_orchestration_queue_depth(self, depth: int) -> None:
+            if depth == 1:
+                first_started.set()
+                release_first.wait()
+            values.append(depth)
+
+    sink = Sink()
+    dispatcher = ObservationDispatcher(sink)
+    dispatcher.set_orchestration_queue_depth(1)
+    assert first_started.wait(0.2)
+    dispatcher.set_orchestration_queue_depth(2)
+    release_first.set()
+    assert dispatcher.drain(0.2)
+    dispatcher.close()
+    assert values == [1, 2]
+    assert values[-1] == 2
+
+
+def test_unclosed_idle_dispatcher_is_collectible_and_terminates_its_worker():
+    prior_threads = set(threading.enumerate())
+    dispatcher = ObservationDispatcher(NullObservability())
+    dispatcher_reference = weakref.ref(dispatcher)
+    workers = set(threading.enumerate()) - prior_threads
+    assert len(workers) == 1
+
+    del dispatcher
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        gc.collect()
+        alive_threads = set(threading.enumerate())
+        if dispatcher_reference() is None and workers.isdisjoint(alive_threads):
+            break
+        time.sleep(0.005)
+
+    assert dispatcher_reference() is None
+    assert workers.isdisjoint(set(threading.enumerate()))
+
+
+def test_collecting_owner_discards_queued_payload_and_stops_after_sink_returns():
+    entered = threading.Event()
+    release = threading.Event()
+    values: list[int] = []
+
+    class Sink(NullObservability):
+        def set_orchestration_queue_depth(self, depth: int) -> None:
+            entered.set()
+            release.wait()
+            values.append(depth)
+
+    prior_threads = set(threading.enumerate())
+    sink = Sink()
+    dispatcher = ObservationDispatcher(sink, capacity=2)
+    workers = set(threading.enumerate()) - prior_threads
+    dispatcher.set_orchestration_queue_depth(1)
+    assert entered.wait(0.2)
+    dispatcher.set_orchestration_queue_depth(2)
+    dispatcher_reference = weakref.ref(dispatcher)
+    del dispatcher
+    gc.collect()
+    assert dispatcher_reference() is None
+
+    release.set()
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline and not workers.isdisjoint(
+        set(threading.enumerate())
+    ):
+        time.sleep(0.005)
+
+    assert workers.isdisjoint(set(threading.enumerate()))
+    assert values == [1]
 
 
 def _http(

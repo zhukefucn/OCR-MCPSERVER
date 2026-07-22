@@ -82,6 +82,8 @@ def create_app(
             async with mcp_app.lifespan(application):
                 yield
         finally:
+            if isinstance(resolved_readiness, ReadinessService):
+                resolved_readiness.close_observability()
             if owned_dispatcher is not None:
                 owned_dispatcher.close()
 
@@ -96,6 +98,11 @@ def create_app(
     app.include_router(router)
 
     resolved_logger = event_logger if event_logger is not None else _event_logger()
+    resolved_readiness = (
+        readiness
+        if readiness is not None
+        else _UnavailableReadiness(resolved_observability)
+    )
     app.state.observability_registry = resolved_registry
     app.state.observability = resolved_observability
     app.state.observability_target = raw_observability
@@ -104,17 +111,11 @@ def create_app(
         if isinstance(resolved_observability, ObservationDispatcher)
         else None
     )
-    app.state.readiness = (
-        readiness
-        if readiness is not None
-        else _UnavailableReadiness(resolved_observability)
-    )
+    app.state.readiness = resolved_readiness
 
     @app.get("/metrics", include_in_schema=False)
     async def metrics() -> Response:
         try:
-            if isinstance(resolved_observability, ObservationDispatcher):
-                resolved_observability.drain(0.1)
             body = generate_latest(resolved_registry)
         except Exception:
             return Response(status_code=503, content=b"")
