@@ -156,14 +156,14 @@ class SecondaryOCRSettings(_SettingsSection):
 
 
 class StructuredContentSettings(_SettingsSection):
-    max_characters: int = Field(default=1_000_000, ge=1)
-    max_utf8_bytes: int = Field(default=4_000_000, ge=1)
-    max_html_depth: int = Field(default=64, ge=1)
-    max_html_elements: int = Field(default=20_000, ge=1)
-    max_table_rows: int = Field(default=5_000, ge=1)
-    max_table_cells: int = Field(default=10_000, ge=1)
-    max_latex_repetition: int = Field(default=128, ge=1)
-    max_artifact_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
+    max_characters: int = Field(default=1_000_000, ge=1, le=10_000_000)
+    max_utf8_bytes: int = Field(default=4_000_000, ge=1, le=40_000_000)
+    max_html_depth: int = Field(default=64, ge=1, le=256)
+    max_html_elements: int = Field(default=20_000, ge=1, le=100_000)
+    max_table_rows: int = Field(default=5_000, ge=1, le=20_000)
+    max_table_cells: int = Field(default=10_000, ge=1, le=100_000)
+    max_latex_repetition: int = Field(default=128, ge=1, le=1_024)
+    max_artifact_bytes: int = Field(default=64 * 1024 * 1024, ge=1, le=256 * 1024 * 1024)
 
     @field_validator(
         "max_characters",

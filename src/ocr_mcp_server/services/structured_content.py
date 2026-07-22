@@ -37,7 +37,20 @@ class StructuredContentLimits:
             self.max_latex_repetition,
             self.max_artifact_bytes,
         )
-        if any(type(value) is not int or value < 1 for value in values):
+        hard_caps = (
+            10_000_000,
+            40_000_000,
+            256,
+            100_000,
+            20_000,
+            100_000,
+            1_024,
+            256 * 1024 * 1024,
+        )
+        if any(
+            type(value) is not int or value < 1 or value > cap
+            for value, cap in zip(values, hard_caps, strict=True)
+        ):
             raise ValueError("structured-content limits must be positive integers")
         if (
             self.max_utf8_bytes < self.max_characters
@@ -55,11 +68,49 @@ _ALLOWED_TAGS = frozenset(
 _CELL_TAGS = frozenset({"td", "th"})
 _SPAN_ATTRIBUTES = frozenset({"rowspan", "colspan"})
 _DANGEROUS_TEX = re.compile(
-    r"\\(?:input|include|includeonly|write|immediate|openout|openin|read|catcode|csname|usepackage|documentclass|newread|newwrite|loop|repeat)\b",
+    r"\\(?:input|include|includeonly|write|immediate|openout|openin|read|catcode|csname|usepackage|documentclass|newread|newwrite|def|edef|gdef|xdef|newcommand|renewcommand|special|directlua|href|url|loop|repeat)(?![A-Za-z])",
     re.IGNORECASE,
 )
 _ENVIRONMENT = re.compile(r"\\(begin|end)\{([A-Za-z][A-Za-z0-9*_-]{0,31})\}")
 _TOKEN = re.compile(r"\\[A-Za-z]+|\\.|[A-Za-z0-9]+|[^\s]")
+_TEX_COMMAND = re.compile(r"\\([A-Za-z]+|.)", re.DOTALL)
+_SAFE_TEX_ENVIRONMENTS = frozenset(
+    {
+        "array", "matrix", "pmatrix", "bmatrix", "Bmatrix", "vmatrix",
+        "Vmatrix", "smallmatrix", "cases", "aligned", "alignedat", "gathered",
+        "split", "equation", "equation*", "align", "align*", "gather", "gather*",
+        "multline", "multline*",
+    }
+)
+_SAFE_TEX_COMMANDS = frozenset(
+    """
+    begin end frac dfrac tfrac cfrac sqrt binom dbinom tbinom substack
+    overset underset stackrel limits nolimits left right middle big Big bigg Bigg
+    bigl bigr bigm Bigl Bigr Bigm biggl biggr biggm Biggl Biggr Biggm
+    mathrm mathbf mathit mathsf mathtt mathcal mathbb mathfrak text operatorname
+    boldsymbol bm overline underline hat widehat bar vec dot ddot dddot tilde
+    widetilde breve check acute grave sum prod coprod int iint iiint iiiint oint
+    lim max min sup inf log ln exp sin cos tan cot sec csc arcsin arccos arctan
+    sinh cosh tanh det gcd Pr pmod bmod mod quad qquad
+    alpha beta gamma delta epsilon varepsilon zeta eta theta vartheta iota kappa
+    lambda mu nu xi omicron pi varpi rho varrho sigma varsigma tau upsilon phi
+    varphi chi psi omega Gamma Delta Theta Lambda Xi Pi Sigma Upsilon Phi Psi Omega
+    partial nabla infty ell hbar imath jmath Re Im wp prime
+    times div cdot ast star circ bullet cap cup uplus sqcap sqcup vee wedge setminus
+    wr diamond triangle triangleleft triangleright bigtriangleup bigtriangledown
+    le leq ge geq ne neq approx sim simeq equiv cong propto ll gg subset superset
+    subseteq supseteq nsubseteq nsupseteq in notin ni parallel perp mid
+    to gets mapsto rightarrow leftarrow leftrightarrow Rightarrow Leftarrow
+    Leftrightarrow longrightarrow longleftarrow longleftrightarrow Longrightarrow
+    Longleftarrow Longleftrightarrow uparrow downarrow updownarrow Uparrow Downarrow
+    Updownarrow hookrightarrow hookleftarrow nearrow searrow swarrow nwarrow
+    forall exists nexists neg emptyset varnothing top bot angle measuredangle
+    ldots cdots vdots ddots dots dotsc dotsb dotsm
+    """.split()
+)
+_HTML_ENTITY = re.compile(
+    r"&(?:(?P<numeric>#[0-9]+|#[xX][0-9A-Fa-f]+)|amp|lt|gt|quot|apos|nbsp);"
+)
 
 
 def _validate_text(value: object, limits: StructuredContentLimits, *, allow_empty: bool) -> str:
@@ -76,8 +127,7 @@ def _validate_text(value: object, limits: StructuredContentLimits, *, allow_empt
         or len(encoded) > limits.max_utf8_bytes
         or any(
             character == "\x00"
-            or unicodedata.category(character) in {"Cc", "Cs"}
-            and character not in "\n\r\t"
+            or unicodedata.category(character) in {"Cc", "Cf", "Cs"}
             for character in selected
         )
     ):
@@ -159,7 +209,19 @@ class _TableParser(HTMLParser):
         if tag in _CELL_TAGS:
             self._cell_depth -= 1
 
+    def parse_endtag(self, index: int) -> int:
+        end = self.rawdata.find(">", index + 2)
+        if end < 0:
+            return -1
+        if re.fullmatch(
+            r"</[A-Za-z][A-Za-z0-9]*>", self.rawdata[index : end + 1]
+        ) is None:
+            self._reject()
+        return super().parse_endtag(index)
+
     def handle_data(self, data: str) -> None:
+        if any(unicodedata.category(character) in {"Cc", "Cf", "Cs"} for character in data):
+            self._reject()
         if data.strip():
             if self._cell_depth < 1:
                 self._reject()
@@ -184,6 +246,26 @@ class _TableParser(HTMLParser):
 
 def validate_table_html(value: object, limits: StructuredContentLimits) -> str:
     selected = _validate_text(value, limits, allow_empty=False)
+    cursor = 0
+    while True:
+        cursor = selected.find("&", cursor)
+        if cursor < 0:
+            break
+        entity = _HTML_ENTITY.match(selected, cursor)
+        if entity is None:
+            raise StructuredContentInvalid() from None
+        numeric = entity.group("numeric")
+        if numeric is not None:
+            try:
+                codepoint = int(
+                    numeric[2:], 16
+                ) if numeric[1] in {"x", "X"} else int(numeric[1:], 10)
+                character = chr(codepoint)
+            except (ValueError, OverflowError):
+                raise StructuredContentInvalid() from None
+            if unicodedata.category(character) in {"Cc", "Cf", "Cs"}:
+                raise StructuredContentInvalid() from None
+        cursor = entity.end()
     parser = _TableParser(limits)
     try:
         parser.feed(selected)
@@ -208,14 +290,22 @@ def _is_escaped(value: str, index: int) -> bool:
 
 def validate_formula_latex(value: object, limits: StructuredContentLimits) -> str:
     selected = _validate_text(value, limits, allow_empty=False)
-    if _DANGEROUS_TEX.search(selected):
+    if _DANGEROUS_TEX.search(selected) or "^^" in selected or "%" in selected:
         raise StructuredContentInvalid() from None
+    for command_match in _TEX_COMMAND.finditer(selected):
+        command = command_match.group(1)
+        if command.isalpha() and command not in _SAFE_TEX_COMMANDS:
+            raise StructuredContentInvalid() from None
 
     environments: list[str] = []
     environment_ranges: set[int] = set()
+    valid_environment_starts: set[int] = set()
     for match in _ENVIRONMENT.finditer(selected):
+        valid_environment_starts.add(match.start())
         environment_ranges.update(range(match.start(), match.end()))
         action, name = match.groups()
+        if name not in _SAFE_TEX_ENVIRONMENTS:
+            raise StructuredContentInvalid() from None
         if action == "begin":
             environments.append(name)
             if len(environments) > limits.max_html_depth:
@@ -223,6 +313,12 @@ def validate_formula_latex(value: object, limits: StructuredContentLimits) -> st
         elif not environments or environments.pop() != name:
             raise StructuredContentInvalid() from None
     if environments:
+        raise StructuredContentInvalid() from None
+    all_environment_starts = {
+        match.start()
+        for match in re.finditer(r"\\(?:begin|end)(?![A-Za-z])", selected)
+    }
+    if all_environment_starts != valid_environment_starts:
         raise StructuredContentInvalid() from None
 
     stack: list[str] = []

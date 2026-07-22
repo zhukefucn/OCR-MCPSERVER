@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 from hashlib import sha256
 import json
 from pathlib import Path
+from collections.abc import Mapping
+import shutil
 
 import pytest
 
@@ -28,6 +30,7 @@ from ocr_mcp_server.domain import (
     SecondaryResultState,
 )
 from ocr_mcp_server.services.merge_publication import (
+    _write_file_anchored,
     merge_and_publish,
     rollback_publication,
 )
@@ -191,6 +194,36 @@ def test_invalid_existing_structure_can_be_replaced(tmp_path, limits):
     assert publication.replacement_count == 1
 
 
+@pytest.mark.parametrize(
+    ("node", "recognized", "removed"),
+    [
+        (
+            {"type": "table", "content": {"image_source": {"path": "images/a.png"}, "html": "<script>unsafe</script>"}},
+            _ocr(SecondaryResultKind.FORMULA, "x+y"),
+            {"html"},
+        ),
+        (
+            {"type": "equation_interline", "content": {"image_source": {"path": "images/a.png"}, "math_content": r"\input{x}", "math_type": "latex"}},
+            _ocr(),
+            {"math_content", "math_type"},
+        ),
+    ],
+)
+def test_cross_type_replacement_removes_old_unsafe_structured_fields(tmp_path, limits, node, recognized, removed):
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    publication = merge_and_publish(result, collection, {candidate.candidate_id: recognized}, publication_root=tmp_path / "published", output_version=2, timestamp=NOW, limits=limits)
+    content = json.loads(publication.manifest_path.read_text(encoding="utf-8"))[0][0]["content"]
+    assert removed.isdisjoint(content)
+
+
+def test_dangerous_formula_payload_retains_node_end_to_end(tmp_path, limits):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    publication = merge_and_publish(result, collection, {candidate.candidate_id: _ocr(SecondaryResultKind.FORMULA, r"\includegraphics{../../secret}")}, publication_root=tmp_path / "published", output_version=2, timestamp=NOW, limits=limits)
+    assert publication.records[0].reason is ReplacementReason.INVALID_CONTENT
+    assert json.loads(publication.manifest_path.read_text(encoding="utf-8"))[0][0] == node
+
+
 def test_stale_reference_and_standalone_are_each_audited_without_fake_nodes(tmp_path, limits):
     node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
     refs = (
@@ -236,6 +269,34 @@ def test_source_manifest_symlink_is_rejected_without_publication(tmp_path, limit
     assert not (tmp_path / "published" / "version-00000002").exists()
 
 
+def test_source_manifest_parent_symlink_is_rejected(tmp_path, limits):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    original_root = result.result_root.with_name("mineru-original")
+    result.result_root.replace(original_root)
+    attacker_root = tmp_path / "attacker"; attacker_root.mkdir()
+    (attacker_root / "images").mkdir()
+    (attacker_root / "images" / "a.png").write_bytes(b"attacker-image")
+    (attacker_root / result.content_list_v2_path.name).write_text(json.dumps([[node]]), encoding="utf-8")
+    try:
+        result.result_root.symlink_to(attacker_root, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink privilege unavailable")
+    with pytest.raises(MergeFailure) as raised:
+        merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=tmp_path / "published", output_version=2, timestamp=NOW, limits=limits)
+    assert raised.value.code == MergeErrorCode.INVALID_SOURCE_MANIFEST.value
+
+
+def test_candidate_content_changed_after_collection_fails_globally(tmp_path, limits):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    candidate.primary_path.write_bytes(b"changed-after-inference")
+    with pytest.raises(MergeFailure) as raised:
+        merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=tmp_path / "published", output_version=2, timestamp=NOW, limits=limits)
+    assert raised.value.code == MergeErrorCode.INVARIANT_VIOLATION.value
+    assert not (tmp_path / "published" / "version-00000002").exists()
+
+
 @pytest.mark.parametrize("mutation", ["missing", "extra", "engine", "task", "version", "duplicate_pointer"])
 def test_global_coverage_and_identity_mismatch_publishes_nothing(tmp_path, limits, mutation):
     node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
@@ -269,6 +330,35 @@ def test_malformed_manifest_fails_safely_and_does_not_leak(tmp_path, limits, cap
     assert planted not in caplog.text
 
 
+def test_duplicate_json_object_keys_are_rejected_as_ambiguous(tmp_path, limits):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    result.content_list_v2_path.write_text(
+        '[[{"type":"image","type":"chart","content":{"image_source":{"path":"images/a.png"}}}]]',
+        encoding="utf-8",
+    )
+    with pytest.raises(MergeFailure) as raised:
+        merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=tmp_path / "published", output_version=2, timestamp=NOW, limits=limits)
+    assert raised.value.code == MergeErrorCode.INVALID_SOURCE_MANIFEST.value
+
+
+def test_hostile_result_mapping_error_is_safely_discarded(tmp_path, limits, caplog):
+    planted = "SECRET_BACKEND_MAPPING_ERROR"
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, _, _ = _setup(tmp_path, [node])
+
+    class HostileMapping(Mapping):
+        def __getitem__(self, key): raise RuntimeError(planted)
+        def __iter__(self): raise RuntimeError(planted)
+        def __len__(self): raise RuntimeError(planted)
+
+    with pytest.raises(MergeFailure) as raised:
+        merge_and_publish(result, collection, HostileMapping(), publication_root=tmp_path / "published", output_version=2, timestamp=NOW, limits=limits)
+    assert planted not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert planted not in caplog.text
+
+
 def test_idempotent_retry_verifies_bytes_and_conflict_is_safe(tmp_path, limits):
     node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
     result, collection, candidate, _ = _setup(tmp_path, [node])
@@ -282,15 +372,119 @@ def test_idempotent_retry_verifies_bytes_and_conflict_is_safe(tmp_path, limits):
     assert raised.value.code == MergeErrorCode.PUBLICATION_CONFLICT.value
 
 
+def test_idempotent_retry_with_extra_regular_file_is_conflict(tmp_path, limits):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    root = tmp_path / "published"
+    kwargs = dict(publication_root=root, output_version=2, timestamp=NOW, limits=limits)
+    publication = merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, **kwargs)
+    (publication.publication_directory / "extra.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(MergeFailure) as raised:
+        merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, **kwargs)
+    assert raised.value.code == MergeErrorCode.PUBLICATION_CONFLICT.value
+
+
+def test_idempotent_retry_rejects_publication_root_swap_between_checks(tmp_path, limits, monkeypatch):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    root = tmp_path / "published"
+    kwargs = dict(publication_root=root, output_version=2, timestamp=NOW, limits=limits)
+    merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, **kwargs)
+    alternate = tmp_path / "alternate-publication"
+    shutil.copytree(root, alternate)
+    saved = tmp_path / "saved-publication"
+    original_check = __import__("ocr_mcp_server.services.merge_publication", fromlist=["_existing_target_is_unsafe"])._existing_target_is_unsafe
+    swapped = False
+
+    def swap_after_first_check(target):
+        nonlocal swapped
+        answer = original_check(target)
+        if not swapped:
+            root.rename(saved)
+            alternate.rename(root)
+            swapped = True
+        return answer
+
+    monkeypatch.setattr("ocr_mcp_server.services.merge_publication._existing_target_is_unsafe", swap_after_first_check)
+    with pytest.raises(MergeFailure) as raised:
+        merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, **kwargs)
+    assert raised.value.code == MergeErrorCode.UNSAFE_PUBLICATION_PATH.value
+
+
+def test_idempotent_retry_rejects_target_swap_after_byte_match(tmp_path, limits, monkeypatch):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    root = tmp_path / "published"
+    kwargs = dict(publication_root=root, output_version=2, timestamp=NOW, limits=limits)
+    publication = merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, **kwargs)
+    target = publication.publication_directory
+    alternate = root / "alternate-version"
+    shutil.copytree(target, alternate)
+    content_path = alternate / "content_list_v2.json"
+    altered = bytearray(content_path.read_bytes()); altered[0] = ord("{")
+    content_path.write_bytes(bytes(altered))
+    saved = root / "saved-version"
+    module = __import__("ocr_mcp_server.services.merge_publication", fromlist=["_existing_matches"])
+    original_match = module._existing_matches
+    swapped = False
+
+    def swap_after_match(path, expected):
+        nonlocal swapped
+        answer = original_match(path, expected)
+        if answer and not swapped:
+            path.rename(saved)
+            alternate.rename(path)
+            swapped = True
+        return answer
+
+    monkeypatch.setattr("ocr_mcp_server.services.merge_publication._existing_matches", swap_after_match)
+    with pytest.raises(MergeFailure) as raised:
+        merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, **kwargs)
+    assert raised.value.code == MergeErrorCode.UNSAFE_PUBLICATION_PATH.value
+
+
 def test_publish_failure_cleans_only_own_stage(tmp_path, limits, monkeypatch):
     node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
     result, collection, candidate, _ = _setup(tmp_path, [node])
     root = tmp_path / "published"; root.mkdir(); unrelated = root / ".staging-unrelated"; unrelated.mkdir()
-    monkeypatch.setattr("ocr_mcp_server.services.merge_publication.publish_directory_no_replace", lambda *_: (_ for _ in ()).throw(OSError("SECRET")))
+    monkeypatch.setattr("ocr_mcp_server.services.merge_publication._publish_stage_anchored", lambda *_: (_ for _ in ()).throw(OSError("SECRET")))
     with pytest.raises(MergeFailure):
         merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=root, output_version=2, timestamp=NOW, limits=limits)
     assert unrelated.exists()
     assert not list(root.glob(".merge-stage-*"))
+
+
+def test_publish_failure_does_not_delete_replacement_at_staging_path(tmp_path, limits, monkeypatch):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    root = tmp_path / "published"; root.mkdir()
+    replacement = {"path": None}
+
+    def replace_stage_then_fail(stage, target, root_descriptor):
+        del target, root_descriptor
+        moved = stage.with_name(stage.name + "-owned")
+        stage.rename(moved)
+        stage.mkdir()
+        marker = stage / "attacker-marker"
+        marker.write_text("keep", encoding="utf-8")
+        replacement["path"] = stage
+        raise OSError("injected")
+
+    monkeypatch.setattr("ocr_mcp_server.services.merge_publication._publish_stage_anchored", replace_stage_then_fail)
+    with pytest.raises(MergeFailure):
+        merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=root, output_version=2, timestamp=NOW, limits=limits)
+    assert replacement["path"].is_dir()
+    assert (replacement["path"] / "attacker-marker").read_text(encoding="utf-8") == "keep"
+
+
+def test_anchored_write_closes_raw_descriptor_when_fdopen_fails(tmp_path, monkeypatch):
+    descriptor = __import__("os").open(tmp_path / "raw.tmp", __import__("os").O_WRONLY | __import__("os").O_CREAT)
+    monkeypatch.setattr("ocr_mcp_server.services.merge_publication.os.open", lambda *args, **kwargs: descriptor)
+    monkeypatch.setattr("ocr_mcp_server.services.merge_publication.os.fdopen", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("injected")))
+    with pytest.raises(OSError):
+        _write_file_anchored(tmp_path, 123, "artifact.json", b"value")
+    with pytest.raises(OSError):
+        __import__("os").fstat(descriptor)
 
 
 def test_symlink_publication_root_is_rejected(tmp_path, limits):
@@ -317,6 +511,21 @@ def test_publication_root_below_symlinked_parent_is_rejected(tmp_path, limits):
         merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=link / "child", output_version=2, timestamp=NOW, limits=limits)
     assert raised.value.code == MergeErrorCode.UNSAFE_PUBLICATION_PATH.value
     assert not (real / "child" / "version-00000002").exists()
+
+
+def test_symlink_version_target_is_unsafe_not_an_idempotent_conflict(tmp_path, limits):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    root = tmp_path / "published"; root.mkdir()
+    elsewhere = tmp_path / "elsewhere"; elsewhere.mkdir()
+    target = root / "version-00000002"
+    try:
+        target.symlink_to(elsewhere, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink privilege unavailable")
+    with pytest.raises(MergeFailure) as raised:
+        merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=root, output_version=2, timestamp=NOW, limits=limits)
+    assert raised.value.code == MergeErrorCode.UNSAFE_PUBLICATION_PATH.value
 
 
 def test_rollback_publishes_new_version_equal_to_original_and_detects_tampering(tmp_path, limits):
@@ -362,3 +571,32 @@ def test_rollback_rejects_hash_adjusted_invalid_publication_schema(tmp_path, lim
     with pytest.raises(MergeFailure) as raised:
         rollback_publication(forged, publication_root=root, output_version=3, timestamp=NOW, limits=limits)
     assert raised.value.code == MergeErrorCode.ROLLBACK_VERIFICATION_FAILED.value
+
+
+def test_rollback_rejects_alternate_same_directory_snapshot_even_with_matching_hash(tmp_path, limits):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    root = tmp_path / "published"
+    merged = merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=root, output_version=2, timestamp=NOW, limits=limits)
+    alternate = merged.publication_directory / "alternate.json"
+    alternate.write_bytes(b"[]\n")
+    forged = replace(merged, original_snapshot_path=alternate, original_sha256=sha256(b"[]\n").hexdigest())
+    with pytest.raises(MergeFailure) as raised:
+        rollback_publication(forged, publication_root=root, output_version=3, timestamp=NOW, limits=limits)
+    assert raised.value.code == MergeErrorCode.ROLLBACK_VERIFICATION_FAILED.value
+
+
+def test_rollback_discards_unsafe_path_conversion_error(tmp_path, limits):
+    planted = "SECRET_PATH_CONVERSION"
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    root = tmp_path / "published"
+    merged = merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=root, output_version=2, timestamp=NOW, limits=limits)
+
+    class HostilePath:
+        def __fspath__(self): raise RuntimeError(planted)
+
+    with pytest.raises(MergeFailure) as raised:
+        rollback_publication(merged, publication_root=HostilePath(), output_version=3, timestamp=NOW, limits=limits)
+    assert planted not in str(raised.value)
+    assert raised.value.__cause__ is None

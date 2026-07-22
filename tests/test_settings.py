@@ -78,6 +78,11 @@ def test_structured_content_settings_reject_contradictory_limits() -> None:
         AppSettings(structured_content={"max_characters": 1000, "max_utf8_bytes": 999})
 
 
+def test_structured_content_settings_reject_values_above_hard_caps() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(structured_content={"max_html_depth": 257})
+
+
 def test_remote_import_hosts_are_canonicalized_and_deduplicated() -> None:
     settings = AppSettings(
         remote_import={"allowed_hosts": ["FILES.Example.COM.", "files.example.com"]}
