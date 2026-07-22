@@ -1,0 +1,47 @@
+# Task 7 实施报告：结构化替换、版本发布与回滚
+
+## 范围
+
+- Base：`434dc42d5f1e42db8937f1f8e94a486740c973c1`
+- 实现提交：`d002b31f1c83a2b2b1d1da33b5e0f80eb6b2ac73`
+- 安全复审修复提交：`f5c0d37503e10933e663bf2c1ee0d6511289dcb8`
+- 未推送、未执行远程部署、未修改父设计或实施计划。
+
+## 已交付
+
+- 深度表格 HTML 验证：严格受限标签/属性、原始结束标签与实体 token、深度/元素/行/单元格/span/字符/字节限制。
+- 保守 LaTeX 验证：命令与环境白名单、括号/数学定界符/环境嵌套检查、危险原语与字符重写拒绝、重复上限。
+- 不可变审计领域契约、确定性 ID/顺序/快照/哈希。
+- 仅对有效 TABLE/FORMULA 的 MinerU V2 精确节点替换；其余逐引用保留并审计；跨类型替换清除旧的不安全结构化字段。
+- exact coverage、task/version/engine、pointer/type/path/alias、候选 identity/size/SHA-256 全局校验。
+- 固定版本目录的原子无覆盖发布、精确幂等、冲突拒绝、独立 `publication_manifest.json` 文件名/哈希绑定。
+- staging/root/target/file identity gate；Linux 使用 root/stage fd、openat/no-follow 与 renameat2；Windows 拒绝 reparse 并在关键边界复核 identity。
+- 回滚从经固定路径、精确文件集合、独立哈希清单与 schema 验证的原始快照发布全新版本，不覆盖合并版本。
+- 部署安全上限已加入 `AppSettings` 与 `config/example.yaml`；未新增 Paddle/MinerU/Torch/OpenCV 依赖。
+
+## TDD 证据
+
+1. 初始 RED：两个新测试模块在收集阶段失败，分别缺少 `structured_content` 服务与 merge 错误/领域契约。
+2. 首轮 GREEN：focused `132 passed`，随后 settings RED/GREEN 完成部署配置。
+3. 自审 RED/GREEN：补入控制/格式字符、实体解码、危险 TeX、重复 JSON key、源 manifest symlink、父链、回滚 schema、target symlink、异常脱敏与 hard cap。
+4. 独立复审 RED：一次集中重放得到 `17 failed`，覆盖危险公式、父目录替换、候选变更、alternate rollback、staging replacement、畸形结束标签与跨类型残留。
+5. 后续确定性 RED/GREEN：existing root/target/file name swap、fdopen ownership、无界冲突读取、严格实体与冲突分类。
+
+## 复审闭环
+
+- 独立只读 reviewer 首轮：NOT READY，报告 2 Critical、4 Important、1 Minor。
+- 全部原始复现闭环后，reviewer 继续发现 existing target/name identity 与严格实体边界；均补确定性回归并修复。
+- 最终 reviewer 结论：`READY`。
+
+## 最终本地验证
+
+- Focused：`179 passed in 0.98s`
+- Full：`522 passed, 5 skipped in 4.13s`
+- `python -m pip check`：`No broken requirements found.`
+- `python -m compileall -q src tests`：退出码 0
+- `git diff --check`：退出码 0（仅 Git 的 LF/CRLF 工作树提示）
+
+## 剩余关注
+
+- 当前机器是 Windows；Linux 专用 openat/renameat2 分支需要控制层按既定节奏在 Ubuntu 同步后运行全套测试与容器启动验证。
+- LaTeX 使用保守白名单；真实 Paddle 输出若出现新但无副作用的数学命令，应先加验证样本和安全评估，再显式扩充白名单。
