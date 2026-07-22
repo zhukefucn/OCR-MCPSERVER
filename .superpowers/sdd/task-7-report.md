@@ -100,3 +100,40 @@ git diff --check
 - 失败清理不再调用 `shutil.rmtree`；POSIX 使用已持有的 root/stage fd 做目录相对的精确 unlink/rmdir，Windows 逐文件复核 identity 后仅删除已知文件。任何名称或 identity 不一致均保留目录。
 - rollback 独立 manifest 采用精确顶层 schema，并要求磁盘字节等于重新生成的 canonical JSON。
 - merge 边界按 Task 5 既定 SHA-256 公式重算 candidate/record ID，任何不匹配全局失败且不发布。
+
+## Controller 清理竞态跟进（2026-07-22）
+
+Controller 再次复审发现：即使先校验 identity，校验与 `unlink`/`rmdir` 之间仍存在同名对象替换窗口。修复提交：
+
+- `05a229423a08870b1738c75aed5647b736beab67` — `fix: preserve failed publication staging`
+
+本节结论取代上一节关于“失败清理逐文件删除”的描述。现在的安全策略是：
+
+- 发布失败或尚未确认发布时，不对 staging 执行任何基于名称或路径的删除；
+- staging 作为 `.merge-stage-*` 孤儿目录保留，等待后续独立、受控的保留期清理；
+- 发布成功时 staging 已被原子重命名为目标版本目录，无需额外清理；
+- 本任务不实现保留期清理，也不扩展到 Task 8。
+
+新增两个确定性故障注入回归，分别在 identity 校验后、删除动作前替换同名文件和空目录。修改前 RED：
+
+```text
+.venv\Scripts\python.exe -m pytest tests/test_merge_publication.py::test_failed_publication_never_unlinks_same_name_file_replacement tests/test_merge_publication.py::test_failed_publication_never_removes_same_name_directory_replacement -q
+```
+
+RED 结果：`2 failed in 1.8s`；两个 victim 均被旧清理逻辑删除。
+
+修改后 focused 验证：
+
+```text
+.venv\Scripts\python.exe -m pytest tests/test_structured_content_validation.py tests/test_merge_publication.py -q
+```
+
+GREEN focused 结果：`123 passed in 2.0s`。
+
+完整门禁结果：
+
+- Full：`530 passed, 5 skipped in 5.6s`
+- 收集：`535 tests collected in 0.73s`
+- pip check：`No broken requirements found.`
+- compileall：退出码 0
+- diff-check：退出码 0，仅 Git LF/CRLF 提示
