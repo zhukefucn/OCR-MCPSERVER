@@ -942,6 +942,106 @@ def test_posix_publication_falls_back_when_otmpfile_is_unsupported(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX named publication fallback")
+def test_posix_named_stage_cleanup_removes_only_the_owned_name(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from ocr_mcp_server.services import artifacts as module
+
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    real_open = module.os.open
+    temporary_flag = getattr(module.os, "O_TMPFILE", 0)
+
+    def without_otmpfile(path, flags, *args, **kwargs):
+        if temporary_flag and flags & temporary_flag == temporary_flag:
+            raise OSError(errno.EOPNOTSUPP, "planted unsupported anonymous stage")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "open", without_otmpfile)
+    with module._PinnedArtifactRoot(root, os.lstat(root)) as pinned:
+        descriptor, stage_name, _stage_path = pinned.create_stage()
+        assert stage_name is not None
+        try:
+            os.write(descriptor, b"verified stage content")
+            os.fsync(descriptor)
+            pinned.force_stage_cleanup(descriptor, stage_name)
+            assert os.fstat(descriptor).st_size == 0
+            assert not (root / stage_name).exists()
+        finally:
+            os.close(descriptor)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX named publication fallback")
+def test_posix_named_publication_does_not_require_renameat2(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from ocr_mcp_server.services import artifacts as module
+
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    real_open = module.os.open
+    temporary_flag = getattr(module.os, "O_TMPFILE", 0)
+    real_libc = module.ctypes.CDLL(None, use_errno=True)
+    real_linkat = real_libc.linkat
+    real_linkat.argtypes = (
+        module.ctypes.c_int,
+        module.ctypes.c_char_p,
+        module.ctypes.c_int,
+        module.ctypes.c_char_p,
+        module.ctypes.c_int,
+    )
+    real_linkat.restype = module.ctypes.c_int
+    calls: list[tuple[bytes, int]] = []
+
+    def without_otmpfile(path, flags, *args, **kwargs):
+        if temporary_flag and flags & temporary_flag == temporary_flag:
+            raise OSError(errno.EOPNOTSUPP, "planted unsupported anonymous stage")
+        return real_open(path, flags, *args, **kwargs)
+
+    class RestrictedLinkAt:
+        argtypes = None
+        restype = None
+
+        def __call__(self, source_fd, source_name, root_fd, target_name, flags):
+            calls.append((source_name, flags))
+            if source_name == b"":
+                module.ctypes.set_errno(errno.ENOENT)
+                return -1
+            return real_linkat(source_fd, source_name, root_fd, target_name, flags)
+
+    class LibCWithoutRenameAt2:
+        linkat = RestrictedLinkAt()
+
+    monkeypatch.setattr(module.os, "open", without_otmpfile)
+    monkeypatch.setattr(
+        module.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: LibCWithoutRenameAt2(),
+    )
+    with module._PinnedArtifactRoot(root, os.lstat(root)) as pinned:
+        descriptor, stage_name, _stage_path = pinned.create_stage()
+        assert stage_name is not None
+        try:
+            os.write(descriptor, b"descriptor-bound-stage")
+            os.fsync(descriptor)
+            pinned.link_no_replace(descriptor, stage_name, "published.zip")
+            assert module._same_object(
+                os.fstat(descriptor),
+                os.stat(
+                    "published.zip",
+                    dir_fd=pinned.descriptor,
+                    follow_symlinks=False,
+                ),
+            )
+        finally:
+            os.close(descriptor)
+    assert calls[0] == (b"", 0x1000)
+    assert calls[1][0].startswith(b"/proc/self/fd/") and calls[1][1] == 0x400
+    assert (root / "published.zip").read_bytes() == b"descriptor-bound-stage"
+    assert not list(root.glob(".artifact-stage-*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX named publication fallback")
 def test_posix_named_stage_swap_never_succeeds_or_leaks_stage_content(
     tmp_path: Path, monkeypatch
 ) -> None:

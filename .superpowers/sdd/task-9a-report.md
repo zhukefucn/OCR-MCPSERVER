@@ -221,6 +221,40 @@ Final verification:
 
 No push or deployment was performed.
 
+## Overlay filesystem named-stage portability closure (2026-07-22)
+
+Running pytest with `--basetemp` on the container overlay filesystem reproduced three
+failures that the bind-mounted workspace did not expose. Overlay rejected anonymous
+`O_TMPFILE` staging, so the named fallback became active. That path scrubbed failed or
+idempotent stages through their descriptors but deliberately never removed their
+owned names, and it required the non-portable `renameat2` symbol for publication.
+
+Named-stage cleanup now first scrubs the owned open descriptor, then removes the
+root-relative stage name only when a fresh no-follow name stat still identifies that
+same inode. A replacement name is therefore preserved. Successful publication still
+prefers atomic `renameat2(..., RENAME_NOREPLACE)` when available. If the symbol is
+missing or the kernel reports `ENOSYS`/`EINVAL`, publication uses no-replace `linkat`
+from the verified open descriptor (`AT_EMPTY_PATH`, then the descriptor-bound
+`/proc/self/fd` form when restricted) and removes the matching source stage name.
+Target creation remains atomic and descriptor/root/inode bound; final size, SHA-256,
+manifest, name binding, and publication identity verification are unchanged.
+
+Strict TDD evidence:
+
+1. Original overlay artifact run: `3 failed, 56 passed, 4 skipped`; the failures were
+   interrupted cleanup, restricted empty-path linking with a named stage, and exact
+   retry cleanup.
+2. New deterministic regressions both failed before production changes: named cleanup
+   left its owned path, and missing `renameat2` raised `ENOSYS`.
+3. Focused overlay run after the change: `5 passed, 60 deselected`.
+4. Full overlay artifact suite: `61 passed, 4 skipped in 1.38s`.
+5. Windows artifact suite: `58 passed, 7 skipped in 1.75s`.
+6. Windows full suite: `675 passed, 12 skipped in 9.44s`.
+7. Ubuntu overlay full suite: `677 passed, 10 skipped in 9.09s`.
+8. `pip check`, `compileall -q src tests`, and `git diff --check`: exit 0.
+
+No push or deployment was performed.
+
 ## Descriptor-bound success finalization closure (2026-07-22)
 
 A subsequent review found that the exact-existing retry released its no-follow target
