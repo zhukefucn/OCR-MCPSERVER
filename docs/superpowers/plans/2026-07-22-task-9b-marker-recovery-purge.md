@@ -211,3 +211,74 @@ Append the recovery invariant, each RED symptom, each GREEN regression, focused/
 - [ ] **Step 4: Request same-reviewer re-review**
 
 Send the local commit hashes and verification results to the controller and explicitly request the same reviewer repeat spec and code-quality review.
+
+---
+
+### Task 4: Recover a canonical marker left empty before creator locking
+
+**Files:**
+- Modify: `tests/test_retention.py`
+- Modify: `tests/test_file_intake.py`
+- Modify: `tests/test_remote_fetch.py`
+- Modify: `tests/test_artifacts.py`
+- Modify: `src/ocr_mcp_server/infra/retention_repository.py`
+- Modify: `src/ocr_mcp_server/services/file_storage.py`
+- Append: `.superpowers/sdd/task-9b-report.md`
+
+**Interfaces:**
+- Produces: `RetentionRepository.bind_empty_lock_marker(batch_id, identity, *, allow_missing, initialize: Callable[[], None]) -> None`.
+- Consumes: the OS-locked descriptor and existing `read_locked_marker()` proof in `FileStorage.batch_lock`.
+- Invariant: the callback executes inside `BEGIN IMMEDIATE` only when retention policy permits the batch and no registry row exists; only after callback fsync/revalidation does the transaction insert and commit the identity.
+
+- [ ] **Step 1: Write the empty-creation crash regression**
+
+Inject a crash from the creator's first `_try_batch_lock` call, after `_open_lock_file` has published the zero-length canonical marker. Assert the marker is `b""` and no registry row exists, then retry with a fresh `FileStorage` and require the same filesystem identity to be initialized to `b"\x00"` and registered.
+
+- [ ] **Step 2: Verify the crash regression is RED**
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_retention.py::test_empty_marker_survives_pre_lock_crash_and_is_recovered -q -p no:cacheprovider
+```
+
+Expected: FAIL after the bounded initialization wait with `path_unsafe`, leaving the marker empty and unregistered.
+
+- [ ] **Step 3: Add safety and live-opener regressions**
+
+Add tests proving that an empty marker with either matching or mismatched registry identity is rejected before any callback write, an empty multi-link marker is preserved, and a second live opener blocks on a creator-held OS lock until that creator writes/fsyncs `0x00` and releases it.
+
+- [ ] **Step 4: Implement transactional empty binding**
+
+Add the repository method with this transaction order:
+
+```python
+await session.execute(text("BEGIN IMMEDIATE"))
+retention = await session.get(RetentionRecord, batch_id)
+if retention is None and not allow_missing:
+    raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT)
+if await session.get(BatchLockMarkerRecord, batch_id) is not None:
+    raise RetentionFailure(RetentionErrorCode.CLEANUP_OWNERSHIP)
+initialize()
+session.add(BatchLockMarkerRecord(batch_id=batch_id, identity=encoded))
+await session.commit()
+```
+
+Validate canonical batch ID, non-negative integer identity pair, strict boolean `allow_missing`, and callable initializer before opening the transaction. Propagate initializer filesystem failures so the session rolls back without inserting.
+
+- [ ] **Step 5: Initialize only through the locked descriptor**
+
+Replace the bounded empty-marker rejection loop with one repository callback. The callback must call `read_locked_marker()` and require `b""`, write `b"\x00"` through the same descriptor, fsync it, then require `read_locked_marker() == b"\x00"`. After the repository returns, call the normal bind path again; the exact committed identity must match. A creator whose empty marker was initialized by a competing opener while it waited must accept only the resulting exact `b"\x00"`/identity binding.
+
+- [ ] **Step 6: Update in-memory marker registries**
+
+Each test-only registry implements:
+
+```python
+async def bind_empty_lock_marker(self, *_args, initialize, **_kwargs):
+    initialize()
+```
+
+This preserves real descriptor behavior in file-intake, remote-fetch, and artifact tests without pretending to provide SQLite durability.
+
+- [ ] **Step 7: Verify GREEN and all lifecycle gates**
+
+Run the new crash/safety/live-opener tests, the focused four-file lifecycle gate, the full repository suite, `pip check`, `compileall`, and `git diff --check`. Append exact RED/GREEN evidence to the controller report, commit implementation/tests separately from documentation, and request the same reviewer inspect the new HEAD.

@@ -1,61 +1,73 @@
-# Task 9B second-remediation controller review
+# Task 9B final remediation controller review
 
 ## Target and verdict
 
-- Head: `319d7d3b27e8e8d9d8616b924c8476f896250723`
-- Remediation range: `f74ab0f..319d7d3`
-- Scope: Task 9 lifecycle consistency only
+- Head: `933222eacf61beb41b9fe82c9692f12260d93ca8`
+- Remediation range: `319d7d3..933222e`
+- Scope: Task 9 marker recovery and metadata lifecycle
 - Critical findings: **0**
-- Important findings: **2**
+- Important findings: **1**
 - Minor findings: **0**
 - Spec verdict: **NOT READY**
 - Code-quality verdict: **NOT READY**
 - Overall: **NOT READY**
 
-All six findings from the previous review are closed in the targeted implementation and regression tests. Canonical batch artifact placement and metadata-phase early-delete resume also remain correct. The new durable lock-marker registry introduces one unrecoverable filesystem/DB partial-failure boundary and retains per-task metadata beyond the required 30-day purge, so the lifecycle is not yet ready.
+The initialized `0x00` pre-bind recovery path and marker-row purge are correct, and all previous lifecycle closures remain green. One earlier crash boundary remains: the canonical marker is created as an empty file before the creator acquires the OS lock and writes `0x00`. A crash in that interval leaves an empty marker that all future attempts reject, so the required crash-reclaimable lifecycle is not complete.
 
-## Prior-finding closure
+## Confirmed closures
 
-| Finding | Result | Controller evidence |
-|---|---|---|
-| Windows parent replacement during scrub | **Closed** | The configured root and isolated tombstone are pinned; Windows tombstone/nested-directory handles deny delete sharing and final paths are checked before and after mutation. The two Windows regressions pass. |
-| Multi-link file modification | **Closed** | `_scrub_open_regular` requires `st_nlink == 1` before truncation and verifies it afterward. The hard-link integration regression preserves external bytes and leaves DB availability unchanged. |
-| Artifact rollback object binding | **Closed** | The bundle carries the publication identity; rollback opens once and verifies identity, size, link count, and full SHA-256 before scrubbing that descriptor. Same-name replacement is preserved. |
-| Expired artifact guard bypass | **Closed** | `ArtifactPackagingStep` holds `FileStorage.batch_lock` around guard acquisition, publish, register, rollback, guard release, and finalization. Cleanup remains blocked after the DB guard expires until packaging releases the OS lock. |
-| Post-register cancellation inconsistency | **Closed** | Registration is tracked as the commit point; exceptions after commit do not scrub the ZIP. The available row's size/hash remain consistent with disk. |
-| Lock-name replacement on retry | **Closed** | Existing marker identity must match `batch_lock_markers` before marker bytes are read or normalized. The two-attempt name-swap regression preserves the replacement unchanged. |
+### Initialized pre-bind marker recovery
 
-Previously closed behavior also remains covered:
+An existing unbound marker is adopted only while its descriptor is OS-locked and only when all of the following hold:
 
-- The bundler requires a canonical lowercase batch UUID, publishes under `<artifact base>/<batch UUID>`, and stores `<batch UUID>/<artifact-id>.zip`.
-- A second early-delete call resumes directly in metadata after an injected first metadata-purge failure.
-- Tombstone names remain persisted before isolation, and artifact availability advances only after both content roots and the retired marker complete successfully.
+- canonical UUID-derived lock name;
+- stable data root, `.locks` directory, descriptor identity, and final name binding;
+- non-reparse regular file with exactly one link;
+- exact size and complete bytes `0x00` before and after the registry transaction;
+- no existing `BatchLockMarkerRecord`.
 
-## Findings
+Empty, retired `0x01`, oversized, multi-link, unknown-content, and registered-identity-mismatch markers are rejected without mutation. A post-commit failure retries through the exact durable identity row. The creator now writes `0x00` only while holding the same OS lock, so a concurrent opener either observes the completed marker or releases/retries the empty initialization window.
 
-### Important - first marker-bind failure permanently wedges the batch
+### Metadata purge
 
-`FileStorage.batch_lock` exclusively creates the marker file and writes `0x00` before calling `marker_registry.bind_lock_marker` (`src/ocr_mcp_server/services/file_storage.py:99-155`). `RetentionRepository.bind_lock_marker` refuses to create a registry row for an already-existing marker because the next attempt reports `created=False` (`src/ocr_mcp_server/infra/retention_repository.py:67-104`).
+`purge_metadata` deletes `BatchLockMarkerRecord` in the same transaction as artifact, audit, stage-event, file-task, retention, and batch metadata. The exact 30-day boundary and immediate early-delete tests confirm that:
 
-If SQLite binding fails or the process crashes after filesystem creation but before the first registry commit, the filesystem marker survives without a registry row. Every retry then classifies that service-created marker as an unknown object and fails ownership validation. This is fail-safe with respect to replacement bytes, but it is not retryable and a crashed cleaner/writer cannot recover.
+- the DB marker row is gone after commit;
+- the on-disk marker remains exactly the content-free retired byte `0x01`;
+- a later call cannot adopt, normalize, or mutate that unregistered retired marker.
+
+### Previous lifecycle findings
+
+The prior six closure regressions remain green:
+
+- Windows parent directories remain pinned/exclusively opened through child scrub.
+- Multi-link content files are rejected before modification.
+- Artifact rollback binds identity, size, link count, and SHA-256 to one open descriptor.
+- Packaging holds the shared `FileStorage` batch lock through publish, registration, finalization, rollback, and guard release even after DB-guard expiry.
+- Post-register cancellation leaves the available DB row and ZIP consistent.
+- A different same-name marker is never adopted or modified on retry.
+
+Canonical batch artifact placement and metadata-phase early-delete resume also remain green.
+
+## Finding
+
+### Important - crash before marker initialization is not recoverable
+
+`_open_lock_file` publishes the canonical file with `O_CREAT|O_EXCL`/`CREATE_NEW` before `batch_lock` acquires its OS lock (`src/ocr_mcp_server/services/file_storage.py:99-103,127-159`). The creator writes `0x00` only after lock acquisition. If the process exits after canonical creation but before acquiring the lock or writing the initialization byte, the marker remains empty with no registry row.
+
+On retry, the existing opener locks the empty file, waits for an initializer up to the bounded retry count, and then rejects it. No creator still exists, so every later retry follows the same path. The batch is permanently wedged even though the empty file was created by the service.
 
 Independent deterministic reproduction:
 
 ```text
-first attempt: cleanup_claim_conflict
-orphan marker exists: True bytes: b'\x00'
-retry: cleanup_ownership_invalid
+first attempt: creator crashed before initialization
+marker after crash: b''
+retry: path_unsafe marker remains: b''
 ```
 
-Required closure: persist a content-free creation intent/nonce before publishing the marker, then make retry able to reconcile only a marker carrying that exact intent. An unknown same-name marker must still remain untouched. Add fault injection immediately before and immediately after the first registry commit.
+This preserves unknown bytes but violates the requirement that a crashed cleaner/writer leave work reclaimable.
 
-### Important - marker registry rows bypass the 30-day metadata purge
-
-`BatchLockMarkerRecord` is keyed by batch ID but has no foreign key or expiry, and `purge_metadata` never deletes it (`src/ocr_mcp_server/infra/task_models.py:167-171`; `src/ocr_mcp_server/infra/retention_repository.py:400-415`). Every processed task therefore leaves a permanent SQLite row after artifact/audit/task metadata is purged at 30 days.
-
-The stored device/inode identity is content-free, but it is still per-task lifecycle metadata and grows without a bounded purge, contrary to the configured 30-day content-free metadata policy. The on-disk retired marker can continue preventing UUID resurrection without retaining this DB row: once the registry row is purged, the existing name is unknown and is already rejected without mutation.
-
-Required closure: delete the marker registry row in the referentially ordered metadata purge, or give it an explicit bounded expiry consistent with the 30-day policy. Add a boundary test showing no `batch_lock_markers` row remains after ordinary and immediate early metadata purge while the one-byte retired marker remains content-free and non-adoptable.
+Required closure: do not expose an empty canonical marker. Stage and fsync the initialized content-free `0x00` marker under a server-generated sibling name, then atomically publish it without replacement; a crash before publication leaves the canonical name absent and safely retryable. An equivalent durable creation-intent/nonce protocol is acceptable if unknown empty files remain non-adoptable. Add fault injection immediately after canonical creation and before the first lock acquisition/write.
 
 ## Verification evidence
 
@@ -63,20 +75,26 @@ Focused lifecycle suite:
 
 ```text
 .\.venv\Scripts\python.exe -m pytest tests/test_retention.py tests/test_artifacts.py tests/test_file_intake.py tests/test_remote_fetch.py -p no:cacheprovider
-126 passed in 4.66s
+132 passed in 6.51s
 ```
 
-Explicit closure set (six prior findings plus canonical placement and metadata resume):
+Explicit current and previous closure set:
 
 ```text
-9 passed in 1.09s
+12 passed in 1.35s
+```
+
+Cross-process intake contention:
+
+```text
+20/20 consecutive runs passed
 ```
 
 Fresh repository-wide gate:
 
 ```text
 .\.venv\Scripts\python.exe -m pytest -p no:cacheprovider
-663 passed, 5 skipped in 8.31s
+669 passed, 5 skipped in 10.63s
 
 .\.venv\Scripts\python.exe -m pip check
 No broken requirements found.
@@ -91,62 +109,63 @@ exit 0, no output
 Patch package validation before this report edit:
 
 ```text
-git apply --check --reverse .superpowers/sdd/review-f74ab0f..319d7d3.diff
+git apply --check --reverse .superpowers/sdd/review-319d7d3..933222e.diff
 exit 0
-package Git blob: 50e753bf03dbeb1a108f3a7679b13feccec1494c
+package Git blob: d8d1d7df6ec236d65b22e3bf26eb7ee6fa1bfeb5
 ```
 
 ## Disposition
 
-Do not advance Task 9B yet. Close the first-bind crash/retry protocol and include the marker registry in bounded metadata retention, then repeat the focused controller review. No Critical safety regression remains in the six previously reported paths.
+Do not advance Task 9B yet. Close the empty canonical-marker crash window, add the focused recovery regression, and repeat the bounded controller review. The requested initialized-marker recovery, purge behavior, prior six lifecycle fixes, and broad verification are otherwise ready.
 
-## Implementer response to the two remaining findings
+## Implementer response to the final Important finding
 
-The two findings were addressed under one constrained marker invariant: only the exact fresh one-byte marker `0x00` can recover a missing first registry binding, while the retired marker remains the distinct byte `0x01` and is never adoptable after its registry metadata is purged.
+The final recovery protocol handles the canonical empty-file crash state without adopting a general unknown empty object. It combines the already held OS batch lock with a serialized SQLite transaction and a descriptor-bound initializer callback.
 
-### Important - pre-bind crash recovery
+### RED - crash after canonical creation and before the first lock
 
-RED: `test_fresh_marker_survives_pre_bind_crash_and_is_recovered` injected failure after the canonical marker had been created and durably initialized but before the first registry call could commit. The marker remained `b"\x00"`, the registry row remained absent, and retry failed with `cleanup_ownership_invalid` because it reached `marker is None` with `created=False`.
+`test_empty_marker_survives_pre_lock_crash_and_is_recovered` injects a process failure from the creator's first `_try_batch_lock` call. At that point the canonical marker has been exclusively created but remains the same regular single-link object with exact contents `b''`; no `BatchLockMarkerRecord` exists.
 
-GREEN: `FileStorage.batch_lock` now performs marker decisions only while holding the OS lock on the same open descriptor. It requires a canonical UUID-derived name, stable data-root/`.locks`/name binding, non-reparse regular type, link count one, stable identity, exact size, and exact full marker bytes before passing `recover_unbound=True`. `RetentionRepository.bind_lock_marker` accepts that authorization only when its `BEGIN IMMEDIATE` transaction still finds no row. An existing row always requires exact identity equality and is never updated or bypassed by recovery authorization.
+Before this remediation, a fresh `FileStorage` retry acquired that marker, exhausted the 100-attempt initialization wait, and raised `path_unsafe`. The empty bytes and absent registry row were unchanged, so every future retry followed the same permanent failure.
 
-The recovery set covers both crash boundaries and rejection cases:
+### GREEN - transactionally authorized handle initialization
 
-- pre-bind failure retries and registers the original marker identity;
-- post-commit failure retries through the already durable exact-identity row;
-- empty, retired `0x01`, oversized, and hard-linked unbound markers are rejected without mutation or registry insertion;
-- the prior name-swap retry now uses an exact fresh-byte `0x00` replacement and proves that an existing registry mismatch is still rejected without mutation.
+`RetentionRepository.bind_empty_lock_marker` now owns this exact sequence:
 
-During the required fresh baseline, the existing cross-process intake regression exposed the marker initialization window independently: one run returned `path_unsafe` instead of the capacity error. After moving validation behind the OS lock, stress reproduction identified both sides of the remaining race in the same run:
+1. validate the canonical batch ID, non-negative integer identity pair, strict `allow_missing` flag, and synchronous initializer;
+2. acquire `BEGIN IMMEDIATE`;
+3. require the retention row unless the existing missing-row intake policy permits it;
+4. require that no marker registry row exists, rejecting even a same-identity row before invoking the callback;
+5. invoke the callback while the caller still holds the OS lock;
+6. insert the exact marker identity and commit only after successful callback return.
 
-```text
-existing opener: OSError('invalid batch lock marker')
-creator: PermissionError(13, 'Permission denied')
-result: [('error', 'path_unsafe'), ('error', 'path_unsafe')]
-```
+The callback remains entirely in `FileStorage`. On the same open descriptor it proves the stable data root, `.locks` parent, canonical UUID-derived name, descriptor/name identity, non-reparse regular type, single-link count, and exact zero length. It then writes `0x00`, fsyncs, and repeats the complete proof with exact one-byte contents before the repository can insert or commit.
 
-The existing opener had locked the newly created but still-empty file while the creator attempted to write its initialization byte through that byte-range lock. Creation now acquires the OS lock before writing `0x00`. An existing opener that locks an empty marker releases, yields, and reacquires for a bounded initialization window; it never adopts or mutates the empty object. The cross-process regression then passed 20 consecutive runs, and the final focused/full gates also passed it.
+This covers both crash states:
 
-### Important - bounded marker metadata retention
+- a crash before the callback write rolls back the DB transaction and leaves the exact empty marker eligible for the same recovery;
+- a crash after `0x00` fsync but before DB commit rolls back the row and leaves the initialized object eligible for the previously verified `0x00` pre-bind recovery.
 
-RED: the extended exact-30-day boundary test and immediate early-delete test each observed one remaining `BatchLockMarkerRecord` after every other per-task metadata row had been purged.
+Any existing registry row, matching or mismatched, rejects before initialization and remains unchanged. Empty and initialized multi-link markers remain untouched. Retired `0x01` and oversized markers never enter the empty initializer. The prior root/parent/name-swap regressions continue to exercise the shared descriptor proof.
 
-GREEN: `purge_metadata` now deletes the marker registry row inside the existing transaction, after dependent audit/artifact/event/file rows and before retention/batch rows. Both ordinary exactly-due and immediate early deletion leave no marker registry row. The on-disk marker remains the content-free retired byte `0x01`; a direct later `batch_lock(..., allow_retired=True)` with no registry row rejects it as `cleanup_ownership_invalid` and preserves the byte unchanged. The injected metadata-purge failure still resumes successfully.
+`test_live_creator_lock_prevents_a_second_opener_from_initializing` holds an empty creator descriptor under the OS lock, starts a second opener, and proves it remains blocked until the creator writes and fsyncs `0x00` and releases. The existing cross-process capacity regression then passed 20 consecutive runs with the transactional callback protocol.
 
-## Final remediation verification
+The former malformed-marker parameter no longer labels `b''` intrinsically malformed: an empty marker is recoverable only through the strict absent-row protocol above. Retired and oversized unknown markers remain in the malformed rejection test, while registered-empty and hard-linked-empty cases have explicit rejection coverage.
 
-Focused lifecycle gate including all six prior closures, the two remaining findings, and cross-process intake:
+## Final empty-marker verification
+
+Focused lifecycle gate, including all prior closure tests:
 
 ```text
 .\.venv\Scripts\python.exe -m pytest tests/test_retention.py tests/test_artifacts.py tests/test_file_intake.py tests/test_remote_fetch.py -p no:cacheprovider
-132 passed in 6.30s
+136 passed in 5.01s
 ```
 
 Repository-wide gate:
 
 ```text
 .\.venv\Scripts\python.exe -m pytest -p no:cacheprovider
-669 passed, 5 skipped in 10.49s
+673 passed, 5 skipped in 9.26s
 
 .\.venv\Scripts\python.exe -m pip check
 No broken requirements found.
@@ -158,6 +177,6 @@ git diff --check
 exit 0 (line-ending notices only)
 ```
 
-## Final remediation disposition
+## Final empty-marker disposition
 
-Both remaining Important findings now have strict RED/GREEN coverage, and all six previous closures remain green. Task 9B is ready for the same controller reviewer to repeat spec and code-quality review. No push, deployment, or Task 10 work is included.
+The final Important finding now has a strict RED/GREEN crash regression plus registered-state, link-ownership, live-opener, and cross-process coverage. All prior lifecycle closures remain green. Task 9B is ready for the same controller reviewer to perform the final bounded spec and code-quality review. No push, deployment, or Task 10 work is included.
