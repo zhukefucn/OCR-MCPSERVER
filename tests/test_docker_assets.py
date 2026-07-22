@@ -7,6 +7,7 @@ import tomllib
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -42,6 +43,23 @@ def _dockerignore_excludes(path: str, patterns: list[str]) -> bool:
         if fnmatchcase(path, candidate):
             excluded = not negated
     return excluded
+
+
+def _dockerfile_instructions(dockerfile: str) -> list[str]:
+    """Join continued lines so Dockerfile directives can be inspected safely."""
+
+    instructions: list[str] = []
+    continued_parts: list[str] = []
+    for raw_line in dockerfile.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        is_continued = stripped.endswith("\\")
+        continued_parts.append(stripped[:-1].rstrip() if is_continued else stripped)
+        if not is_continued:
+            instructions.append(" ".join(continued_parts))
+            continued_parts = []
+    return instructions
 
 
 def test_compose_defines_only_the_minimal_gateway_service() -> None:
@@ -133,6 +151,66 @@ def test_gateway_dockerfile_exposes_pip_index_arg_to_pip_install_run() -> None:
     assert pip_index_arg is not None
     assert pip_install_run is not None
     assert pip_index_arg.start() < pip_install_run.start()
+
+
+def test_gateway_dockerfile_does_not_persist_pip_index_at_runtime() -> None:
+    dockerfile = _read_text("docker/ocr-gateway.Dockerfile")
+    env_instructions = [
+        instruction
+        for instruction in _dockerfile_instructions(dockerfile)
+        if re.match(r"^ENV(?:\s|$)", instruction, re.IGNORECASE)
+    ]
+
+    assert not any(
+        re.search(
+            r"(?:^|\s)PIP_INDEX_URL\s*(?:=|\s)",
+            instruction,
+            re.IGNORECASE,
+        )
+        for instruction in env_instructions
+    )
+
+
+def test_gateway_dockerfile_does_not_set_pip_trusted_host() -> None:
+    dockerfile = _read_text("docker/ocr-gateway.Dockerfile")
+
+    assert re.search(r"\bPIP_TRUSTED_HOST\b", dockerfile, re.IGNORECASE) is None
+
+
+def test_gateway_dockerfile_does_not_use_pip_trusted_host_option() -> None:
+    dockerfile = _read_text("docker/ocr-gateway.Dockerfile")
+
+    assert re.search(r"--trusted-host\b", dockerfile, re.IGNORECASE) is None
+
+
+def test_gateway_dockerfile_uses_only_https_pip_index_values() -> None:
+    dockerfile = _read_text("docker/ocr-gateway.Dockerfile")
+    pip_index_values = re.findall(
+        r"\bPIP_INDEX_URL\s*=\s*([^\s\\]+)",
+        dockerfile,
+        re.IGNORECASE,
+    )
+
+    assert pip_index_values
+    assert all(
+        value.strip("'\"").lower().startswith("https://")
+        for value in pip_index_values
+    )
+
+
+def test_gateway_dockerfile_pip_index_urls_do_not_contain_credentials() -> None:
+    dockerfile = _read_text("docker/ocr-gateway.Dockerfile")
+    pip_index_values = re.findall(
+        r"\bPIP_INDEX_URL\s*=\s*([^\s\\]+)",
+        dockerfile,
+        re.IGNORECASE,
+    )
+
+    assert pip_index_values
+    for value in pip_index_values:
+        parsed_value = urlsplit(value.strip("'\""))
+        assert parsed_value.username is None
+        assert parsed_value.password is None
 
 
 def test_gateway_dockerfile_has_only_gateway_runtime_configuration() -> None:
