@@ -33,7 +33,9 @@ def test_project_metadata_declares_python_dependencies_and_entrypoint() -> None:
         "httpx",
         "pillow",
         "pypdf",
+        "prometheus-client",
     }
+    assert "prometheus-client>=0.21,<1" in project["dependencies"]
     development_names = {
         dependency.split("<", 1)[0].split(">", 1)[0].split("=", 1)[0].lower()
         for dependency in project["optional-dependencies"]["dev"]

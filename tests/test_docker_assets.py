@@ -282,6 +282,7 @@ def test_runtime_dependencies_exclude_ocr_engines_and_external_services() -> Non
         dependency_name.startswith(forbidden_name_prefixes)
         for dependency_name in dependency_names
     )
+    assert "prometheus-client" in dependency_names
 
 
 def test_gateway_healthcheck_uses_only_the_python_standard_library() -> None:
