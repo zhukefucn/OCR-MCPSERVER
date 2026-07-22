@@ -92,3 +92,71 @@ package Git blob: 73ec6386bac52235c51ea4090b41636a2353c6d3
 ## Disposition
 
 Task 9B is **READY** for controller integration. No Critical, Important, or Minor finding remains in the bounded retention/artifact lifecycle scope. No push, deployment, or Task 10 work was performed.
+
+## Ubuntu child-name binding follow-up
+
+An Ubuntu-only retention regression at head `619b65d` revealed one remaining regular-file name race after the READY review. This follow-up preserves the prior review and records the bounded correction.
+
+### RED and root cause
+
+`test_owned_root_deletion_leaks_and_preserves_a_concurrent_name_replacement` opens `result.zip`, then injects this race inside `_scrub_open_regular`: rename the open object to `moved-original.zip`, create replacement bytes at the original `result.zip` name, and call the real scrubber.
+
+Ubuntu observed:
+
+```text
+expected: cleanup_ownership_invalid; replacement and moved original preserved
+actual: replacement preserved; moved original truncated to b''
+```
+
+POSIX traversal opened the child relative to its pinned parent descriptor, but `_scrub_regular` discarded `parent_descriptor` and `name` when invoking `_scrub_open_regular`. The real scrubber validated only `fstat(descriptor)`. After the rename, that descriptor still correctly identified the moved original, remained regular, and had link count one, so every predicate passed and `ftruncate` destroyed its bytes. The later directory check detected the name change only after mutation. Windows did not reproduce the byte loss because its separate handle-final-path check rejected the moved descriptor before truncation.
+
+### Binding correction
+
+`_scrub_regular` now carries the pinned parent descriptor and validated child name into `_scrub_open_regular`. A shared assertion runs immediately before `ftruncate` and again after `fsync`:
+
+- `fstat(descriptor)` must identify the expected non-reparse regular single-link object;
+- POSIX resolves the current child name with `os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)`;
+- Windows resolves the current name with `lstat(path)` and retains its handle-final-path check;
+- the current named entry must be a non-reparse regular file whose identity equals both `expected` and the open descriptor;
+- the post-fsync descriptor must additionally be exactly zero bytes.
+
+A missing, renamed, or replaced name is therefore an ownership failure before destructive mutation. The Ubuntu injection reaches the pre-truncate assertion after performing its swap, so neither the replacement nor moved original is scrubbed. Single-link rejection and Windows exclusive parent/handle binding remain part of the same assertion path.
+
+### Verification
+
+The source Ubuntu RED was supplied by the controller. This Windows host has no configured WSL distribution and no Docker or Podman runtime, so it cannot honestly claim a local Ubuntu GREEN; the same reviewer must run the unchanged regression on Ubuntu against the committed head.
+
+Windows exact regression and related name/link/parent set:
+
+```text
+test_owned_root_deletion_leaks_and_preserves_a_concurrent_name_replacement: passed
+hardlink/name_replacement/parent_replacement/windows_exclusive selection: passed
+tests/test_retention.py: 36 passed
+```
+
+Windows focused lifecycle gate:
+
+```text
+.\.venv\Scripts\python.exe -m pytest tests/test_retention.py tests/test_artifacts.py tests/test_file_intake.py tests/test_remote_fetch.py -p no:cacheprovider
+138 passed, 5 skipped in 5.22s
+```
+
+Windows repository-wide gate:
+
+```text
+.\.venv\Scripts\python.exe -m pytest -p no:cacheprovider
+675 passed, 10 skipped in 10.32s
+
+.\.venv\Scripts\python.exe -m pip check
+No broken requirements found.
+
+.\.venv\Scripts\python.exe -m compileall -q src tests
+exit 0, no output
+
+git diff --check
+exit 0 (line-ending notices only)
+```
+
+### Follow-up disposition
+
+The implementation and Windows gates are ready. Task 9B should remain pending only until the same controller reviewer confirms the unchanged Ubuntu regression and Linux full gate on the committed head. No push, deployment, or Task 10 work is included.
