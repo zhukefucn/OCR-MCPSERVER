@@ -256,6 +256,7 @@ class OrientationRecoveryRepository:
         corrected_input_version: int,
         result_batch_id: str,
         result_version: int,
+        adopted_source_file_id: str,
         accepted_input_file_id: str,
         accepted_input_sha256: str,
         accepted_input_size_bytes: int,
@@ -268,6 +269,7 @@ class OrientationRecoveryRepository:
             or not _valid_uuid(result_batch_id)
             or type(result_version) is not int
             or result_version <= claim.snapshot.source_result_version
+            or not _valid_uuid(adopted_source_file_id)
             or not _valid_uuid(accepted_input_file_id)
             or accepted_input_file_id == claim.snapshot.file_id
             or not isinstance(accepted_input_sha256, str)
@@ -295,6 +297,13 @@ class OrientationRecoveryRepository:
                 if record is not None:
                     self._snapshot(record)
                 self._require_takeover_claim(record, retention, claim)
+                if (
+                    record.expected_corrected_input_version != corrected_input_version
+                    or record.corrected_input_file_id != adopted_source_file_id
+                    or record.corrected_input_sha256 != accepted_input_sha256
+                    or record.corrected_input_size_bytes != accepted_input_size_bytes
+                ):
+                    raise OrientationFailure(OrientationErrorCode.CLAIM_CONFLICT)
                 accepted_file = await session.get(
                     FileTaskRecord, accepted_input_file_id
                 )
@@ -308,14 +317,16 @@ class OrientationRecoveryRepository:
                     corrected_input_version,
                     result_batch_id,
                     result_version,
+                    adopted_source_file_id,
                     accepted_input_file_id,
                     accepted_input_sha256,
                     accepted_input_size_bytes,
                 )
                 persisted = (
-                    record.corrected_input_version,
+                    record.expected_corrected_input_version,
                     record.result_batch_id,
                     record.result_version,
+                    record.corrected_input_file_id,
                     record.accepted_input_file_id,
                     record.accepted_input_sha256,
                     record.accepted_input_size_bytes,
@@ -336,6 +347,77 @@ class OrientationRecoveryRepository:
                 record.accepted_input_file_id = accepted_input_file_id
                 record.accepted_input_sha256 = accepted_input_sha256
                 record.accepted_input_size_bytes = accepted_input_size_bytes
+                record.updated_at = now
+                record.version += 1
+                await session.commit()
+                return self._snapshot(record)
+        except OrientationFailure:
+            raise
+        except SQLAlchemyError:
+            raise OrientationFailure(OrientationErrorCode.PERSISTENCE_FAILED) from None
+        except Exception:
+            raise OrientationFailure(OrientationErrorCode.PERSISTENCE_FAILED) from None
+
+    async def bind_corrected_input(
+        self,
+        claim: RecoveryClaim,
+        *,
+        corrected_input_version: int,
+        corrected_file_id: str,
+        corrected_sha256: str,
+        corrected_size_bytes: int,
+        now: datetime,
+    ) -> RecoverySnapshot:
+        if (
+            not isinstance(claim, RecoveryClaim)
+            or type(corrected_input_version) is not int
+            or corrected_input_version != claim.snapshot.source_result_version + 1
+            or not _valid_uuid(corrected_file_id)
+            or corrected_file_id == claim.snapshot.file_id
+            or not isinstance(corrected_sha256, str)
+            or len(corrected_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in corrected_sha256)
+            or type(corrected_size_bytes) is not int
+            or not 1 <= corrected_size_bytes <= DEFAULT_MAX_FILE_SIZE_BYTES
+        ):
+            raise OrientationFailure(OrientationErrorCode.CLAIM_CONFLICT) from None
+        now = _utc(now)
+        try:
+            async with self._sessions() as session:
+                await session.execute(text("BEGIN IMMEDIATE"))
+                record = await session.scalar(
+                    select(OrientationRecoveryRecord).where(
+                        OrientationRecoveryRecord.claim_id == claim.claim_id
+                    )
+                )
+                retention = None if record is None else await session.get(
+                    RetentionRecord, record.batch_id
+                )
+                self._require_takeover_claim(record, retention, claim)
+                expected = (
+                    corrected_input_version,
+                    corrected_file_id,
+                    corrected_sha256,
+                    corrected_size_bytes,
+                )
+                persisted = (
+                    record.expected_corrected_input_version,
+                    record.corrected_input_file_id,
+                    record.corrected_input_sha256,
+                    record.corrected_input_size_bytes,
+                )
+                if all(value is not None for value in persisted):
+                    if persisted != expected:
+                        raise OrientationFailure(OrientationErrorCode.CLAIM_CONFLICT)
+                    return self._snapshot(record)
+                if record.state != RecoveryState.CLAIMED.value or any(
+                    value is not None for value in persisted
+                ):
+                    raise OrientationFailure(OrientationErrorCode.CLAIM_CONFLICT)
+                record.expected_corrected_input_version = corrected_input_version
+                record.corrected_input_file_id = corrected_file_id
+                record.corrected_input_sha256 = corrected_sha256
+                record.corrected_input_size_bytes = corrected_size_bytes
                 record.updated_at = now
                 record.version += 1
                 await session.commit()
@@ -609,7 +691,14 @@ class OrientationRecoveryRepository:
                 state=RecoveryState(record.state),
                 request_fingerprint=record.request_fingerprint,
                 claim_id=record.claim_id,
-                corrected_input_version=record.corrected_input_version,
+                corrected_input_version=(
+                    record.expected_corrected_input_version
+                    if record.expected_corrected_input_version is not None
+                    else record.corrected_input_version
+                ),
+                corrected_input_file_id=record.corrected_input_file_id,
+                corrected_input_sha256=record.corrected_input_sha256,
+                corrected_input_size_bytes=record.corrected_input_size_bytes,
                 result_batch_id=record.result_batch_id,
                 result_version=record.result_version,
                 error_code=record.error_code,

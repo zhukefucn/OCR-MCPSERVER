@@ -38,6 +38,7 @@ from .file_validation import FileValidator, ValidatedFileMetadata
 
 _DERIVATIVE_CAPACITY_LOCKS_GUARD = threading.Lock()
 _DERIVATIVE_CAPACITY_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+_LEASE_MINT = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,15 +47,62 @@ class BatchUsage:
     total_bytes: int
 
 
-@dataclass(slots=True)
 class BatchLockLease:
-    """Held batch lock whose one-byte marker can durably retire the batch."""
+    """Storage-minted, process-bound capability for one active batch lock."""
 
-    batch_id: str
-    descriptor: int
-    verify_identity: Callable[[], bool]
+    __slots__ = (
+        "_batch_id",
+        "_descriptor",
+        "_nonce",
+        "_owner",
+        "_pid",
+        "_verify_identity",
+    )
+
+    def __init__(self, *args, **kwargs) -> None:
+        del args, kwargs
+        raise TypeError("batch lock capabilities are storage-minted")
+
+    @classmethod
+    def _create(
+        cls,
+        mint,
+        *,
+        owner: FileStorage,
+        batch_id: str,
+        descriptor: int,
+        verify_identity: Callable[[], bool],
+    ) -> BatchLockLease:
+        if mint is not _LEASE_MINT:
+            raise TypeError("invalid batch lock mint")
+        lease = object.__new__(cls)
+        lease._batch_id = batch_id
+        lease._descriptor = descriptor
+        lease._nonce = uuid4().hex
+        lease._owner = owner
+        lease._pid = os.getpid()
+        lease._verify_identity = verify_identity
+        return lease
+
+    @property
+    def batch_id(self) -> str:
+        return self._batch_id
+
+    @property
+    def descriptor(self) -> int:
+        return self._descriptor
+
+    def verify_identity(self) -> bool:
+        try:
+            return bool(self._verify_identity())
+        except Exception:
+            return False
 
     def retire(self) -> None:
+        if not self._owner._validate_batch_lock(
+            self, self._batch_id, require_identity=False
+        ):
+            raise OSError("inactive batch lock capability")
         os.lseek(self.descriptor, 0, os.SEEK_SET)
         os.write(self.descriptor, b"\x01")
         os.ftruncate(self.descriptor, 1)
@@ -156,6 +204,54 @@ class FileStorage:
     ) -> None:
         self._data_root = Path(os.path.abspath(data_root))
         self._id_factory = id_factory
+        self._active_leases_guard = threading.Lock()
+        self._active_leases: dict[str, BatchLockLease] = {}
+
+    def _mint_batch_lock(
+        self,
+        batch_id: str,
+        descriptor: int,
+        verify_identity: Callable[[], bool],
+    ) -> BatchLockLease:
+        lease = BatchLockLease._create(
+            _LEASE_MINT,
+            owner=self,
+            batch_id=batch_id,
+            descriptor=descriptor,
+            verify_identity=verify_identity,
+        )
+        with self._active_leases_guard:
+            self._active_leases[lease._nonce] = lease
+        return lease
+
+    def _deactivate_batch_lock(self, lease: BatchLockLease) -> None:
+        with self._active_leases_guard:
+            if self._active_leases.get(lease._nonce) is lease:
+                del self._active_leases[lease._nonce]
+
+    def _validate_batch_lock(
+        self,
+        lease: object,
+        batch_id: str,
+        *,
+        require_identity: bool = True,
+    ) -> bool:
+        if not isinstance(lease, BatchLockLease):
+            return False
+        try:
+            if (
+                lease._owner is not self
+                or lease._pid != os.getpid()
+                or lease._batch_id != batch_id
+            ):
+                return False
+            with self._active_leases_guard:
+                active = self._active_leases.get(lease._nonce) is lease
+            return active and (
+                not require_identity or lease.verify_identity()
+            )
+        except (AttributeError, TypeError):
+            return False
 
     @asynccontextmanager
     async def batch_lock(
@@ -289,7 +385,13 @@ class FileStorage:
                     raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
             elif marker != b"\x00":
                 raise OSError("invalid batch lock marker")
-            yield BatchLockLease(canonical_batch_id, descriptor, lock_unchanged)
+            lease = self._mint_batch_lock(
+                canonical_batch_id, descriptor, lock_unchanged
+            )
+            try:
+                yield lease
+            finally:
+                self._deactivate_batch_lock(lease)
             if not lock_unchanged():
                 raise OSError("unsafe batch lock")
         except FileIntakeFailure as exc:
@@ -603,9 +705,9 @@ class FileStorage:
         ):
             raise FileIntakeFailure(FileIntakeErrorCode.TOO_LARGE)
         if (
-            not isinstance(batch_lock, BatchLockLease)
-            or batch_lock.batch_id != self._canonical_uuid(batch_id)
-            or not batch_lock.verify_identity()
+            not self._validate_batch_lock(
+                batch_lock, self._canonical_uuid(batch_id)
+            )
         ):
             raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
         if (
@@ -704,8 +806,7 @@ class FileStorage:
             )
         with capacity_lock:
             if (
-                batch_lock.batch_id != canonical_batch_id
-                or not batch_lock.verify_identity()
+                not self._validate_batch_lock(batch_lock, canonical_batch_id)
             ):
                 raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
             return self._create_immutable_derivative_locked_sync(
@@ -824,7 +925,7 @@ class FileStorage:
                 raise FileIntakeFailure(
                     FileIntakeErrorCode.BATCH_CAPACITY_EXCEEDED
                 )
-            if not batch_lock.verify_identity():
+            if not self._validate_batch_lock(batch_lock, canonical_batch_id):
                 raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
             current_source = os.fstat(source_descriptor)
             current_source_digest = self._hash_descriptor(source_descriptor)
@@ -858,7 +959,7 @@ class FileStorage:
                 raise OSError("unsafe staged output")
             if cancelled.is_set():
                 raise asyncio.CancelledError
-            if not batch_lock.verify_identity():
+            if not self._validate_batch_lock(batch_lock, canonical_batch_id):
                 raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
             self._publish_no_replace(
                 directory,

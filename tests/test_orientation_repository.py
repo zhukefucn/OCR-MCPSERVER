@@ -26,7 +26,11 @@ from ocr_mcp_server.infra.database import (
 from ocr_mcp_server.infra.orientation_repository import OrientationRecoveryRepository
 from ocr_mcp_server.infra.retention_repository import RetentionRepository
 from ocr_mcp_server.infra.task_repository import TaskRepository
-from ocr_mcp_server.infra.task_models import ArtifactRecord, RetentionRecord
+from ocr_mcp_server.infra.task_models import (
+    ArtifactRecord,
+    FileTaskRecord,
+    RetentionRecord,
+)
 from ocr_mcp_server.services.orientation_recovery import (
     FullRecoveryPipelineSubmission,
     OrientationRecoveryCoordinator,
@@ -39,14 +43,27 @@ from ocr_mcp_server.services.retention import RetentionService
 NOW = datetime(2026, 7, 22, tzinfo=UTC)
 FILE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 ACCEPTED_FILE_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+EXPECTED_CORRECTED_FILE_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
 
 
 def takeover_proof() -> dict[str, object]:
     return {
+        "adopted_source_file_id": EXPECTED_CORRECTED_FILE_ID,
         "accepted_input_file_id": ACCEPTED_FILE_ID,
         "accepted_input_sha256": "b" * 64,
         "accepted_input_size_bytes": 10,
     }
+
+
+async def bind_expected(repo, claim, *, now=NOW):
+    return await repo.bind_corrected_input(
+        claim,
+        corrected_input_version=3,
+        corrected_file_id=EXPECTED_CORRECTED_FILE_ID,
+        corrected_sha256="b" * 64,
+        corrected_size_bytes=10,
+        now=now,
+    )
 
 
 def database_url(path: Path) -> str:
@@ -78,6 +95,10 @@ async def test_schema_upgrade_adds_durable_takeover_proof_columns(
             "accepted_input_file_id",
             "accepted_input_sha256",
             "accepted_input_size_bytes",
+            "corrected_input_file_id",
+            "corrected_input_sha256",
+            "corrected_input_size_bytes",
+            "expected_corrected_input_version",
         }.issubset(columns)
     finally:
         await engine.dispose()
@@ -299,6 +320,7 @@ async def test_concurrent_restart_reconciliation_converges_without_running_work(
     repo, _, batch_id, result_batch_id = repository
     issue = await repo.issue(binding(batch_id), now=NOW)
     claim = await repo.claim(issue.token, (2,), now=NOW)
+    await bind_expected(repo, claim)
 
     class Runner:
         reconcile_calls = 0
@@ -312,6 +334,7 @@ async def test_concurrent_restart_reconciliation_converges_without_running_work(
                 result_batch_id,
                 BatchStatus.QUEUED,
                 3,
+                EXPECTED_CORRECTED_FILE_ID,
                 ACCEPTED_FILE_ID,
                 "b" * 64,
                 10,
@@ -435,6 +458,7 @@ async def test_terminal_compare_and_set_is_idempotent_and_restart_safe(repositor
     repo, engine, batch_id, result_batch_id = repository
     issue = await repo.issue(binding(batch_id), now=NOW)
     claim = await repo.claim(issue.token, (2,), now=NOW)
+    await bind_expected(repo, claim)
 
     restarted = OrientationRecoveryRepository(create_session_factory(engine))
     completed = await restarted.complete(
@@ -460,7 +484,9 @@ async def test_terminal_compare_and_set_is_idempotent_and_restart_safe(repositor
             await connection.execute(
                 text(
                     "SELECT accepted_input_file_id, accepted_input_sha256, "
-                    "accepted_input_size_bytes FROM orientation_recoveries"
+                    "accepted_input_size_bytes, corrected_input_file_id, "
+                    "corrected_input_sha256, corrected_input_size_bytes, "
+                    "expected_corrected_input_version FROM orientation_recoveries"
                 )
             )
         ).mappings().one()
@@ -468,6 +494,10 @@ async def test_terminal_compare_and_set_is_idempotent_and_restart_safe(repositor
         "accepted_input_file_id": ACCEPTED_FILE_ID,
         "accepted_input_sha256": "b" * 64,
         "accepted_input_size_bytes": 10,
+        "corrected_input_file_id": EXPECTED_CORRECTED_FILE_ID,
+        "corrected_input_sha256": "b" * 64,
+        "corrected_input_size_bytes": 10,
+        "expected_corrected_input_version": 3,
     }
 
     with pytest.raises(OrientationFailure) as conflict:
@@ -512,6 +542,7 @@ async def test_terminal_transitions_reject_expired_deleted_or_forged_claims(repo
         binding(batch_id, expires_at=NOW + timedelta(seconds=2)), now=NOW
     )
     claim = await repo.claim(issue.token, (2,), now=NOW)
+    await bind_expected(repo, claim)
 
     with pytest.raises(OrientationFailure) as expired:
         await repo.fail(
@@ -584,6 +615,7 @@ async def test_retention_authoritatively_bounds_issue_and_all_later_operations(r
         binding(batch_id, expires_at=NOW + timedelta(hours=1)), now=NOW
     )
     claim = await repo.claim(issue.token, (2,), now=NOW)
+    await bind_expected(repo, claim)
     async with engine.begin() as connection:
         await connection.execute(
             text(
@@ -625,6 +657,7 @@ async def test_durable_takeover_completes_after_token_and_content_expiry(reposit
         binding(batch_id, expires_at=NOW + timedelta(seconds=1)), now=NOW
     )
     claim = await repo.claim(issue.token, (2,), now=NOW)
+    await bind_expected(repo, claim)
 
     completed = await repo.complete(
         claim,
@@ -639,10 +672,69 @@ async def test_durable_takeover_completes_after_token_and_content_expiry(reposit
 
 
 @pytest.mark.asyncio
+async def test_restart_rejects_other_filetask_and_forged_digest_without_expected_binding(
+    repository,
+) -> None:
+    repo, engine, batch_id, result_batch_id = repository
+    issue = await repo.issue(binding(batch_id), now=NOW)
+    claim = await repo.claim(issue.token, (2,), now=NOW)
+    expected_file_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    await repo.bind_corrected_input(
+        claim,
+        corrected_input_version=3,
+        corrected_file_id=expected_file_id,
+        corrected_sha256="b" * 64,
+        corrected_size_bytes=10,
+        now=NOW,
+    )
+    other_file_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    sessions = create_session_factory(engine)
+    async with sessions() as session:
+        session.add(
+            FileTaskRecord(
+                id=other_file_id,
+                batch_id=result_batch_id,
+                position=1,
+                status="queued",
+                stage="validating",
+                progress=0,
+                attempt_count=0,
+                max_attempts=3,
+                lease_owner=None,
+                lease_token=None,
+                lease_expires_at=None,
+                last_error_code=None,
+                completed_units=None,
+                total_units=None,
+                progress_unit=None,
+                created_at=NOW,
+                updated_at=NOW,
+                version=1,
+            )
+        )
+        await session.commit()
+
+    with pytest.raises(OrientationFailure) as forged:
+        await repo.complete(
+            claim,
+            corrected_input_version=3,
+            result_batch_id=result_batch_id,
+            result_version=3,
+            adopted_source_file_id=expected_file_id,
+            accepted_input_file_id=other_file_id,
+            accepted_input_sha256="c" * 64,
+            accepted_input_size_bytes=11,
+            now=NOW,
+        )
+    assert forged.value.code == OrientationErrorCode.CLAIM_CONFLICT.value
+
+
+@pytest.mark.asyncio
 async def test_deleted_source_claim_reconciles_durable_runner_takeover(repository) -> None:
     repo, engine, batch_id, result_batch_id = repository
     issue = await repo.issue(binding(batch_id), now=NOW)
-    await repo.claim(issue.token, (2,), now=NOW)
+    claim = await repo.claim(issue.token, (2,), now=NOW)
+    await bind_expected(repo, claim)
     retention = RetentionRepository(create_session_factory(engine))
     assert await retention.request_early_delete(batch_id, now=NOW)
     cleanup_claim = await retention.claim_batch(
@@ -658,6 +750,7 @@ async def test_deleted_source_claim_reconciles_durable_runner_takeover(repositor
                 result_batch_id,
                 BatchStatus.QUEUED,
                 3,
+                EXPECTED_CORRECTED_FILE_ID,
                 ACCEPTED_FILE_ID,
                 "b" * 64,
                 10,
@@ -825,6 +918,7 @@ async def test_issue_requires_available_source_artifact_and_complete_requires_re
         )
     issue = await repo.issue(binding(batch_id), now=NOW)
     claim = await repo.claim(issue.token, (2,), now=NOW)
+    await bind_expected(repo, claim)
     with pytest.raises(OrientationFailure) as missing_result:
         await repo.complete(
             claim,

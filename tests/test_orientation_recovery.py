@@ -47,12 +47,14 @@ BATCH_ID = "11111111-1111-4111-8111-111111111111"
 FILE_ID = "22222222-2222-4222-8222-222222222222"
 RESULT_BATCH_ID = "33333333-3333-4333-8333-333333333333"
 ACCEPTED_FILE_ID = "55555555-5555-4555-8555-555555555555"
+CORRECTED_FILE_ID = "44444444-4444-4444-8444-444444444444"
 
 
 def pipeline_submission(
     batch_id: str = RESULT_BATCH_ID,
     result_version: int = 3,
     *,
+    adopted_source_file_id: str = CORRECTED_FILE_ID,
     accepted_input_file_id: str = ACCEPTED_FILE_ID,
     accepted_input_sha256: str = "b" * 64,
     accepted_input_size_bytes: int = 10,
@@ -61,6 +63,7 @@ def pipeline_submission(
         batch_id,
         BatchStatus.QUEUED,
         result_version,
+        adopted_source_file_id,
         accepted_input_file_id,
         accepted_input_sha256,
         accepted_input_size_bytes,
@@ -69,6 +72,7 @@ def pipeline_submission(
 
 def test_pipeline_submission_requires_content_free_durable_takeover_proof():
     valid = pipeline_submission()
+    assert valid.adopted_source_file_id == CORRECTED_FILE_ID
     assert valid.accepted_input_file_id == ACCEPTED_FILE_ID
     assert valid.accepted_input_sha256 == "b" * 64
     assert valid.accepted_input_size_bytes == 10
@@ -96,7 +100,10 @@ def snapshot(state: RecoveryState = RecoveryState.ISSUED) -> RecoverySnapshot:
         state=state,
         request_fingerprint="a" * 64 if claimed else None,
         claim_id="claim-123" if claimed else None,
-        corrected_input_version=3 if terminal else None,
+        corrected_input_version=3 if claimed else None,
+        corrected_input_file_id=CORRECTED_FILE_ID if claimed else None,
+        corrected_input_sha256="b" * 64 if claimed else None,
+        corrected_input_size_bytes=10 if claimed else None,
         result_batch_id=RESULT_BATCH_ID if terminal else None,
         result_version=3 if terminal else None,
         error_code=("orientation_uncertain" if state is RecoveryState.UNCERTAIN else "orientation_failed") if failure else None,
@@ -138,6 +145,7 @@ class Repo:
         corrected_input_version,
         result_batch_id,
         result_version,
+        adopted_source_file_id,
         accepted_input_file_id,
         accepted_input_sha256,
         accepted_input_size_bytes,
@@ -145,25 +153,46 @@ class Repo:
     ):
         self.complete_calls += 1
         assert accepted_input_file_id == ACCEPTED_FILE_ID
+        assert adopted_source_file_id == self.current.corrected_input_file_id
         assert accepted_input_sha256 == "b" * 64
         assert accepted_input_size_bytes == 10
         self.current = replace(
-            claim.snapshot,
+            self.current,
             state=RecoveryState.COMPLETED,
             corrected_input_version=corrected_input_version,
             result_batch_id=result_batch_id,
             result_version=result_version,
-            version=claim.snapshot.version + 1,
+            version=self.current.version + 1,
+        )
+        return self.current
+
+    async def bind_corrected_input(
+        self,
+        claim,
+        *,
+        corrected_input_version,
+        corrected_file_id,
+        corrected_sha256,
+        corrected_size_bytes,
+        now,
+    ):
+        self.current = replace(
+            self.current,
+            corrected_input_version=corrected_input_version,
+            corrected_input_file_id=corrected_file_id,
+            corrected_input_sha256=corrected_sha256,
+            corrected_input_size_bytes=corrected_size_bytes,
+            version=self.current.version + 1,
         )
         return self.current
 
     async def fail(self, claim, *, state, error_code, now):
         self.fail_calls.append((state, error_code))
         self.current = replace(
-            claim.snapshot,
+            self.current,
             state=state,
             error_code=error_code,
-            version=claim.snapshot.version + 1,
+            version=self.current.version + 1,
         )
         return self.current
 
@@ -180,7 +209,7 @@ class Storage:
         assert not allow_missing_marker and not allow_retired
         self.events.append("lock-enter")
         try:
-            yield BatchLockLease(BATCH_ID, -1, lambda: True)
+            yield None
         finally:
             self.events.append("lock-exit")
 
@@ -261,7 +290,7 @@ class Runner:
         assert corrected.file_id != FILE_ID
         assert recovery_id == "claim-123"
         assert (source_batch_id, source_result_version, corrected_input_version) == (BATCH_ID, 2, 3)
-        result = pipeline_submission()
+        result = pipeline_submission(adopted_source_file_id=corrected.file_id)
         self.reconciled = result
         return result
 

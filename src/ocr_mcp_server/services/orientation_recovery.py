@@ -124,7 +124,7 @@ class OrientationCorrectionRequest:
     expected_source_sha256: str
     expected_source_size_bytes: int
     decisions: tuple[OrientationDecision, ...]
-    batch_lock: BatchLockLease = field(repr=False, compare=False)
+    batch_lock: BatchLockLease | None = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
         extensions = {
@@ -147,9 +147,10 @@ class OrientationCorrectionRequest:
             )
             or type(self.expected_source_size_bytes) is not int
             or self.expected_source_size_bytes < 1
-            or not isinstance(self.batch_lock, BatchLockLease)
-            or self.batch_lock.batch_id != self.batch_id
-            or not self.batch_lock.verify_identity()
+            or (
+                self.batch_lock is not None
+                and not isinstance(self.batch_lock, BatchLockLease)
+            )
         ):
             raise ValueError("invalid orientation correction request")
         decisions = tuple(self.decisions)
@@ -192,9 +193,21 @@ class OrientationRecoveryState(Protocol):
         corrected_input_version: int,
         result_batch_id: str,
         result_version: int,
+        adopted_source_file_id: str,
         accepted_input_file_id: str,
         accepted_input_sha256: str,
         accepted_input_size_bytes: int,
+        now: datetime,
+    ) -> RecoverySnapshot: ...
+
+    async def bind_corrected_input(
+        self,
+        claim: RecoveryClaim,
+        *,
+        corrected_input_version: int,
+        corrected_file_id: str,
+        corrected_sha256: str,
+        corrected_size_bytes: int,
         now: datetime,
     ) -> RecoverySnapshot: ...
 
@@ -252,6 +265,7 @@ class FullRecoveryPipelineSubmission:
     batch_id: str
     status: BatchStatus
     result_version: int
+    adopted_source_file_id: str
     accepted_input_file_id: str
     accepted_input_sha256: str
     accepted_input_size_bytes: int
@@ -262,6 +276,7 @@ class FullRecoveryPipelineSubmission:
             or self.status is not BatchStatus.QUEUED
             or type(self.result_version) is not int
             or self.result_version < 1
+            or not _canonical_uuid(self.adopted_source_file_id)
             or not _canonical_uuid(self.accepted_input_file_id)
             or not isinstance(self.accepted_input_sha256, str)
             or len(self.accepted_input_sha256) != 64
@@ -472,6 +487,9 @@ class OrientationRecoveryCoordinator:
                         claim, source, credible, batch_lock
                     )
                     corrected_input_version = claim.snapshot.source_result_version + 1
+                    await self._bind_corrected_input(
+                        claim, corrected, corrected_input_version
+                    )
                     await _safe_progress(progress, 70)
                     submission = await self._run(
                         claim, corrected, corrected_input_version
@@ -481,6 +499,7 @@ class OrientationRecoveryCoordinator:
                         or submission.result_version != corrected_input_version
                         or submission.accepted_input_file_id
                         in {claim.snapshot.file_id, corrected.file_id}
+                        or submission.adopted_source_file_id != corrected.file_id
                         or submission.accepted_input_sha256 != corrected.sha256
                         or submission.accepted_input_size_bytes != corrected.size_bytes
                     ):
@@ -498,6 +517,7 @@ class OrientationRecoveryCoordinator:
                             corrected_input_version=corrected_input_version,
                             result_batch_id=submission.batch_id,
                             result_version=submission.result_version,
+                            adopted_source_file_id=submission.adopted_source_file_id,
                             accepted_input_file_id=submission.accepted_input_file_id,
                             accepted_input_sha256=submission.accepted_input_sha256,
                             accepted_input_size_bytes=submission.accepted_input_size_bytes,
@@ -567,6 +587,13 @@ class OrientationRecoveryCoordinator:
                 and submission.batch_id != claim.snapshot.batch_id
                 and submission.result_version == expected_version
                 and submission.accepted_input_file_id != claim.snapshot.file_id
+                and claim.snapshot.corrected_input_version == expected_version
+                and submission.adopted_source_file_id
+                == claim.snapshot.corrected_input_file_id
+                and submission.accepted_input_sha256
+                == claim.snapshot.corrected_input_sha256
+                and submission.accepted_input_size_bytes
+                == claim.snapshot.corrected_input_size_bytes
             )
             if valid:
                 try:
@@ -575,6 +602,7 @@ class OrientationRecoveryCoordinator:
                         corrected_input_version=expected_version,
                         result_batch_id=submission.batch_id,
                         result_version=submission.result_version,
+                        adopted_source_file_id=submission.adopted_source_file_id,
                         accepted_input_file_id=submission.accepted_input_file_id,
                         accepted_input_sha256=submission.accepted_input_sha256,
                         accepted_input_size_bytes=submission.accepted_input_size_bytes,
@@ -774,6 +802,26 @@ class OrientationRecoveryCoordinator:
                 claim, state=RecoveryState.FAILED,
                 error_code="orientation_pipeline_failed",
             )
+            raise RecoveryServiceFailure(
+                RecoveryServiceErrorCode.UNAVAILABLE
+            ) from None
+
+    async def _bind_corrected_input(
+        self,
+        claim: RecoveryClaim,
+        corrected: StoredFile,
+        corrected_input_version: int,
+    ) -> None:
+        try:
+            await self._repository.bind_corrected_input(
+                claim,
+                corrected_input_version=corrected_input_version,
+                corrected_file_id=corrected.file_id,
+                corrected_sha256=corrected.sha256,
+                corrected_size_bytes=corrected.size_bytes,
+                now=self._now_factory(),
+            )
+        except Exception:
             raise RecoveryServiceFailure(
                 RecoveryServiceErrorCode.UNAVAILABLE
             ) from None

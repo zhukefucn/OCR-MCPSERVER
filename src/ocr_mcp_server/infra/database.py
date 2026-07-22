@@ -61,6 +61,10 @@ def _migrate_orientation_takeover_columns(connection) -> None:
         "accepted_input_file_id": "VARCHAR(36)",
         "accepted_input_sha256": "VARCHAR(64)",
         "accepted_input_size_bytes": "INTEGER",
+        "corrected_input_file_id": "VARCHAR(36)",
+        "corrected_input_sha256": "VARCHAR(64)",
+        "corrected_input_size_bytes": "INTEGER",
+        "expected_corrected_input_version": "INTEGER",
     }
     for name, column_type in additions.items():
         if name not in existing:

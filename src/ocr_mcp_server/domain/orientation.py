@@ -180,6 +180,9 @@ class RecoverySnapshot:
     request_fingerprint: str | None
     claim_id: str | None
     corrected_input_version: int | None
+    corrected_input_file_id: str | None
+    corrected_input_sha256: str | None
+    corrected_input_size_bytes: int | None
     result_batch_id: str | None
     result_version: int | None
     error_code: str | None
@@ -207,6 +210,9 @@ class RecoverySnapshot:
             or (self.request_fingerprint is not None and _DIGEST.fullmatch(self.request_fingerprint) is None)
             or (self.claim_id is not None and _IDENTIFIER.fullmatch(self.claim_id) is None)
             or (self.corrected_input_version is not None and not _positive(self.corrected_input_version))
+            or (self.corrected_input_file_id is not None and not _uuid(self.corrected_input_file_id))
+            or (self.corrected_input_sha256 is not None and _DIGEST.fullmatch(self.corrected_input_sha256) is None)
+            or (self.corrected_input_size_bytes is not None and not _positive(self.corrected_input_size_bytes))
             or (self.result_batch_id is not None and not _uuid(self.result_batch_id))
             or (self.result_version is not None and not _positive(self.result_version))
             or (self.error_code is not None and _CODE.fullmatch(self.error_code) is None)
@@ -217,13 +223,18 @@ class RecoverySnapshot:
             self.request_fingerprint,
             self.claim_id,
         )
-        result_fields = (
+        corrected_fields = (
             self.corrected_input_version,
+            self.corrected_input_file_id,
+            self.corrected_input_sha256,
+            self.corrected_input_size_bytes,
+        )
+        result_fields = (
             self.result_batch_id,
             self.result_version,
         )
         if self.state is RecoveryState.ISSUED and (
-            any(value is not None for value in claimed_fields + result_fields)
+            any(value is not None for value in claimed_fields + corrected_fields + result_fields)
             or self.error_code is not None
         ):
             raise ValueError("issued recovery contains claim state")
@@ -235,15 +246,26 @@ class RecoverySnapshot:
         } and any(value is None for value in claimed_fields):
             raise ValueError("claimed recovery lacks claim state")
         if self.state is RecoveryState.CLAIMED and (
-            any(value is not None for value in result_fields) or self.error_code is not None
+            any(value is not None for value in result_fields)
+            or self.error_code is not None
+            or not (
+                all(value is None for value in corrected_fields)
+                or all(value is not None for value in corrected_fields)
+            )
         ):
             raise ValueError("active claim contains terminal state")
         if self.state is RecoveryState.COMPLETED and (
-            any(value is None for value in result_fields) or self.error_code is not None
+            any(value is None for value in corrected_fields + result_fields)
+            or self.error_code is not None
         ):
             raise ValueError("completed recovery lacks result state")
         if self.state in {RecoveryState.FAILED, RecoveryState.UNCERTAIN} and (
-            any(value is not None for value in result_fields) or self.error_code is None
+            any(value is not None for value in result_fields)
+            or not (
+                all(value is None for value in corrected_fields)
+                or all(value is not None for value in corrected_fields)
+            )
+            or self.error_code is None
         ):
             raise ValueError("failed recovery lacks failure state")
 

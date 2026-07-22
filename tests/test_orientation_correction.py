@@ -20,7 +20,9 @@ from pypdf.generic import NameObject, NumberObject, TextStringObject
 from ocr_mcp_server.domain.files import IncomingFile, SupportedMediaType
 from ocr_mcp_server.domain.orientation import OrientationDecision, OrientationFailure
 from ocr_mcp_server.domain.secondary_ocr import OrthogonalAngle
-from ocr_mcp_server.infra.document_orientation import ImmutableDocumentCorrector
+from ocr_mcp_server.infra.document_orientation import (
+    ImmutableDocumentCorrector as _ImmutableDocumentCorrector,
+)
 from ocr_mcp_server.services.file_storage import BatchLockLease, FileStorage
 from ocr_mcp_server.services.file_validation import FileValidator
 from ocr_mcp_server.services.orientation_recovery import OrientationCorrectionRequest
@@ -73,6 +75,31 @@ class _Markers:
         initialize()
 
 
+class ImmutableDocumentCorrector:
+    """Exercise the production corrector under a real storage-minted lease."""
+
+    _pdf_transform = staticmethod(_ImmutableDocumentCorrector._pdf_transform)
+    _image_transform = staticmethod(_ImmutableDocumentCorrector._image_transform)
+
+    def __init__(self, storage, **kwargs):
+        self._storage = storage
+        self._corrector = _ImmutableDocumentCorrector(storage, **kwargs)
+
+    async def correct(self, request):
+        self._corrector._pdf_transform = type(self)._pdf_transform
+        self._corrector._image_transform = type(self)._image_transform
+        if request.batch_lock is not None:
+            return await self._corrector.correct(request)
+        async with self._storage.batch_lock(
+            request.batch_id,
+            marker_registry=_Markers(),
+            allow_missing_marker=True,
+        ) as lease:
+            return await self._corrector.correct(
+                replace(request, batch_lock=lease)
+            )
+
+
 async def _correct_locked(storage, batch_id, corrector, request):
     async with storage.batch_lock(
         batch_id,
@@ -80,6 +107,17 @@ async def _correct_locked(storage, batch_id, corrector, request):
         allow_missing_marker=True,
     ) as lease:
         return await corrector.correct(replace(request, batch_lock=lease))
+
+
+async def _create_derivative_locked(storage, batch_id, *args, **kwargs):
+    async with storage.batch_lock(
+        batch_id,
+        marker_registry=_Markers(),
+        allow_missing_marker=True,
+    ) as lease:
+        return await storage.create_immutable_derivative(
+            batch_id, *args, batch_lock=lease, **kwargs
+        )
 
 
 def _request(batch_id: str, stored, *decisions: OrientationDecision):
@@ -92,7 +130,7 @@ def _request(batch_id: str, stored, *decisions: OrientationDecision):
         expected_source_sha256=stored.sha256,
         expected_source_size_bytes=stored.size_bytes,
         decisions=decisions,
-        batch_lock=BatchLockLease(batch_id, -1, lambda: True),
+        batch_lock=None,
     )
 
 
@@ -229,7 +267,7 @@ async def test_correction_request_has_no_path_angle_or_engine_control(tmp_path: 
             expected_source_sha256=stored.sha256,
             expected_source_size_bytes=stored.size_bytes,
             decisions=(_decision(1, OrthogonalAngle.DEG_90),),
-            batch_lock=BatchLockLease(batch_id, -1, lambda: True),
+            batch_lock=None,
             output_path=tmp_path / "chosen.pdf",
         )
 
@@ -248,7 +286,7 @@ async def test_pdf_page_count_binding_mismatch_creates_no_derivative(tmp_path: P
         expected_source_sha256=stored.sha256,
         expected_source_size_bytes=stored.size_bytes,
         decisions=(_decision(1, OrthogonalAngle.DEG_90),),
-        batch_lock=BatchLockLease(batch_id, -1, lambda: True),
+        batch_lock=None,
     )
 
     with pytest.raises(OrientationFailure) as caught:
@@ -503,7 +541,8 @@ async def test_transform_baseexception_preserves_control_flow_and_cleans_stage(
         raise _Stop
 
     with pytest.raises(_Stop):
-        await storage.create_immutable_derivative(
+        await _create_derivative_locked(
+            storage,
             batch_id,
             stored.file_id,
             stored.extension,
@@ -512,7 +551,6 @@ async def test_transform_baseexception_preserves_control_flow_and_cleans_stage(
             transform=stop,
             max_file_size_bytes=1_000_000,
             validator=FileValidator(max_pages=500, max_image_pixels=10_000),
-            batch_lock=BatchLockLease(batch_id, -1, lambda: True),
         )
     assert list(stored.path.parent.glob("*.pdf")) == [stored.path]
     assert not list(stored.path.parent.glob("*.part"))
@@ -535,7 +573,8 @@ async def test_writer_enforces_byte_cap_before_oversized_write(tmp_path: Path) -
         target.truncate()
         target.write(valid)
 
-    corrected = await storage.create_immutable_derivative(
+    corrected = await _create_derivative_locked(
+        storage,
         batch_id,
         stored.file_id,
         stored.extension,
@@ -544,7 +583,6 @@ async def test_writer_enforces_byte_cap_before_oversized_write(tmp_path: Path) -
         transform=transform,
         max_file_size_bytes=len(valid),
         validator=FileValidator(max_pages=500, max_image_pixels=10_000),
-        batch_lock=BatchLockLease(batch_id, -1, lambda: True),
     )
     assert observed is True
     assert corrected.size_bytes == len(valid)
@@ -597,7 +635,8 @@ async def test_all_writer_surfaces_enforce_byte_cap_before_growth(
             observed = target.tell() == 0
             target.write(valid)
 
-    corrected = await storage.create_immutable_derivative(
+    corrected = await _create_derivative_locked(
+        storage,
         batch_id,
         stored.file_id,
         stored.extension,
@@ -606,7 +645,6 @@ async def test_all_writer_surfaces_enforce_byte_cap_before_growth(
         transform=transform,
         max_file_size_bytes=cap,
         validator=FileValidator(max_pages=500, max_image_pixels=10_000),
-        batch_lock=BatchLockLease(batch_id, -1, lambda: True),
     )
     assert observed is True
     assert corrected.size_bytes == len(valid)
@@ -626,7 +664,8 @@ async def test_writer_exposes_no_descriptor_or_raw_mutator_bypass(tmp_path: Path
             target.raw
         target.write(valid)
 
-    corrected = await storage.create_immutable_derivative(
+    corrected = await _create_derivative_locked(
+        storage,
         batch_id,
         stored.file_id,
         stored.extension,
@@ -635,7 +674,6 @@ async def test_writer_exposes_no_descriptor_or_raw_mutator_bypass(tmp_path: Path
         transform=transform,
         max_file_size_bytes=len(valid),
         validator=FileValidator(max_pages=500, max_image_pixels=10_000),
-        batch_lock=BatchLockLease(batch_id, -1, lambda: True),
     )
     assert corrected.size_bytes == len(valid)
 
@@ -655,7 +693,8 @@ async def test_derivative_rejects_non_positive_or_boolean_byte_cap(
         called = True
 
     with pytest.raises(Exception) as caught:
-        await storage.create_immutable_derivative(
+        await _create_derivative_locked(
+            storage,
             batch_id,
             stored.file_id,
             stored.extension,
@@ -664,7 +703,6 @@ async def test_derivative_rejects_non_positive_or_boolean_byte_cap(
             transform=transform,
             max_file_size_bytes=cap,
             validator=FileValidator(max_pages=500, max_image_pixels=10_000),
-            batch_lock=BatchLockLease(batch_id, -1, lambda: True),
         )
     assert getattr(caught.value, "code", None) == "file_too_large"
     assert called is False
@@ -1167,3 +1205,46 @@ async def test_concurrent_immutable_corrections_cannot_jointly_exceed_batch_limi
     assert sum(isinstance(item, OrientationFailure) for item in outcomes) == 1
     assert sum(not isinstance(item, BaseException) for item in outcomes) == 1
     assert storage.batch_usage(batch_id).total_bytes <= batch_limit
+
+
+@pytest.mark.asyncio
+async def test_forged_batch_lease_cannot_publish_derivative(tmp_path: Path) -> None:
+    storage, batch_id, stored = await _stored(
+        tmp_path, _pdf_bytes(), "source.pdf", "application/pdf"
+    )
+    with pytest.raises(TypeError):
+        BatchLockLease(batch_id, -1, lambda: True)
+    forged = object.__new__(BatchLockLease)
+    request = replace(
+        _request(batch_id, stored, _decision(1, OrthogonalAngle.DEG_90)),
+        batch_lock=forged,
+    )
+
+    with pytest.raises(OrientationFailure):
+        await ImmutableDocumentCorrector(storage).correct(request)
+    assert storage.batch_usage(batch_id).file_count == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_lease_is_storage_bound_and_invalid_immediately_after_exit(
+    tmp_path: Path,
+) -> None:
+    storage, batch_id, stored = await _stored(
+        tmp_path, _pdf_bytes(), "source.pdf", "application/pdf"
+    )
+    other_instance = FileStorage(storage._data_root)
+    async with storage.batch_lock(
+        batch_id,
+        marker_registry=_Markers(),
+        allow_missing_marker=True,
+    ) as lease:
+        request = replace(
+            _request(batch_id, stored, _decision(1, OrthogonalAngle.DEG_90)),
+            batch_lock=lease,
+        )
+        with pytest.raises(OrientationFailure):
+            await ImmutableDocumentCorrector(other_instance).correct(request)
+
+    with pytest.raises(OrientationFailure):
+        await ImmutableDocumentCorrector(storage).correct(request)
+    assert storage.batch_usage(batch_id).file_count == 1

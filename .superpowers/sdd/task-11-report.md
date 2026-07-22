@@ -82,3 +82,54 @@ No broken requirements found.
 git diff --check
 # both exited 0
 ```
+
+## Second final review - expected derivative binding and lock capability
+
+### RED evidence
+
+The durable-binding test failed before implementation because no expected corrected identity was persisted:
+
+```text
+.venv\\Scripts\\python.exe -m pytest -q tests/test_orientation_repository.py tests/test_orientation_correction.py -x
+FAILED test_restart_rejects_other_filetask_and_forged_digest_without_expected_binding
+AttributeError: 'OrientationRecoveryRepository' object has no attribute 'bind_corrected_input'
+```
+
+The capability test separately proved the public lease dataclass was forgeable:
+
+```text
+.venv\\Scripts\\python.exe -m pytest -q tests/test_orientation_correction.py -k "forged_batch_lease or storage_bound" -x
+FAILED test_forged_batch_lease_cannot_publish_derivative
+Failed: DID NOT RAISE OrientationFailure
+```
+
+### Fix
+
+- Before invoking the runner, the coordinator now atomically binds the corrected input version, UUID, SHA-256, and byte size to the recovery claim. The runner proof adds the adopted source UUID, and both live completion and restart reconciliation compare every durable expected field before accepting the independent result-batch input.
+- The expected version uses a new additive column, leaving the older terminal `corrected_input_version` null while CLAIMED. This keeps the additive migration compatible with the previous SQLite state constraint.
+- A result-batch FileTask with a different UUID and arbitrary otherwise-valid digest/size cannot complete the claim.
+- `BatchLockLease` is now minted only by its owning `FileStorage`. Validation requires the same storage object, current PID, matching batch, active nonce registry entry, and unchanged held lock identity. The registry entry is removed immediately when the context exits, before the OS lock descriptor is released.
+- Forged, stale, and cross-storage capabilities fail closed. Real active capabilities still support safe retirement and immutable publication; the batch-size concurrency gate remains protected by the real process-shared OS batch lock.
+
+### GREEN evidence
+
+Focused recovery, retention, and storage coverage:
+
+```text
+.venv\\Scripts\\python.exe -m pytest -o addopts='--basetemp=.pytest-tmp' -q tests/test_retention.py tests/test_orientation_domain.py tests/test_orientation_repository.py tests/test_orientation_recovery.py tests/test_orientation_correction.py
+146 passed, 7 skipped in 8.28s
+```
+
+Final complete verification:
+
+```text
+.venv\\Scripts\\python.exe -m pytest -o addopts='--basetemp=.pytest-tmp' -q
+845 passed, 20 skipped in 17.90s
+
+.venv\\Scripts\\python.exe -m pip check
+No broken requirements found.
+
+.venv\\Scripts\\python.exe -m compileall -q src tests
+git diff --check
+# both exited 0
+```
