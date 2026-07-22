@@ -19,7 +19,14 @@ from .api.mcp import create_mcp_server
 from .api.observability import HttpObservabilityMiddleware
 from .infra.prometheus_observability import PrometheusObservability
 from .infra.safe_logging import JsonEventFormatter, SafeEventLogger
-from .services.observability import ObservabilitySink
+from .services.health import (
+    DependencyStatus,
+    ProbeCode,
+    ProbeResult,
+    ReadinessService,
+    ReadinessSnapshot,
+)
+from .services.observability import DependencyName, ObservabilitySink
 from .settings import AppSettings, load_settings
 
 
@@ -44,6 +51,7 @@ def create_app(
     gateway: object | None = None,
     registry: CollectorRegistry | None = None,
     observability: ObservabilitySink | None = None,
+    readiness: ReadinessService | None = None,
     event_logger: SafeEventLogger | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> FastAPI:
@@ -71,6 +79,11 @@ def create_app(
     resolved_logger = event_logger if event_logger is not None else _event_logger()
     app.state.observability_registry = resolved_registry
     app.state.observability = resolved_observability
+    app.state.readiness = (
+        readiness
+        if readiness is not None
+        else _UnavailableReadiness(resolved_observability)
+    )
 
     @app.get("/metrics", include_in_schema=False)
     async def metrics() -> Response:
@@ -143,3 +156,28 @@ def _event_logger() -> SafeEventLogger:
     logger.setLevel(logging.INFO)
     logger.propagate = False
     return SafeEventLogger(logger)
+
+
+class _UnavailableReadiness:
+    """Deterministic default used until Task 13 composes dependency probes."""
+
+    def __init__(self, observability: ObservabilitySink) -> None:
+        self._observability = observability
+
+    async def check(self) -> ReadinessSnapshot:
+        snapshot = ReadinessSnapshot(
+            tuple(
+                ProbeResult(
+                    dependency,
+                    DependencyStatus.UNAVAILABLE,
+                    ProbeCode.UNAVAILABLE,
+                )
+                for dependency in DependencyName
+            )
+        )
+        for result in snapshot.dependencies:
+            try:
+                self._observability.set_dependency_ready(result.dependency, False)
+            except Exception:
+                pass
+        return snapshot

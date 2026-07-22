@@ -20,6 +20,9 @@ orchestration:
   recovery_scan_seconds: 30
   notification_min_interval_seconds: 2
 
+health:
+  probe_timeout_seconds: 3.0
+
 limits:
   max_files: 20
   max_file_size_bytes: 31457280

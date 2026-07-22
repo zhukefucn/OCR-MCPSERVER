@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import ipaddress
+import math
 from pathlib import Path
 import re
 from typing import Any, Literal
@@ -328,6 +329,22 @@ class OrchestrationSettings(_SettingsSection):
         return self
 
 
+class HealthSettings(_SettingsSection):
+    probe_timeout_seconds: float = Field(default=3.0, gt=0)
+
+    @field_validator("probe_timeout_seconds", mode="before")
+    @classmethod
+    def require_finite_positive_timeout(cls, value: object) -> object:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError("health probe timeout must be finite and positive")
+        return value
+
+
 class AppSettings(BaseSettings):
     """Complete process-level configuration for the service."""
 
@@ -349,6 +366,7 @@ class AppSettings(BaseSettings):
     structured_content: StructuredContentSettings = Field(default_factory=StructuredContentSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     orchestration: OrchestrationSettings = Field(default_factory=OrchestrationSettings)
+    health: HealthSettings = Field(default_factory=HealthSettings)
 
     @classmethod
     def settings_customise_sources(

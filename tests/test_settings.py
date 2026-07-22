@@ -423,6 +423,27 @@ def test_example_yaml_documents_orchestration_defaults() -> None:
     assert orchestration.notification_min_interval_seconds == 2
 
 
+@pytest.mark.parametrize(
+    "value",
+    [0, -1, True, float("nan"), float("inf"), float("-inf")],
+)
+def test_health_probe_timeout_rejects_non_positive_non_finite_and_boolean_values(
+    value: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(health={"probe_timeout_seconds": value})
+
+
+def test_health_settings_reject_unknown_fields() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(health={"probe_timeout_seconds": 1, "fault_injection": True})
+
+
+def test_example_yaml_documents_health_probe_timeout() -> None:
+    health = load_settings(config_file=Path("config/example.yaml")).health
+    assert health.probe_timeout_seconds == 3.0
+
+
 def test_example_yaml_documents_structured_merge_safety_limits() -> None:
     structured = load_settings(config_file=Path("config/example.yaml")).structured_content
     assert structured.max_characters > 0

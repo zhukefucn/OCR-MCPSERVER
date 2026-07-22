@@ -2,18 +2,11 @@
 
 from fastapi import APIRouter
 
+from .health import router as health_router
 from .rest import router as rest_router
 
 router = APIRouter()
-
-
-@router.get("/health/live", operation_id="liveness")
-def liveness() -> dict[str, str]:
-    """Report process liveness without touching databases or OCR models."""
-
-    return {"status": "ok"}
-
-
+router.include_router(health_router)
 router.include_router(rest_router)
 
 

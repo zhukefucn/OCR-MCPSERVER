@@ -4,6 +4,13 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from ocr_mcp_server.app import create_app
+from ocr_mcp_server.services.health import (
+    DependencyStatus,
+    ProbeCode,
+    ProbeResult,
+    ReadinessSnapshot,
+)
+from ocr_mcp_server.services.observability import DependencyName
 from ocr_mcp_server.settings import AppSettings, ServerSettings
 
 
@@ -24,3 +31,88 @@ def test_liveness_endpoint_returns_stable_json() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+class Readiness:
+    def __init__(self, snapshot: ReadinessSnapshot) -> None:
+        self.snapshot = snapshot
+        self.calls = 0
+
+    async def check(self) -> ReadinessSnapshot:
+        self.calls += 1
+        return self.snapshot
+
+
+def _snapshot(*, unavailable: DependencyName | None = None) -> ReadinessSnapshot:
+    return ReadinessSnapshot(
+        tuple(
+            ProbeResult(
+                dependency,
+                DependencyStatus.UNAVAILABLE
+                if dependency is unavailable
+                else DependencyStatus.READY,
+                ProbeCode.UNAVAILABLE
+                if dependency is unavailable
+                else ProbeCode.READY,
+            )
+            for dependency in DependencyName
+        )
+    )
+
+
+def test_readiness_endpoint_returns_exact_200_and_503_bodies() -> None:
+    ready = Readiness(_snapshot())
+    unavailable = Readiness(_snapshot(unavailable=DependencyName.MINERU))
+
+    with TestClient(create_app(AppSettings(), readiness=ready)) as client:
+        ready_response = client.get("/health/ready")
+    with TestClient(create_app(AppSettings(), readiness=unavailable)) as client:
+        unavailable_response = client.get("/health/ready")
+
+    assert ready_response.status_code == 200
+    assert ready_response.json() == {
+        "status": "ready",
+        "dependencies": [
+            {"dependency": "sqlite", "status": "ready", "code": "ready"},
+            {"dependency": "mineru", "status": "ready", "code": "ready"},
+            {"dependency": "paddle", "status": "ready", "code": "ready"},
+        ],
+    }
+    assert unavailable_response.status_code == 503
+    assert unavailable_response.json() == {
+        "status": "unavailable",
+        "dependencies": [
+            {"dependency": "sqlite", "status": "ready", "code": "ready"},
+            {
+                "dependency": "mineru",
+                "status": "unavailable",
+                "code": "unavailable",
+            },
+            {"dependency": "paddle", "status": "ready", "code": "ready"},
+        ],
+    }
+
+
+def test_default_readiness_is_deterministically_unavailable() -> None:
+    with TestClient(create_app(AppSettings())) as client:
+        response = client.get("/health/ready")
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unavailable",
+        "dependencies": [
+            {
+                "dependency": dependency.value,
+                "status": "unavailable",
+                "code": "unavailable",
+            }
+            for dependency in DependencyName
+        ],
+    }
+
+
+def test_liveness_never_calls_readiness() -> None:
+    readiness = Readiness(_snapshot())
+    with TestClient(create_app(AppSettings(), readiness=readiness)) as client:
+        response = client.get("/health/live")
+    assert response.json() == {"status": "ok"}
+    assert readiness.calls == 0

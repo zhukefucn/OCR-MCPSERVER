@@ -49,7 +49,7 @@ def test_auth_bypass_is_exactly_the_three_observability_paths() -> None:
             client.get(f"/v1/tasks/{uuid4()}"),
         ]
 
-    assert [response.status_code for response in public] == [200, 404, 200]
+    assert [response.status_code for response in public] == [200, 503, 200]
     assert all(response.status_code == 503 for response in protected)
     assert all(
         response.json()["error"]["code"] == "authentication_unavailable"
