@@ -82,11 +82,15 @@ def _setup(tmp_path: Path, nodes: list[dict], *, references=None):
                 original_node_type=nodes[0]["type"],
             ),
         )
+    image_sha256 = sha256(b"immutable-image").hexdigest()
+    candidate_id = "candidate-" + sha256(
+        f"image-candidate\0file-123\0{1}\0{image_sha256}".encode("utf-8")
+    ).hexdigest()
     candidate = ImageCandidate(
-        candidate_id="candidate-1",
+        candidate_id=candidate_id,
         file_task_id="file-123",
         result_version=1,
-        sha256=sha256(b"immutable-image").hexdigest(),
+        sha256=image_sha256,
         size_bytes=15,
         image_format=MinerUImageFormat.PNG,
         width=10,
@@ -317,6 +321,29 @@ def test_global_coverage_and_identity_mismatch_publishes_nothing(tmp_path, limit
     assert not (tmp_path / "published" / "version-00000002").exists()
 
 
+@pytest.mark.parametrize("identity_kind", ["candidate", "record"])
+def test_forged_deterministic_candidate_or_record_identity_is_rejected(tmp_path, limits, identity_kind):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    record = collection.processing_records[0]
+    if identity_kind == "candidate":
+        forged_id = "candidate-" + "f" * 64
+        candidate = replace(candidate, candidate_id=forged_id)
+        record = replace(record, candidate_id=forged_id)
+    else:
+        record = replace(record, record_id="secondary-" + "f" * 64)
+    collection = CandidateCollection(
+        file_task_id=collection.file_task_id,
+        result_version=collection.result_version,
+        candidates=(candidate,),
+        processing_records=(record,),
+    )
+    with pytest.raises(MergeFailure) as raised:
+        merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=tmp_path / "published", output_version=2, timestamp=NOW, limits=limits)
+    assert raised.value.code == MergeErrorCode.INVARIANT_VIOLATION.value
+    assert not (tmp_path / "published" / "version-00000002").exists()
+
+
 def test_malformed_manifest_fails_safely_and_does_not_leak(tmp_path, limits, caplog):
     planted = "SECRET_PATH_AND_JSON"
     node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
@@ -477,6 +504,54 @@ def test_publish_failure_does_not_delete_replacement_at_staging_path(tmp_path, l
     assert (replacement["path"] / "attacker-marker").read_text(encoding="utf-8") == "keep"
 
 
+def test_stage_name_swap_before_rename_never_returns_publication_success(tmp_path, limits, monkeypatch):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    root = tmp_path / "published"; root.mkdir()
+    module = __import__("ocr_mcp_server.services.merge_publication", fromlist=["_publish_stage_anchored"])
+    original_publish = module._publish_stage_anchored
+
+    def swap_stage_name(stage, target, root_descriptor):
+        owned = stage.with_name(stage.name + "-owned")
+        stage.rename(owned)
+        shutil.copytree(owned, stage)
+        content = stage / "content_list_v2.json"
+        altered = bytearray(content.read_bytes()); altered[0] = ord("{")
+        content.write_bytes(bytes(altered))
+        return original_publish(stage, target, root_descriptor)
+
+    monkeypatch.setattr("ocr_mcp_server.services.merge_publication._publish_stage_anchored", swap_stage_name)
+    with pytest.raises(MergeFailure):
+        merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=root, output_version=2, timestamp=NOW, limits=limits)
+
+
+def test_cleanup_swap_inside_delete_never_removes_replacement_directory(tmp_path, limits, monkeypatch):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    root = tmp_path / "published"; root.mkdir()
+    victim = {"path": None}
+    os_module = __import__("os")
+    original_unlink = os_module.unlink
+
+    monkeypatch.setattr("ocr_mcp_server.services.merge_publication._publish_stage_anchored", lambda *_: (_ for _ in ()).throw(OSError("injected")))
+
+    def swap_at_owned_file_delete(path, *args, **kwargs):
+        if victim["path"] is None:
+            stage = next(root.glob(".merge-stage-*"))
+            owned = stage.with_name(stage.name + "-owned-at-delete")
+            stage.rename(owned)
+            stage.mkdir()
+            (stage / "victim-marker").write_text("survive", encoding="utf-8")
+            victim["path"] = stage
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr("ocr_mcp_server.services.merge_publication.os.unlink", swap_at_owned_file_delete)
+    with pytest.raises(MergeFailure):
+        merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=root, output_version=2, timestamp=NOW, limits=limits)
+    assert victim["path"].is_dir()
+    assert (victim["path"] / "victim-marker").read_text(encoding="utf-8") == "survive"
+
+
 def test_anchored_write_closes_raw_descriptor_when_fdopen_fails(tmp_path, monkeypatch):
     descriptor = __import__("os").open(tmp_path / "raw.tmp", __import__("os").O_WRONLY | __import__("os").O_CREAT)
     monkeypatch.setattr("ocr_mcp_server.services.merge_publication.os.open", lambda *args, **kwargs: descriptor)
@@ -570,6 +645,20 @@ def test_rollback_rejects_hash_adjusted_invalid_publication_schema(tmp_path, lim
     forged = replace(merged, manifest_sha256=sha256(invalid).hexdigest())
     with pytest.raises(MergeFailure) as raised:
         rollback_publication(forged, publication_root=root, output_version=3, timestamp=NOW, limits=limits)
+    assert raised.value.code == MergeErrorCode.ROLLBACK_VERIFICATION_FAILED.value
+
+
+def test_rollback_rejects_publication_manifest_with_extra_top_level_field(tmp_path, limits):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    root = tmp_path / "published"
+    merged = merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=root, output_version=2, timestamp=NOW, limits=limits)
+    metadata_path = merged.publication_directory / "publication_manifest.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["unexpected"] = "field"
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    with pytest.raises(MergeFailure) as raised:
+        rollback_publication(merged, publication_root=root, output_version=3, timestamp=NOW, limits=limits)
     assert raised.value.code == MergeErrorCode.ROLLBACK_VERIFICATION_FAILED.value
 
 

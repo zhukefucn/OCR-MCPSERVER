@@ -111,6 +111,10 @@ _SAFE_TEX_COMMANDS = frozenset(
 _HTML_ENTITY = re.compile(
     r"&(?:(?P<numeric>#[0-9]+|#[xX][0-9A-Fa-f]+)|amp|lt|gt|quot|apos|nbsp);"
 )
+_HTML_TAG_TOKEN = re.compile(
+    r"</?[A-Za-z][A-Za-z0-9]*(?:\s+[A-Za-z_:][A-Za-z0-9_.:-]*"
+    r"(?:\s*=\s*(?:\"[^\"<>]*\"|'[^'<>]*'|[^\s\"'=<>`]+))?)*>"
+)
 
 
 def _validate_text(value: object, limits: StructuredContentLimits, *, allow_empty: bool) -> str:
@@ -246,6 +250,15 @@ class _TableParser(HTMLParser):
 
 def validate_table_html(value: object, limits: StructuredContentLimits) -> str:
     selected = _validate_text(value, limits, allow_empty=False)
+    tag_cursor = 0
+    while True:
+        tag_cursor = selected.find("<", tag_cursor)
+        if tag_cursor < 0:
+            break
+        tag = _HTML_TAG_TOKEN.match(selected, tag_cursor)
+        if tag is None:
+            raise StructuredContentInvalid() from None
+        tag_cursor = tag.end()
     cursor = 0
     while True:
         cursor = selected.find("&", cursor)

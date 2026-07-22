@@ -65,6 +65,8 @@ def test_valid_table_html_is_returned_trimmed(value, limits):
         "<table><tr><td>x</td></tr></table junk>",
         '<table><tr><td>x</td></tr></table foo="bar">',
         "<table><tr><td>x</td></tr></table/ >",
+        "<table><tr><td>x<</td></tr></table>",
+        "<table><tr><td>< </td></tr></table>",
         "<table><tr><td>x\ud800</td></tr></table>",
     ],
 )

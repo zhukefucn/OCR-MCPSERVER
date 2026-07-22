@@ -13,7 +13,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import stat
 import sys
 import tempfile
@@ -284,8 +283,22 @@ def _validate_inputs(
     for candidate_id, candidate in candidates.items():
         record = records[candidate_id]
         recognized = results[candidate_id]
+        expected_candidate_id = "candidate-" + sha256(
+            (
+                "image-candidate\0"
+                f"{candidate.file_task_id}\0{candidate.result_version}\0{candidate.sha256}"
+            ).encode("utf-8")
+        ).hexdigest()
+        expected_record_id = "secondary-" + sha256(
+            (
+                "secondary-record\0"
+                f"{candidate.file_task_id}\0{candidate.result_version}\0{candidate.sha256}"
+            ).encode("utf-8")
+        ).hexdigest()
         if (
             not isinstance(recognized, SecondaryOcrResult)
+            or candidate.candidate_id != expected_candidate_id
+            or record.record_id != expected_record_id
             or candidate.file_task_id != collection.file_task_id
             or record.file_task_id != collection.file_task_id
             or candidate.result_version != collection.result_version
@@ -614,28 +627,102 @@ def _publish_stage_anchored(
     raise OSError(error_number, os.strerror(error_number))
 
 
-def _safe_rmtree(
+def _safe_remove_owned_stage(
     stage: Path,
     root: Path,
     *,
     expected_stage_identity: os.stat_result,
     expected_root_identity: os.stat_result,
+    expected_names: frozenset[str],
+    root_descriptor: int | None,
+    stage_descriptor: int | None,
 ) -> None:
     try:
-        root_stat = os.lstat(root)
-        if (
-            stage.parent == root
-            and stage.name.startswith(".merge-stage-")
-            and _same_object_identity(root_stat, expected_root_identity)
-        ):
-            stage_stat = os.lstat(stage)
+        if stage.parent != root or not stage.name.startswith(".merge-stage-"):
+            return
+        if root_descriptor is not None and stage_descriptor is not None:
             if (
-                _same_object_identity(stage_stat, expected_stage_identity)
-                and stat.S_ISDIR(stage_stat.st_mode)
-                and not stat.S_ISLNK(stage_stat.st_mode)
-                and not _is_reparse(stage_stat)
+                not _same_object_identity(
+                    os.fstat(root_descriptor), expected_root_identity
+                )
+                or not _same_object_identity(
+                    os.fstat(stage_descriptor), expected_stage_identity
+                )
+                or not _same_object_identity(
+                    os.stat(
+                        stage.name,
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    ),
+                    expected_stage_identity,
+                )
             ):
-                shutil.rmtree(stage)
+                return
+            names = set(os.listdir(stage_descriptor))
+            if not names.issubset(expected_names):
+                return
+            identities = {}
+            for name in names:
+                item_stat = os.stat(
+                    name, dir_fd=stage_descriptor, follow_symlinks=False
+                )
+                if not stat.S_ISREG(item_stat.st_mode) or _is_reparse(item_stat):
+                    return
+                identities[name] = item_stat
+            for name, identity in identities.items():
+                if not _same_identity(
+                    os.stat(
+                        name, dir_fd=stage_descriptor, follow_symlinks=False
+                    ),
+                    identity,
+                ):
+                    return
+                os.unlink(name, dir_fd=stage_descriptor)
+            if os.listdir(stage_descriptor):
+                return
+            if not _same_object_identity(
+                os.stat(
+                    stage.name,
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                ),
+                expected_stage_identity,
+            ):
+                return
+            os.rmdir(stage.name, dir_fd=root_descriptor)
+            return
+
+        if (
+            not _same_object_identity(os.lstat(root), expected_root_identity)
+            or not _same_object_identity(os.lstat(stage), expected_stage_identity)
+        ):
+            return
+        names = {item.name for item in stage.iterdir()}
+        if not names.issubset(expected_names):
+            return
+        identities = {}
+        for name in names:
+            item_stat = os.lstat(stage / name)
+            if (
+                not stat.S_ISREG(item_stat.st_mode)
+                or stat.S_ISLNK(item_stat.st_mode)
+                or _is_reparse(item_stat)
+            ):
+                return
+            identities[name] = item_stat
+        for name, identity in identities.items():
+            if (
+                not _same_object_identity(os.lstat(stage), expected_stage_identity)
+                or not _same_identity(os.lstat(stage / name), identity)
+            ):
+                return
+            os.unlink(stage / name)
+        if (
+            any(stage.iterdir())
+            or not _same_object_identity(os.lstat(stage), expected_stage_identity)
+        ):
+            return
+        os.rmdir(stage)
     except BaseException:
         pass
 
@@ -838,6 +925,42 @@ def _assert_target_binding_anchored(
         _fail(MergeErrorCode.UNSAFE_PUBLICATION_PATH)
 
 
+def _verify_new_publication(
+    target: Path,
+    contents: Mapping[str, bytes],
+    *,
+    original_stage_identity: os.stat_result,
+    root_descriptor: int | None,
+) -> None:
+    if root_descriptor is not None:
+        status, binding = _classify_existing_target_anchored(
+            root_descriptor, target.name, contents
+        )
+        if (
+            status != "match"
+            or binding is None
+            or not _same_object_identity(
+                binding.target_identity, original_stage_identity
+            )
+        ):
+            _fail(MergeErrorCode.UNSAFE_PUBLICATION_PATH)
+        _assert_target_binding_anchored(
+            root_descriptor, target.name, binding
+        )
+        return
+    if _existing_target_is_unsafe(target):
+        _fail(MergeErrorCode.UNSAFE_PUBLICATION_PATH)
+    binding = _existing_matches(target, contents)
+    if (
+        binding is None
+        or not _same_object_identity(
+            binding.target_identity, original_stage_identity
+        )
+    ):
+        _fail(MergeErrorCode.UNSAFE_PUBLICATION_PATH)
+    _assert_target_binding_path(target, binding)
+
+
 def _publish(root: Path, output_version: int, contents: Mapping[str, bytes], max_artifact_bytes: int) -> Path:
     root = _ensure_safe_directory(root, create=True)
     root_identity = os.lstat(root)
@@ -931,6 +1054,16 @@ def _publish(root: Path, output_version: int, contents: Mapping[str, bytes], max
         ):
             _fail(MergeErrorCode.UNSAFE_PUBLICATION_PATH)
         _publish_stage_anchored(stage, target, root_descriptor)
+        _verify_new_publication(
+            target,
+            contents,
+            original_stage_identity=(
+                os.fstat(stage_descriptor)
+                if stage_descriptor is not None
+                else stage_identity
+            ),
+            root_descriptor=root_descriptor,
+        )
         published = True
         try:
             root_fd = root_descriptor
@@ -978,6 +1111,16 @@ def _publish(root: Path, output_version: int, contents: Mapping[str, bytes], max
     except BaseException:
         _fail(MergeErrorCode.PUBLICATION_FAILED)
     finally:
+        if not published:
+            _safe_remove_owned_stage(
+                stage,
+                root,
+                expected_stage_identity=stage_identity,
+                expected_root_identity=root_identity,
+                expected_names=frozenset(contents),
+                root_descriptor=root_descriptor,
+                stage_descriptor=stage_descriptor,
+            )
         if stage_descriptor is not None:
             try:
                 os.close(stage_descriptor)
@@ -988,13 +1131,6 @@ def _publish(root: Path, output_version: int, contents: Mapping[str, bytes], max
                 os.close(root_descriptor)
             except OSError:
                 pass
-        if not published and stage.exists():
-            _safe_rmtree(
-                stage,
-                root,
-                expected_stage_identity=stage_identity,
-                expected_root_identity=root_identity,
-            )
 
 
 def _merge_and_publish_impl(
@@ -1112,12 +1248,21 @@ def _verified_rollback_source(
         metadata = _strict_json_loads(metadata_bytes.decode("utf-8"))
         if (
             not isinstance(metadata, dict)
+            or set(metadata)
+            != {
+                "artifact_kind",
+                "task_id",
+                "source_version",
+                "output_version",
+                "files",
+            }
             or metadata.get("artifact_kind") != "merge"
             or metadata.get("task_id") != publication.task_id
             or metadata.get("source_version") != publication.source_version
             or metadata.get("output_version") != publication.output_version
             or not isinstance(metadata.get("files"), dict)
             or set(metadata["files"]) != set(_REQUIRED_FILES)
+            or _canonical_json(metadata) != metadata_bytes
         ):
             _fail(MergeErrorCode.ROLLBACK_VERIFICATION_FAILED)
         values = (
