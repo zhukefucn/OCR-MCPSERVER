@@ -15,7 +15,33 @@ from ocr_mcp_server.services.observability import (
 )
 
 
-DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
+HTTP_DURATION_BUCKETS = (
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+)
+OCR_DURATION_BUCKETS = (
+    0.1,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    30.0,
+    60.0,
+    120.0,
+    300.0,
+    600.0,
+    900.0,
+)
 
 
 class PrometheusObservability(NullObservability):
@@ -32,7 +58,7 @@ class PrometheusObservability(NullObservability):
             "ocr_http_request_duration_seconds",
             "HTTP request duration in seconds.",
             ("method", "route"),
-            buckets=DURATION_BUCKETS,
+            buckets=HTTP_DURATION_BUCKETS,
             registry=registry,
         )
         self._tasks = Counter(
@@ -45,14 +71,14 @@ class PrometheusObservability(NullObservability):
             "ocr_task_duration_seconds",
             "Task attempt duration in seconds.",
             ("outcome",),
-            buckets=DURATION_BUCKETS,
+            buckets=OCR_DURATION_BUCKETS,
             registry=registry,
         )
         self._stage_duration = Histogram(
             "ocr_pipeline_stage_duration_seconds",
             "Pipeline stage duration in seconds.",
             ("stage", "outcome"),
-            buckets=DURATION_BUCKETS,
+            buckets=OCR_DURATION_BUCKETS,
             registry=registry,
         )
         self._orchestration_queue_depth = Gauge(
@@ -120,4 +146,8 @@ class PrometheusObservability(NullObservability):
         self._dependency_ready.labels(dependency.value).set(1 if ready else 0)
 
 
-__all__ = ["DURATION_BUCKETS", "PrometheusObservability"]
+__all__ = [
+    "HTTP_DURATION_BUCKETS",
+    "OCR_DURATION_BUCKETS",
+    "PrometheusObservability",
+]

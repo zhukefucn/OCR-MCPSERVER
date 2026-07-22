@@ -7,7 +7,8 @@ from prometheus_client import CollectorRegistry, generate_latest
 
 from ocr_mcp_server.domain.models import ProcessingStage
 from ocr_mcp_server.infra.prometheus_observability import (
-    DURATION_BUCKETS,
+    HTTP_DURATION_BUCKETS,
+    OCR_DURATION_BUCKETS,
     PrometheusObservability,
 )
 from ocr_mcp_server.services.observability import (
@@ -199,25 +200,79 @@ def _sample(
     raise AssertionError(f"missing sample {sample_name} {labels}")
 
 
-def test_histograms_use_the_exported_fixed_buckets() -> None:
+def test_histograms_use_separate_exact_fixed_buckets_for_http_and_ocr_work() -> None:
     registry = CollectorRegistry()
     sink = PrometheusObservability(registry)
     sink.observe_http(_http())
-    sink.observe_task(TaskOutcome.FAILED, 0.1)
-    sink.observe_stage(ProcessingStage.FAILED, StageOutcome.FAILED, 0.1)
-
-    for metric_name in (
-        "ocr_http_request_duration_seconds",
-        "ocr_task_duration_seconds",
-        "ocr_pipeline_stage_duration_seconds",
-    ):
-        family = next(f for f in registry.collect() if f.name == metric_name)
-        actual = tuple(
-            float(sample.labels["le"])
-            for sample in family.samples
-            if sample.name.endswith("_bucket")
+    long_observations = (30.0, 120.0, 300.0, 600.0, 900.0)
+    for duration in long_observations:
+        sink.observe_task(TaskOutcome.FAILED, duration)
+        sink.observe_stage(
+            ProcessingStage.MINERU_PARSING, StageOutcome.COMPLETED, duration
         )
-        assert actual == (*DURATION_BUCKETS, math.inf)
+
+    families = {family.name: family for family in registry.collect()}
+    http_buckets = _buckets(
+        families["ocr_http_request_duration_seconds"],
+        method="GET",
+        route="/health/live",
+    )
+    task_buckets = _buckets(
+        families["ocr_task_duration_seconds"], outcome="failed"
+    )
+    stage_buckets = _buckets(
+        families["ocr_pipeline_stage_duration_seconds"],
+        stage="mineru_parsing",
+        outcome="completed",
+    )
+
+    assert HTTP_DURATION_BUCKETS == (
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        10.0,
+    )
+    assert OCR_DURATION_BUCKETS == (
+        0.1,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        10.0,
+        30.0,
+        60.0,
+        120.0,
+        300.0,
+        600.0,
+        900.0,
+    )
+    assert tuple(http_buckets) == (*HTTP_DURATION_BUCKETS, math.inf)
+    assert tuple(task_buckets) == (*OCR_DURATION_BUCKETS, math.inf)
+    assert tuple(stage_buckets) == (*OCR_DURATION_BUCKETS, math.inf)
+    for boundary, expected_count in zip(
+        long_observations, range(1, len(long_observations) + 1), strict=True
+    ):
+        assert task_buckets[boundary] == expected_count
+        assert stage_buckets[boundary] == expected_count
+    assert task_buckets[math.inf] == len(long_observations)
+    assert stage_buckets[math.inf] == len(long_observations)
+
+
+def _buckets(family: object, **labels: str) -> dict[float, float]:
+    return {
+        float(sample.labels["le"]): float(sample.value)
+        for sample in family.samples  # type: ignore[attr-defined]
+        if sample.name.endswith("_bucket")
+        and {key: value for key, value in sample.labels.items() if key != "le"}
+        == labels
+    }
 
 
 def test_registries_are_isolated() -> None:
@@ -232,32 +287,37 @@ def test_registries_are_isolated() -> None:
     assert b'ocr_recovery_total{outcome="failed"}' not in generate_latest(second)
 
 
-def test_exposition_never_contains_sensitive_caller_canaries() -> None:
-    canaries = (
-        "batch-123-secret",
-        "invoice-secret.pdf",
-        "https://secret.example/doc",
-        "C:\\secret\\invoice.pdf",
-        "/srv/secret/invoice.pdf",
-        "token-secret-123",
-        "raw OCR secret text",
-        "exception-secret",
-    )
+@pytest.mark.parametrize(
+    "canary",
+    [
+        pytest.param("batch-123-secret", id="id"),
+        pytest.param("invoice-secret.pdf", id="filename"),
+        pytest.param("https://secret.example/doc", id="url"),
+        pytest.param("C:\\secret\\invoice.pdf", id="windows-path"),
+        pytest.param("/srv/secret/invoice.pdf", id="unix-path"),
+        pytest.param("token-secret-123", id="token"),
+        pytest.param("raw OCR secret text", id="ocr-text"),
+        pytest.param("exception-secret", id="exception-text"),
+    ],
+)
+def test_each_sensitive_caller_canary_is_normalized_before_exposition(
+    canary: str,
+) -> None:
     registry = CollectorRegistry()
     sink = PrometheusObservability(registry)
 
-    sink.observe_http(
-        HttpObservation(
-            "GET",
-            canaries[2],
-            "4xx",
-            0.01,
-            route_allowlist=ROUTES,
-        )
+    observation = HttpObservation(
+        "GET",
+        canary,
+        "4xx",
+        0.01,
+        route_allowlist=ROUTES,
     )
+    assert observation.route == "unmatched"
+    sink.observe_http(observation)
     output = generate_latest(registry).decode("utf-8")
 
-    assert all(canary not in output for canary in canaries)
+    assert canary not in output
 
 
 def test_best_effort_contains_ordinary_failures_without_exposing_them() -> None:

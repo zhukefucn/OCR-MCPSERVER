@@ -96,3 +96,48 @@ from the explicitly named Task 12D scenarios, uses the existing
 `ProcessingStage` enum for stage labels, and exports one conventional fixed
 duration bucket tuple:
 `(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10)`.
+
+## Review follow-up
+
+Two Important review findings were addressed with focused tests before the
+production bucket change.
+
+### Follow-up RED
+
+Command:
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/test_observability.py -q
+```
+
+Result: exit 1 during collection because the required split constants did not
+exist: `ImportError: cannot import name 'HTTP_DURATION_BUCKETS' from
+'ocr_mcp_server.infra.prometheus_observability'`. This was the expected failure
+for the single short bucket tuple shared by HTTP, task, and stage histograms.
+
+### Follow-up GREEN
+
+Command:
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/test_observability.py -q
+```
+
+Result: exit 0, 34 passed. HTTP buckets remain fixed through 10 seconds. Task
+and stage buckets use a separate fixed OCR-duration tuple through 900 seconds.
+The tests observe 30, 120, 300, 600, and 900 seconds and verify exact cumulative
+bucket counts rather than only comparing tuple reuse.
+
+The canary-coverage finding was a test defect rather than a production behavior
+defect: once the missing bucket exports were implemented, the new parameterized
+cases passed against the existing route normalization. Eight distinct cases now
+pass an ID, filename, URL, Windows path, Unix path, token, OCR text, and
+exception text through the existing `HttpObservation.route` boundary, assert
+each becomes `unmatched`, record it, and assert that exact canary is absent from
+the generated exposition. No production free-text parameter was added.
+
+### Follow-up concerns
+
+None. The earlier bucket concern is resolved by explicit exported tuples for
+HTTP and OCR work. The finite outcome members remain derived from the approved
+Task 12D scenarios as previously documented.
