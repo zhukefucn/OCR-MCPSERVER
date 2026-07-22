@@ -226,3 +226,27 @@ A subsequent review found that four cleanup-and-rethrow handlers had been narrow
 ### Remaining concerns
 
 - None blocking. POSIX cleanup is covered deterministically with fake descriptors on Windows; Windows HANDLE ownership cleanup is tested independently of the Win32 open call.
+
+## Ubuntu platform-gate follow-up
+
+Ubuntu native verification exposed a cross-platform test defect, not a production defect: `test_windows_handle_conversion_closes_handle_on_system_exit` imported the Windows-only `msvcrt` module on Linux.
+
+- Ubuntu RED evidence supplied by the native gate: `1 failed, 339 passed, 3 skipped`; failure was `ModuleNotFoundError: No module named 'msvcrt'`.
+- Fix base: `749879ccf33d2b875faf8d12b30b41ab9eb4edb0`.
+- Fixed test head: `bcfdc0a031451af566d9e0aefd8cbf0447841ded`.
+- Commit: `bcfdc0a test: gate Windows handle cleanup by platform`.
+- Change: one `pytest.mark.skipif(os.name != "nt", ...)` decorator; no production code changed.
+- Linux behavior: the test skips before its function body imports `msvcrt`. The expected Ubuntu total after synchronization is `339 passed, 4 skipped`; a fresh Ubuntu run remains the native confirmation step.
+- Windows behavior: the test is not skipped and continues to exercise real `msvcrt.open_osfhandle` interruption cleanup.
+
+### Windows local verification
+
+- Directed Windows test: 1 passed.
+- `python -m pytest`: `338 passed, 5 skipped in 3.26s`.
+- `python -m pip check`: `No broken requirements found.`
+- `python -m compileall -q src tests`: exit 0, no output.
+- `git diff --check`: exit 0, no whitespace errors; only the Windows LF-to-CRLF notice for the test file.
+
+### Concern
+
+- No production concern. The Ubuntu expected count is documented but must be confirmed by the native Ubuntu gate after synchronization.
