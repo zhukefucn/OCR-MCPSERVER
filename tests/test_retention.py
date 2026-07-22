@@ -30,6 +30,7 @@ from ocr_mcp_server.infra.task_models import (
     BatchRecord,
     FileTaskRecord,
     ReplacementAuditMetadataRecord,
+    RetentionRecord,
     StageEventRecord,
 )
 from ocr_mcp_server.infra.task_repository import TaskRepository
@@ -95,6 +96,104 @@ async def _create_batch(tasks: TaskRepository, key: str):
         audit_metadata_retention_days=30,
     )
     return created.batch.id, file_id
+
+
+@pytest.mark.asyncio
+async def test_content_cleanup_invalidates_orientation_tokens_before_tombstones_and_delete(
+    tmp_path: Path, retention_repository,
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "orientation-invalidation-order")
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    (data_root / batch_id).mkdir(parents=True)
+    (artifact_root / batch_id).mkdir(parents=True)
+    events: list[str] = []
+    original_invalidate = repository.invalidate_orientation_recoveries
+
+    async def invalidate(claim, *, now):
+        async with sessions() as session:
+            state = await session.get(RetentionRecord, claim.batch_id)
+            assert state.data_tombstone is None and state.artifact_tombstone is None
+        events.append("invalidate")
+        return await original_invalidate(claim, now=now)
+
+    repository.invalidate_orientation_recoveries = invalidate
+
+    class Deleter:
+        def __init__(self):
+            self.real = OwnedBatchRootDeleter()
+
+        def delete(self, root, selected_batch_id, *, tombstone_name=None):
+            events.append("delete-data" if root == data_root else "delete-artifact")
+            self.real.delete(
+                root, selected_batch_id, tombstone_name=tombstone_name
+            )
+
+    result = await RetentionService(
+        repository,
+        data_root,
+        artifact_root,
+        deleter=Deleter(),
+    ).run_once("worker", now=NOW + timedelta(hours=24), lease_seconds=60, limit=1)
+
+    assert (result.content_deleted, result.failed) == (1, 0)
+    assert events == ["invalidate", "delete-data", "delete-artifact"]
+
+
+@pytest.mark.asyncio
+async def test_orientation_invalidation_failure_aborts_content_deletion_safely(
+    tmp_path: Path, retention_repository,
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "orientation-invalidation-failure")
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    (data_root / batch_id).mkdir(parents=True)
+    (artifact_root / batch_id).mkdir(parents=True)
+
+    async def invalidation_failure(claim, *, now):
+        raise RuntimeError("private document text")
+
+    repository.invalidate_orientation_recoveries = invalidation_failure
+
+    class ForbiddenDeleter:
+        def delete(self, *args, **kwargs):
+            raise AssertionError("deletion must not start")
+
+    result = await RetentionService(
+        repository,
+        data_root,
+        artifact_root,
+        deleter=ForbiddenDeleter(),
+    ).run_once("worker", now=NOW + timedelta(hours=24), lease_seconds=60, limit=1)
+
+    assert (result.content_deleted, result.failed) == (0, 1)
+    assert "private" not in repr(result)
+    state = await repository.get(batch_id)
+    assert state.content_deleted_at is None
+    async with sessions() as session:
+        retained = await session.get(
+            RetentionRecord,
+            batch_id,
+        )
+        assert retained.data_tombstone is None and retained.artifact_tombstone is None
+        assert retained.last_error_code == RetentionErrorCode.CLEANUP_FAILED.value
+
+
+@pytest.mark.asyncio
+async def test_orientation_invalidation_without_rows_is_zero_and_retry_idempotent(
+    retention_repository,
+) -> None:
+    repository, tasks, _, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "orientation-invalidation-empty")
+    assert await repository.request_early_delete(batch_id, now=NOW)
+    claim = await repository.claim_batch(
+        batch_id, "cleanup", now=NOW, lease_seconds=60
+    )
+
+    assert await repository.invalidate_orientation_recoveries(claim, now=NOW) == 0
+    assert await repository.invalidate_orientation_recoveries(claim, now=NOW) == 0
 
 
 @pytest.mark.asyncio

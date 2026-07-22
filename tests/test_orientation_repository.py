@@ -26,6 +26,13 @@ from ocr_mcp_server.infra.orientation_repository import OrientationRecoveryRepos
 from ocr_mcp_server.infra.retention_repository import RetentionRepository
 from ocr_mcp_server.infra.task_repository import TaskRepository
 from ocr_mcp_server.infra.task_models import ArtifactRecord, RetentionRecord
+from ocr_mcp_server.services.orientation_recovery import (
+    FullRecoveryPipelineSubmission,
+    OrientationRecoveryCoordinator,
+)
+from ocr_mcp_server.domain.models import BatchStatus
+from ocr_mcp_server.domain.errors import RetentionErrorCode, RetentionFailure
+from ocr_mcp_server.services.retention import RetentionService
 
 
 NOW = datetime(2026, 7, 22, tzinfo=UTC)
@@ -126,6 +133,171 @@ async def test_issue_rejects_second_token_for_same_file_result_version(repositor
     with pytest.raises(OrientationFailure) as caught:
         await repo.issue(binding(batch_id), now=NOW)
     assert caught.value.code == OrientationErrorCode.REQUEST_CONFLICT.value
+
+
+@pytest.mark.asyncio
+async def test_list_claimed_is_bounded_live_and_excludes_expired_content(repository) -> None:
+    repo, engine, batch_id, _ = repository
+    issue = await repo.issue(binding(batch_id), now=NOW)
+    claimed = await repo.claim(issue.token, (4, 2), now=NOW)
+
+    recovered = await repo.list_claimed(now=NOW, limit=1)
+
+    assert len(recovered) == 1
+    assert recovered[0] == replace(claimed, acquired=False)
+    assert await repo.list_claimed(now=NOW + timedelta(hours=20), limit=1) == ()
+    for invalid_limit in (0, 1001, True):
+        with pytest.raises(OrientationFailure) as caught:
+            await repo.list_claimed(now=NOW, limit=invalid_limit)
+        assert caught.value.code == OrientationErrorCode.REQUEST_INVALID.value
+
+
+@pytest.mark.asyncio
+async def test_metadata_purge_cascades_orientation_rows(repository) -> None:
+    repo, engine, batch_id, _ = repository
+    issue = await repo.issue(binding(batch_id), now=NOW)
+    await repo.claim(issue.token, (2,), now=NOW)
+    sessions = create_session_factory(engine)
+    retention = RetentionRepository(sessions)
+    assert await retention.request_early_delete(batch_id, now=NOW)
+    content_claim = await retention.claim_batch(
+        batch_id, "cleanup", now=NOW, lease_seconds=60
+    )
+    await retention.complete_content(content_claim, now=NOW)
+    metadata_claim = await retention.claim_batch(
+        batch_id, "cleanup", now=NOW, lease_seconds=60
+    )
+    await retention.purge_metadata(metadata_claim, now=NOW)
+
+    async with sessions() as session:
+        remaining = await session.scalar(
+            text("SELECT count(*) FROM orientation_recoveries WHERE batch_id=:batch_id"),
+            {"batch_id": batch_id},
+        )
+    assert remaining == 0
+
+
+@pytest.mark.asyncio
+async def test_retention_claim_atomically_invalidates_claimed_recovery_and_retry_is_zero(
+    repository,
+) -> None:
+    repo, engine, batch_id, _ = repository
+    issue = await repo.issue(binding(batch_id), now=NOW)
+    await repo.claim(issue.token, (2,), now=NOW)
+    sessions = create_session_factory(engine)
+    retention = RetentionRepository(sessions)
+    assert await retention.request_early_delete(batch_id, now=NOW)
+    claim = await retention.claim_batch(
+        batch_id, "cleanup", now=NOW, lease_seconds=60
+    )
+
+    assert await retention.invalidate_orientation_recoveries(claim, now=NOW) == 1
+    assert await retention.invalidate_orientation_recoveries(claim, now=NOW) == 0
+
+    async with sessions() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT state, version FROM orientation_recoveries "
+                    "WHERE batch_id=:batch_id"
+                ),
+                {"batch_id": batch_id},
+            )
+        ).mappings().one()
+    assert row["state"] == RecoveryState.DELETED.value
+    assert row["version"] == 3
+
+
+@pytest.mark.asyncio
+async def test_successful_token_invalidation_survives_physical_delete_failure(
+    repository, tmp_path: Path
+) -> None:
+    repo, engine, batch_id, _ = repository
+    issue = await repo.issue(binding(batch_id), now=NOW)
+    sessions = create_session_factory(engine)
+    retention = RetentionRepository(sessions)
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    (data_root / batch_id).mkdir(parents=True)
+    (artifact_root / batch_id).mkdir(parents=True)
+
+    class FailedDelete:
+        def delete(self, *args, **kwargs):
+            raise RetentionFailure(RetentionErrorCode.CLEANUP_FAILED)
+
+    result = await RetentionService(
+        retention,
+        data_root,
+        artifact_root,
+        deleter=FailedDelete(),
+    ).run_once(
+        "cleanup",
+        now=NOW + timedelta(hours=20),
+        lease_seconds=60,
+        limit=1,
+    )
+
+    assert (result.content_deleted, result.failed) == (0, 1)
+    with pytest.raises(OrientationFailure) as deleted:
+        await repo.resolve(issue.token, now=NOW)
+    assert deleted.value.code == OrientationErrorCode.TOKEN_INVALID.value
+    async with sessions() as session:
+        state = await session.scalar(
+            text(
+                "SELECT state FROM orientation_recoveries "
+                "WHERE batch_id=:batch_id"
+            ),
+            {"batch_id": batch_id},
+        )
+    assert state == RecoveryState.DELETED.value
+
+
+@pytest.mark.asyncio
+async def test_concurrent_restart_reconciliation_converges_without_running_work(repository) -> None:
+    repo, _, batch_id, result_batch_id = repository
+    issue = await repo.issue(binding(batch_id), now=NOW)
+    claim = await repo.claim(issue.token, (2,), now=NOW)
+
+    class Runner:
+        reconcile_calls = 0
+        run_calls = 0
+
+        async def reconcile(self, recovery_id):
+            assert recovery_id == claim.claim_id
+            self.reconcile_calls += 1
+            await asyncio.sleep(0)
+            return FullRecoveryPipelineSubmission(
+                result_batch_id, BatchStatus.QUEUED, 3
+            )
+
+        async def run(self, *args, **kwargs):
+            self.run_calls += 1
+            raise AssertionError("restart reconciliation cannot run work")
+
+    runner = Runner()
+    service = OrientationRecoveryCoordinator(
+        repository=repo,
+        detector=object(),
+        corrector=object(),
+        runner=runner,
+        storage=object(),
+        marker_registry=object(),
+        content_write_guards=object(),
+        now_factory=lambda: NOW,
+    )
+
+    first, second = await asyncio.gather(
+        service.reconcile_incomplete(limit=1),
+        service.reconcile_incomplete(limit=1),
+    )
+
+    assert first.scanned == second.scanned == 1
+    assert first.completed + first.deferred == 1
+    assert second.completed + second.deferred == 1
+    assert runner.run_calls == 0
+    resolved = await repo.resolve(issue.token, now=NOW)
+    assert resolved.state is RecoveryState.COMPLETED
+    assert (resolved.result_batch_id, resolved.result_version) == (result_batch_id, 3)
 
 
 @pytest.mark.asyncio

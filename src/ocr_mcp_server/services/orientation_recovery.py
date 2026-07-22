@@ -198,6 +198,10 @@ class OrientationRecoveryState(Protocol):
         now: datetime,
     ) -> RecoverySnapshot: ...
 
+    async def list_claimed(
+        self, *, now: datetime, limit: int
+    ) -> tuple[RecoveryClaim, ...]: ...
+
 
 class RecoveryStorage(Protocol):
     def batch_lock(
@@ -249,10 +253,31 @@ class FullRecoveryPipelineRunner(Protocol):
         self,
         corrected: StoredFile,
         *,
+        recovery_id: str,
         source_batch_id: str,
         source_result_version: int,
         corrected_input_version: int,
     ) -> FullRecoveryPipelineSubmission: ...
+
+    async def reconcile(
+        self, recovery_id: str
+    ) -> FullRecoveryPipelineSubmission | None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryReconciliationResult:
+    scanned: int
+    completed: int
+    failed: int
+    deferred: int
+
+    def __post_init__(self) -> None:
+        values = (self.scanned, self.completed, self.failed, self.deferred)
+        if (
+            any(type(value) is not int or value < 0 for value in values)
+            or self.completed + self.failed + self.deferred != self.scanned
+        ):
+            raise ValueError("invalid recovery reconciliation result")
 
 
 @dataclass(frozen=True, slots=True)
@@ -461,6 +486,84 @@ class OrientationRecoveryCoordinator:
             )
             raise RecoveryServiceFailure(RecoveryServiceErrorCode.CONFLICT) from None
 
+    async def reconcile_incomplete(
+        self, *, limit: int = 100
+    ) -> RecoveryReconciliationResult:
+        """Reconcile durable runner state after a process restart.
+
+        This path is deliberately read/transition only: it never detects,
+        corrects, or starts pipeline work.
+        """
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise RecoveryServiceFailure(RecoveryServiceErrorCode.REQUEST_INVALID)
+        try:
+            claims = tuple(
+                await self._repository.list_claimed(
+                    now=self._now_factory(), limit=limit
+                )
+            )
+            if (
+                len(claims) > limit
+                or any(not isinstance(claim, RecoveryClaim) for claim in claims)
+                or len({claim.claim_id for claim in claims}) != len(claims)
+            ):
+                raise ValueError
+        except Exception:
+            raise RecoveryServiceFailure(RecoveryServiceErrorCode.UNAVAILABLE) from None
+
+        completed = failed = deferred = 0
+        for claim in claims:
+            try:
+                submission = await self._runner.reconcile(claim.claim_id)
+            except Exception:
+                deferred += 1
+                continue
+
+            expected_version = claim.snapshot.source_result_version + 1
+            valid = (
+                isinstance(submission, FullRecoveryPipelineSubmission)
+                and submission.batch_id != claim.snapshot.batch_id
+                and submission.result_version == expected_version
+            )
+            if valid:
+                try:
+                    await self._repository.complete(
+                        claim,
+                        corrected_input_version=expected_version,
+                        result_batch_id=submission.batch_id,
+                        result_version=submission.result_version,
+                        now=self._now_factory(),
+                    )
+                    completed += 1
+                except Exception:
+                    deferred += 1
+                continue
+
+            # Only an explicit absence is authoritative.  A malformed or
+            # foreign response may be a reconciliation dependency fault and
+            # must not terminalize a live claim.
+            if submission is not None:
+                deferred += 1
+                continue
+
+            try:
+                await self._repository.fail(
+                    claim,
+                    state=RecoveryState.FAILED,
+                    error_code="orientation_recovery_interrupted",
+                    now=self._now_factory(),
+                )
+                failed += 1
+            except Exception:
+                deferred += 1
+
+        return RecoveryReconciliationResult(
+            scanned=len(claims),
+            completed=completed,
+            failed=failed,
+            deferred=deferred,
+        )
+
     async def _replay(
         self, snapshot: RecoverySnapshot, progress: ProgressCallback | None
     ) -> OrientationRecoverySubmission:
@@ -610,6 +713,7 @@ class OrientationRecoveryCoordinator:
         try:
             result = await self._runner.run(
                 corrected,
+                recovery_id=claim.claim_id,
                 source_batch_id=claim.snapshot.batch_id,
                 source_result_version=claim.snapshot.source_result_version,
                 corrected_input_version=corrected_input_version,

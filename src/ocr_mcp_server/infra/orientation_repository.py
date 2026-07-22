@@ -388,6 +388,63 @@ class OrientationRecoveryRepository:
         except Exception:
             raise OrientationFailure(OrientationErrorCode.PERSISTENCE_FAILED) from None
 
+    async def list_claimed(
+        self, *, now: datetime, limit: int
+    ) -> tuple[RecoveryClaim, ...]:
+        """Return a bounded deterministic set of live claims for restart repair."""
+        now = _utc(now)
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise OrientationFailure(OrientationErrorCode.REQUEST_INVALID) from None
+        try:
+            async with self._sessions() as session:
+                rows = (
+                    await session.execute(
+                        select(OrientationRecoveryRecord, RetentionRecord)
+                        .join(
+                            RetentionRecord,
+                            RetentionRecord.batch_id
+                            == OrientationRecoveryRecord.batch_id,
+                        )
+                        .where(
+                            OrientationRecoveryRecord.state
+                            == RecoveryState.CLAIMED.value,
+                            OrientationRecoveryRecord.expires_at > now,
+                            RetentionRecord.early_delete.is_(False),
+                            RetentionRecord.content_deleted_at.is_(None),
+                            RetentionRecord.data_tombstone.is_(None),
+                            RetentionRecord.artifact_tombstone.is_(None),
+                            RetentionRecord.content_due_at > now,
+                        )
+                        .order_by(
+                            OrientationRecoveryRecord.updated_at,
+                            OrientationRecoveryRecord.token_digest,
+                        )
+                        .limit(limit)
+                    )
+                ).all()
+                claims: list[RecoveryClaim] = []
+                for record, retention in rows:
+                    snapshot = self._snapshot(record)
+                    claim = RecoveryClaim(
+                        claim_id=record.claim_id,
+                        request_fingerprint=record.request_fingerprint,
+                        snapshot=snapshot,
+                        acquired=False,
+                    )
+                    self._require_claim(record, retention, claim, now)
+                    claims.append(claim)
+                return tuple(claims)
+        except OrientationFailure:
+            raise
+        except SQLAlchemyError:
+            raise OrientationFailure(
+                OrientationErrorCode.PERSISTENCE_FAILED
+            ) from None
+        except Exception:
+            raise OrientationFailure(
+                OrientationErrorCode.PERSISTENCE_FAILED
+            ) from None
+
     @staticmethod
     def _retention_is_non_live(record: RetentionRecord, now: datetime) -> bool:
         return bool(

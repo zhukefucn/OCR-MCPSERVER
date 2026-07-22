@@ -419,6 +419,16 @@ class RetentionService:
                 allow_retired=True,
             ) as batch_lock:
                 await self._repository.require_content_write_quiescent(claim, now=now)
+                try:
+                    invalidated = await self._repository.invalidate_orientation_recoveries(
+                        claim, now=now
+                    )
+                    if type(invalidated) is not int or invalidated < 0:
+                        raise ValueError
+                except Exception:
+                    raise RetentionFailure(
+                        RetentionErrorCode.CLEANUP_FAILED
+                    ) from None
                 data_tombstone = await self._repository.prepare_tombstone(
                     claim, root_kind="data", now=now
                 )

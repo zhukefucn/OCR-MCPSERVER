@@ -204,13 +204,20 @@ class Corrector:
 class Runner:
     def __init__(self):
         self.calls = 0
+        self.reconcile_calls: list[str] = []
+        self.reconciled = None
 
-    async def run(self, corrected, *, source_batch_id, source_result_version, corrected_input_version):
+    async def run(self, corrected, *, recovery_id, source_batch_id, source_result_version, corrected_input_version):
         self.calls += 1
         STORAGE.events.append("run")
         assert corrected.file_id != FILE_ID
+        assert recovery_id == "claim-123"
         assert (source_batch_id, source_result_version, corrected_input_version) == (BATCH_ID, 2, 3)
         return FullRecoveryPipelineSubmission(RESULT_BATCH_ID, BatchStatus.QUEUED, 3)
+
+    async def reconcile(self, recovery_id):
+        self.reconcile_calls.append(recovery_id)
+        return self.reconciled
 
 
 MARKERS = object()
@@ -656,6 +663,117 @@ def test_recovery_command_repr_redacts_the_raw_token():
     command = OrientationRecoveryCommand(token, (2,))
     assert token not in repr(command)
     assert "<redacted>" in repr(command)
+
+
+@pytest.mark.asyncio
+async def test_restart_reconciles_existing_runner_submission_without_duplicate_work():
+    repo = Repo(RecoveryState.CLAIMED)
+
+    async def list_claimed(*, now, limit):
+        assert (now, limit) == (NOW, 10)
+        return (RecoveryClaim("claim-123", "a" * 64, repo.current, False),)
+
+    repo.list_claimed = list_claimed
+    service, _, detector, corrector, runner = coordinator(repo=repo)
+    runner.reconciled = FullRecoveryPipelineSubmission(
+        RESULT_BATCH_ID, BatchStatus.QUEUED, 3
+    )
+
+    result = await service.reconcile_incomplete(limit=10)
+
+    assert (result.scanned, result.completed, result.failed, result.deferred) == (1, 1, 0, 0)
+    assert runner.reconcile_calls == ["claim-123"]
+    assert repo.current.state is RecoveryState.COMPLETED
+    assert (detector.calls, corrector.calls, runner.calls) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_restart_marks_claim_failed_when_runner_proves_no_submission():
+    repo = Repo(RecoveryState.CLAIMED)
+    repo.list_claimed = lambda **kwargs: _async_value(
+        (RecoveryClaim("claim-123", "a" * 64, repo.current, False),)
+    )
+    service, _, detector, corrector, runner = coordinator(repo=repo)
+
+    result = await service.reconcile_incomplete(limit=1)
+
+    assert (result.scanned, result.completed, result.failed, result.deferred) == (1, 0, 1, 0)
+    assert repo.fail_calls == [
+        (RecoveryState.FAILED, "orientation_recovery_interrupted")
+    ]
+    assert (detector.calls, corrector.calls, runner.calls) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_restart_defers_claim_when_runner_reconciliation_is_unavailable():
+    repo = Repo(RecoveryState.CLAIMED)
+    repo.list_claimed = lambda **kwargs: _async_value(
+        (RecoveryClaim("claim-123", "a" * 64, repo.current, False),)
+    )
+    service, _, detector, corrector, runner = coordinator(repo=repo)
+
+    async def unavailable(_recovery_id):
+        raise RuntimeError("backend diagnostic with customer content")
+
+    runner.reconcile = unavailable
+    result = await service.reconcile_incomplete(limit=1)
+
+    assert (result.scanned, result.completed, result.failed, result.deferred) == (1, 0, 0, 1)
+    assert repo.current.state is RecoveryState.CLAIMED
+    assert "customer" not in repr(result)
+    assert (detector.calls, corrector.calls, runner.calls) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "submission",
+    [
+        FullRecoveryPipelineSubmission(BATCH_ID, BatchStatus.QUEUED, 3),
+        FullRecoveryPipelineSubmission(RESULT_BATCH_ID, BatchStatus.QUEUED, 4),
+        object(),
+    ],
+)
+async def test_restart_defers_invalid_or_foreign_runner_result_without_new_work(submission):
+    repo = Repo(RecoveryState.CLAIMED)
+    repo.list_claimed = lambda **kwargs: _async_value(
+        (RecoveryClaim("claim-123", "a" * 64, repo.current, False),)
+    )
+    service, _, detector, corrector, runner = coordinator(repo=repo)
+    runner.reconciled = submission
+
+    result = await service.reconcile_incomplete(limit=1)
+
+    assert (result.completed, result.failed, result.deferred) == (0, 0, 1)
+    assert repo.fail_calls == []
+    assert repo.current.state is RecoveryState.CLAIMED
+    assert (detector.calls, corrector.calls, runner.calls) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_restart_cancellation_leaves_claim_for_later_reconciliation():
+    repo = Repo(RecoveryState.CLAIMED)
+    repo.list_claimed = lambda **kwargs: _async_value(
+        (RecoveryClaim("claim-123", "a" * 64, repo.current, False),)
+    )
+    service, _, detector, corrector, runner = coordinator(repo=repo)
+    entered = __import__("asyncio").Event()
+
+    async def blocked(_recovery_id):
+        entered.set()
+        await __import__("asyncio").Event().wait()
+
+    runner.reconcile = blocked
+    task = __import__("asyncio").create_task(service.reconcile_incomplete(limit=1))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(__import__("asyncio").CancelledError):
+        await task
+    assert repo.current.state is RecoveryState.CLAIMED
+    assert (detector.calls, corrector.calls, runner.calls) == (0, 0, 0)
+
+
+async def _async_value(value):
+    return value
 
 
 @pytest.mark.asyncio

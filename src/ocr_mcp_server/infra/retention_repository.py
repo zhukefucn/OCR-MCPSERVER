@@ -23,6 +23,7 @@ from .task_models import (
     BatchLockMarkerRecord,
     BatchRecord,
     FileTaskRecord,
+    OrientationRecoveryRecord,
     ReplacementAuditMetadataRecord,
     RetentionRecord,
     StageEventRecord,
@@ -441,6 +442,42 @@ class RetentionRepository:
                 await session.commit()
         except SQLAlchemyError:
             raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT) from None
+
+    async def invalidate_orientation_recoveries(
+        self, claim: RetentionClaim, *, now: datetime
+    ) -> int:
+        """Atomically invalidate recovery rows under a live content claim."""
+        now = _utc(now)
+        try:
+            async with self._sessions() as session:
+                await session.execute(text("BEGIN IMMEDIATE"))
+                await self._require_claim(
+                    session, claim, RetentionPhase.CONTENT, now
+                )
+                result = await session.execute(
+                    update(OrientationRecoveryRecord)
+                    .where(
+                        OrientationRecoveryRecord.batch_id == claim.batch_id,
+                        OrientationRecoveryRecord.state != "deleted",
+                    )
+                    .values(
+                        state="deleted",
+                        updated_at=now,
+                        version=OrientationRecoveryRecord.version + 1,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                count = result.rowcount
+                if type(count) is not int or count < 0:
+                    raise RetentionFailure(RetentionErrorCode.CLEANUP_FAILED)
+                await session.commit()
+                return count
+        except RetentionFailure:
+            raise
+        except SQLAlchemyError:
+            raise RetentionFailure(RetentionErrorCode.CLEANUP_FAILED) from None
+        except Exception:
+            raise RetentionFailure(RetentionErrorCode.CLEANUP_FAILED) from None
 
     async def purge_metadata(self, claim: RetentionClaim, *, now: datetime) -> None:
         now = _utc(now)
