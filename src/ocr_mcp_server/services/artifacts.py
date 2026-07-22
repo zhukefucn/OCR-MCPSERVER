@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -24,12 +25,19 @@ from ..domain.artifacts import (
     ArtifactBundle,
     ArtifactSnapshot,
     replacement_audit_metadata_sha256,
+    validate_content_free_model_versions,
 )
 from ..domain.errors import ArtifactErrorCode, ArtifactFailure
-from ..domain.merge import MergePublicationResult, ReplacementAuditRecord
+from ..domain.merge import (
+    MergePublicationResult,
+    ReplacementAuditRecord,
+    ReplacementDecision,
+    ReplacementReason,
+)
 from ..domain.mineru import MinerUDocumentResult
 from ..domain.models import ProcessingStage
 from ..domain.progress import ProgressCounters, ProgressUnit
+from ..domain.secondary_ocr import SecondaryResultKind
 from .candidate_collection import _open_candidate
 from .structured_content import (
     StructuredContentInvalid,
@@ -55,7 +63,6 @@ _CODE_TYPES = frozenset({"code", "code_block"})
 _KNOWN_NODE_TYPES = _TEXT_TYPES | _TITLE_TYPES | _LIST_TYPES | _CODE_TYPES | frozenset(
     {"image", "table", "equation_interline"}
 )
-_SAFE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+/@-]{0,127}")
 
 
 def _fail(code: ArtifactErrorCode) -> None:
@@ -487,7 +494,7 @@ def _windows_pin_directory(path: Path) -> int:
     create_file.restype = wintypes.HANDLE
     handle = create_file(
         str(path),
-        0x80,
+        0x40000000,
         0x1 | 0x2,  # Deliberately deny delete/rename sharing while publishing.
         None,
         3,
@@ -610,8 +617,53 @@ class _PinnedArtifactRoot:
     ) -> None:
         if self.descriptor is None:
             assert stage_name is not None
-            os.link(self.path / stage_name, self.path / target_name)
-            return
+            import msvcrt
+
+            class _RenameInformation(ctypes.Structure):
+                _fields_ = (
+                    ("Flags", wintypes.DWORD),
+                    ("RootDirectory", wintypes.HANDLE),
+                    ("FileNameLength", wintypes.DWORD),
+                    ("FileName", wintypes.WCHAR * 1),
+                )
+
+            destination = str(self.path / target_name)
+            encoded = destination.encode("utf-16-le")
+            size = ctypes.sizeof(_RenameInformation) + len(encoded) - ctypes.sizeof(
+                wintypes.WCHAR
+            )
+            buffer = ctypes.create_string_buffer(size)
+            information = ctypes.cast(
+                buffer, ctypes.POINTER(_RenameInformation)
+            ).contents
+            information.Flags = 0
+            information.RootDirectory = None
+            information.FileNameLength = len(encoded)
+            ctypes.memmove(
+                ctypes.addressof(buffer) + _RenameInformation.FileName.offset,
+                encoded,
+                len(encoded),
+            )
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            rename = kernel32.SetFileInformationByHandle
+            rename.argtypes = (
+                wintypes.HANDLE,
+                ctypes.c_int,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+            )
+            rename.restype = wintypes.BOOL
+            if rename(
+                msvcrt.get_osfhandle(stage_descriptor),
+                3,
+                buffer,
+                size,
+            ):
+                return
+            error_number = ctypes.get_last_error()
+            if error_number in {80, 183}:
+                raise FileExistsError(error_number, os.strerror(error_number))
+            raise OSError(error_number, os.strerror(error_number))
         libc = ctypes.CDLL(None, use_errno=True)
         linkat = libc.linkat
         linkat.argtypes = (
@@ -639,7 +691,7 @@ class _PinnedArtifactRoot:
         if stage_name is None:
             return
         if self.descriptor is None:
-            return  # Windows cleanup is armed safely on the still-open handle.
+            return
         try:
             os.unlink(stage_name, dir_fd=self.descriptor)
         except FileNotFoundError:
@@ -650,6 +702,19 @@ class _PinnedArtifactRoot:
             return
         if self.descriptor is not None:
             return
+        self._set_stage_cleanup(stage_descriptor, True)
+
+    def disarm_stage_cleanup(
+        self, stage_descriptor: int, stage_name: str | None
+    ) -> None:
+        if stage_name is None:
+            return
+        if self.descriptor is not None:
+            return
+        self._set_stage_cleanup(stage_descriptor, False)
+
+    @staticmethod
+    def _set_stage_cleanup(stage_descriptor: int, delete: bool) -> None:
         import msvcrt
 
         class _Disposition(ctypes.Structure):
@@ -664,7 +729,7 @@ class _PinnedArtifactRoot:
             wintypes.DWORD,
         )
         function.restype = wintypes.BOOL
-        disposition = _Disposition(True)
+        disposition = _Disposition(delete)
         if not function(
             msvcrt.get_osfhandle(stage_descriptor),
             4,
@@ -673,11 +738,81 @@ class _PinnedArtifactRoot:
         ):
             raise OSError from None
 
+    @staticmethod
+    def _set_stage_cleanup_extended(stage_descriptor: int) -> None:
+        import msvcrt
+
+        class _DispositionEx(ctypes.Structure):
+            _fields_ = (("Flags", wintypes.DWORD),)
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        function = kernel32.SetFileInformationByHandle
+        function.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        function.restype = wintypes.BOOL
+        disposition = _DispositionEx(0x1)
+        if not function(
+            msvcrt.get_osfhandle(stage_descriptor),
+            21,
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        ):
+            raise OSError from None
+
+    def force_stage_cleanup(
+        self, stage_descriptor: int, stage_name: str | None
+    ) -> None:
+        if stage_name is None or self.descriptor is not None:
+            return
+        try:
+            self._set_stage_cleanup(stage_descriptor, True)
+        except OSError:
+            self._set_stage_cleanup_extended(stage_descriptor)
+
+    @staticmethod
+    def scrub_stage(stage_descriptor: int) -> None:
+        try:
+            os.ftruncate(stage_descriptor, 0)
+        except OSError:
+            if os.name != "nt":
+                raise
+            import msvcrt
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            seek = kernel32.SetFilePointerEx
+            seek.argtypes = (
+                wintypes.HANDLE,
+                ctypes.c_longlong,
+                ctypes.POINTER(ctypes.c_longlong),
+                wintypes.DWORD,
+            )
+            seek.restype = wintypes.BOOL
+            truncate = kernel32.SetEndOfFile
+            truncate.argtypes = (wintypes.HANDLE,)
+            truncate.restype = wintypes.BOOL
+            handle = msvcrt.get_osfhandle(stage_descriptor)
+            position = ctypes.c_longlong()
+            if not seek(handle, 0, ctypes.byref(position), 0) or not truncate(handle):
+                raise OSError(ctypes.get_last_error(), "stage scrub failed") from None
+        os.fsync(stage_descriptor)
+        if os.fstat(stage_descriptor).st_size != 0:
+            raise OSError from None
+
     def fsync(self) -> None:
         if self.descriptor is not None:
             os.fsync(self.descriptor)
         else:
-            _fsync_directory(self.path)
+            assert self.handle is not None
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            flush = kernel32.FlushFileBuffers
+            flush.argtypes = (wintypes.HANDLE,)
+            flush.restype = wintypes.BOOL
+            if not flush(self.handle):
+                raise OSError(ctypes.get_last_error(), "directory durability failed")
 
     def _named_stat(self, name: str) -> os.stat_result:
         if self.descriptor is None:
@@ -818,8 +953,6 @@ def _safe_model_metadata(
         if not isinstance(record, ReplacementAuditRecord):
             _fail(ArtifactErrorCode.INVALID_INPUT)
         engine = record.engine.value
-        if _SAFE_IDENTIFIER.fullmatch(engine) is None:
-            _fail(ArtifactErrorCode.INVALID_INPUT)
         engines.add(engine)
         expected_candidate = "candidate-" + _hash_id(
             "image-candidate",
@@ -850,14 +983,13 @@ def _safe_model_metadata(
             or record.audit_id != expected_audit
         ):
             _fail(ArtifactErrorCode.INVALID_INPUT)
-        for key, value in record.model_versions.items():
-            if (
-                not isinstance(key, str)
-                or not isinstance(value, str)
-                or _SAFE_IDENTIFIER.fullmatch(key) is None
-                or _SAFE_IDENTIFIER.fullmatch(value) is None
-            ):
-                _fail(ArtifactErrorCode.INVALID_INPUT)
+        try:
+            safe_versions = validate_content_free_model_versions(
+                record.model_versions
+            )
+        except ValueError:
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        for key, value in safe_versions.items():
             versions.add(f"{key}:{value}")
     return sorted(engines), sorted(versions)
 
@@ -896,6 +1028,203 @@ def _expected_audit_bytes(publication: MergePublicationResult) -> bytes:
             ],
         }
     )
+
+
+def _snapshot_value(value: str | None) -> dict | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        _fail(ArtifactErrorCode.INVALID_INPUT)
+    parsed = _strict_json(value.encode("utf-8"))
+    if not isinstance(parsed, dict):
+        _fail(ArtifactErrorCode.INVALID_INPUT)
+    canonical = json.dumps(
+        parsed,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    if canonical != value:
+        _fail(ArtifactErrorCode.INVALID_INPUT)
+    return parsed
+
+
+def _is_existing_structure(
+    node: dict,
+    limits: StructuredContentLimits,
+) -> bool:
+    content = node.get("content")
+    if not isinstance(content, dict):
+        return False
+    try:
+        if node.get("type") == "table":
+            validate_table_html(content.get("html"), limits)
+            return True
+        if (
+            node.get("type") == "equation_interline"
+            and content.get("math_type") == "latex"
+        ):
+            validate_formula_latex(content.get("math_content"), limits)
+            return True
+    except StructuredContentInvalid:
+        return False
+    return False
+
+
+def _expected_node_for_audit(
+    record: ReplacementAuditRecord,
+    original_node: dict | None,
+    replacement_node: dict | None,
+    limits: StructuredContentLimits,
+) -> dict | None:
+    """Exhaustively validate Task 7 audit semantics; unknown combinations fail."""
+
+    if record.reason is ReplacementReason.STANDALONE_REFERENCE:
+        if (
+            record.decision is ReplacementDecision.RETAINED
+            and original_node is None
+            and replacement_node is None
+        ):
+            return None
+        _fail(ArtifactErrorCode.INVALID_INPUT)
+    if original_node is None:
+        _fail(ArtifactErrorCode.INVALID_INPUT)
+
+    structured = _is_existing_structure(original_node, limits)
+    if record.reason in {
+        ReplacementReason.REPLACED_TABLE,
+        ReplacementReason.REPLACED_FORMULA,
+    }:
+        if (
+            record.decision is not ReplacementDecision.REPLACED
+            or replacement_node is None
+            or structured
+        ):
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        original_content = original_node.get("content")
+        replacement_content = replacement_node.get("content")
+        if not isinstance(original_content, dict) or not isinstance(
+            replacement_content, dict
+        ):
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        expected = deepcopy(original_node)
+        expected_content = expected["content"]
+        if record.reason is ReplacementReason.REPLACED_TABLE:
+            if (
+                record.kind is not SecondaryResultKind.TABLE
+                or replacement_node.get("type") != "table"
+                or not isinstance(replacement_content.get("html"), str)
+            ):
+                _fail(ArtifactErrorCode.INVALID_INPUT)
+            expected["type"] = "table"
+            expected_content.pop("math_content", None)
+            expected_content.pop("math_type", None)
+            expected_content["html"] = replacement_content["html"]
+        else:
+            if (
+                record.kind is not SecondaryResultKind.FORMULA
+                or replacement_node.get("type") != "equation_interline"
+                or replacement_content.get("math_type") != "latex"
+                or not isinstance(replacement_content.get("math_content"), str)
+            ):
+                _fail(ArtifactErrorCode.INVALID_INPUT)
+            expected["type"] = "equation_interline"
+            expected_content.pop("html", None)
+            expected_content["math_content"] = replacement_content["math_content"]
+            expected_content["math_type"] = "latex"
+        if replacement_node != expected:
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        return replacement_node
+
+    if record.decision is not ReplacementDecision.RETAINED or replacement_node is not None:
+        _fail(ArtifactErrorCode.INVALID_INPUT)
+    if record.reason is ReplacementReason.ALREADY_STRUCTURED:
+        if not structured:
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        return original_node
+    if record.reason is ReplacementReason.STALE_REFERENCE:
+        _fail(ArtifactErrorCode.INVALID_INPUT)
+    if structured:
+        _fail(ArtifactErrorCode.INVALID_INPUT)
+    if record.reason is ReplacementReason.OTHER_IMAGE:
+        if record.kind is not SecondaryResultKind.OTHER:
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        return original_node
+    if record.reason is ReplacementReason.INVALID_CONTENT:
+        if record.kind not in {
+            SecondaryResultKind.TABLE,
+            SecondaryResultKind.FORMULA,
+        }:
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        return original_node
+    if record.reason in {
+        ReplacementReason.UNCERTAIN,
+        ReplacementReason.FAILED,
+        ReplacementReason.INVALID_RESULT,
+    }:
+        return original_node
+    _fail(ArtifactErrorCode.INVALID_INPUT)
+
+
+def _reconstruct_audited_final(
+    original: object,
+    publication: MergePublicationResult,
+    limits: StructuredContentLimits,
+) -> object:
+    if not isinstance(original, list):
+        _fail(ArtifactErrorCode.INVALID_INPUT)
+    expected_pointers = {
+        pointer for _raw, pointer in _extract_image_references((original,))
+    }
+    reconstructed = deepcopy(original)
+    seen: set[str] = set()
+    for record in publication.records:
+        pointer = record.json_pointer
+        if pointer is None:
+            if (
+                record.page_index is not None
+                or record.node_index is not None
+                or record.original_node_type is not None
+                or record.reason is not ReplacementReason.STANDALONE_REFERENCE
+            ):
+                _fail(ArtifactErrorCode.INVALID_INPUT)
+            _expected_node_for_audit(
+                record,
+                _snapshot_value(record.original_node_snapshot),
+                _snapshot_value(record.replacement_node_snapshot),
+                limits,
+            )
+            continue
+        if (
+            pointer not in expected_pointers
+            or pointer in seen
+            or type(record.page_index) is not int
+            or type(record.node_index) is not int
+            or pointer != f"/{record.page_index}/{record.node_index}"
+        ):
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        seen.add(pointer)
+        try:
+            original_node = original[record.page_index][record.node_index]
+        except (IndexError, TypeError):
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        if (
+            not isinstance(original_node, dict)
+            or record.original_node_type != original_node.get("type")
+            or _snapshot_value(record.original_node_snapshot) != original_node
+        ):
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        replacement = _snapshot_value(record.replacement_node_snapshot)
+        reconstructed[record.page_index][record.node_index] = _expected_node_for_audit(
+            record,
+            original_node,
+            replacement,
+            limits,
+        )
+    if seen != expected_pointers:
+        _fail(ArtifactErrorCode.INVALID_INPUT)
+    return reconstructed
 
 
 class ArtifactBundler:
@@ -1019,6 +1348,14 @@ class ArtifactBundler:
         original = _strict_json(loaded["original_content_list_v2.json"])
         final = _strict_json(loaded["content_list_v2.json"])
         if _canonical_json(original) != loaded["original_content_list_v2.json"] or _canonical_json(final) != loaded["content_list_v2.json"]:
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        if _canonical_json(
+            _reconstruct_audited_final(
+                original,
+                publication,
+                _structured_limits(self._limits.max_markdown_bytes),
+            )
+        ) != loaded["content_list_v2.json"]:
             _fail(ArtifactErrorCode.INVALID_INPUT)
         source_original = _read_file(result.content_list_v2_path, result_root, self._limits.max_entry_bytes, ArtifactErrorCode.UNSAFE_SOURCE)
         if sha256(source_original).hexdigest() != publication.original_sha256:
@@ -1169,6 +1506,9 @@ class ArtifactBundler:
                 descriptor, stage_name, _stage_path = pinned.create_stage()
             except BaseException:
                 _fail(ArtifactErrorCode.PUBLISH_FAILED)
+            published = False
+            stage_closed = False
+            stage_identity = None
             try:
                 try:
                     with os.fdopen(descriptor, "w+b", closefd=False) as raw:
@@ -1191,7 +1531,7 @@ class ArtifactBundler:
                         os.fsync(raw.fileno())
                 except _ArchiveLimitReached:
                     _fail(ArtifactErrorCode.LIMIT_EXCEEDED)
-                size, archive_digest, _stage_identity = pinned.scan_descriptor(
+                size, archive_digest, stage_identity = pinned.scan_descriptor(
                     descriptor,
                     stage_name,
                     self._limits.max_artifact_bytes,
@@ -1209,7 +1549,11 @@ class ArtifactBundler:
                     raise
                 except BaseException:
                     _fail(ArtifactErrorCode.PUBLISH_FAILED)
-                published = False
+                try:
+                    pinned.arm_stage_cleanup(descriptor, stage_name)
+                    pinned.disarm_stage_cleanup(descriptor, stage_name)
+                except BaseException:
+                    _fail(ArtifactErrorCode.PUBLISH_FAILED)
                 try:
                     pinned.link_no_replace(descriptor, stage_name, storage_key)
                     published = True
@@ -1221,6 +1565,13 @@ class ArtifactBundler:
                         expected_manifest=manifest_bytes,
                         limit=self._limits.max_artifact_bytes,
                     )
+                    if stage_name is not None:
+                        try:
+                            pinned.force_stage_cleanup(descriptor, stage_name)
+                            os.close(descriptor)
+                            stage_closed = True
+                        except BaseException:
+                            _fail(ArtifactErrorCode.PUBLISH_FAILED)
                 except OSError as exc:
                     if exc.errno == errno.EEXIST:
                         _fail(ArtifactErrorCode.PUBLISH_CONFLICT)
@@ -1229,7 +1580,7 @@ class ArtifactBundler:
                     try:
                         published_identity = pinned._named_stat(storage_key)
                         if (
-                            not _same_object(_stage_identity, published_identity)
+                            not _same_object(stage_identity, published_identity)
                             or published_identity.st_size != size
                         ):
                             _fail(ArtifactErrorCode.PUBLISH_FAILED)
@@ -1237,10 +1588,10 @@ class ArtifactBundler:
                         raise
                     except BaseException:
                         _fail(ArtifactErrorCode.PUBLISH_FAILED)
-                    try:
-                        pinned.fsync()
-                    except BaseException:
-                        _fail(ArtifactErrorCode.PUBLISH_FAILED)
+                try:
+                    pinned.fsync()
+                except BaseException:
+                    _fail(ArtifactErrorCode.PUBLISH_FAILED)
                 if not _same_object(root_identity, os.lstat(artifact_root)):
                     _fail(ArtifactErrorCode.PUBLISH_FAILED)
                 return ArtifactBundle(
@@ -1264,18 +1615,29 @@ class ArtifactBundler:
                     retained_count=publication.retained_count,
                 )
             finally:
-                try:
-                    pinned.arm_stage_cleanup(descriptor, stage_name)
-                except OSError:
-                    pass
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+                cleanup_error: BaseException | None = None
+                if not stage_closed:
+                    try:
+                        if not published and stage_name is not None:
+                            try:
+                                pinned.force_stage_cleanup(descriptor, stage_name)
+                            except OSError:
+                                pinned.scrub_stage(descriptor)
+                    except BaseException as exc:
+                        cleanup_error = exc
+                    finally:
+                        try:
+                            os.close(descriptor)
+                        except OSError as exc:
+                            if cleanup_error is None:
+                                cleanup_error = exc
                 try:
                     pinned.unlink_stage(stage_name)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+                if cleanup_error is not None:
+                    raise cleanup_error
 
 
 class ArtifactRepositoryProtocol(Protocol):

@@ -49,6 +49,30 @@ The second closure review found the equivalent stage-name race. Final publicatio
 
 No test uses GPU, network, MinerU, Paddle, external services, or real sleeps.
 
+### Controller re-review closure
+
+The controller's post-verification review reopened four contracts. Each was reproduced before implementation:
+
+1. Task 7 hashes and caller records could be recomputed around an unaudited final-manifest mutation.
+2. Model metadata still admitted path/client-file tokens.
+3. Windows cleanup-disposition failure was checked only after publication and could leave a named stage.
+4. An exact retry verified the existing ZIP but skipped the directory durability barrier and could reach SQLite registration.
+
+Task 7 closure reconstructs the only permitted final manifest from the exact canonical original plus every ordered audit pointer, decision, reason, original snapshot, and replacement snapshot. One exhaustive, default-deny semantic validator owns every `ReplacementReason` combination. It rejects missing, extra/duplicate real-node coverage, stale snapshots/references, impossible `ALREADY_STRUCTURED`, retained records carrying replacement snapshots, replacement kind/reason mismatches, and any unaudited final mutation.
+
+The shared domain grammar now accepts only bounded ASCII model/version tokens and rejects Windows/POSIX/UNC paths, drive/colon forms, dot segments, whitespace/content, client-file keys/values, and disguised filename tokens such as `acme.pdf.v1`. Both the ZIP boundary and first SQLite insert use the same validator.
+
+Windows now probes handle-bound cleanup before exposing a target, publishes by no-replace handle rename, flushes the pinned writable directory handle, and uses legacy plus extended disposition fallbacks. If both disposition APIs fail before publication, the finalizer never attempts racy path deletion: while the exclusive descriptor is still held it truncates and fsyncs the exact stage inode, then closes it unconditionally and returns failure. If Python `ftruncate` fails, the same handle is truncated with `SetFilePointerEx` plus `SetEndOfFile`. A zero-byte placeholder may remain, but no unindexed archive content remains and an injected replacement object is never deleted. Ordinary publication, interruption, single-cleanup-failure, exact-retry, and post-link-failure paths enumerate no named stage.
+
+Every successful path, including exact retry, removes its retry stage before a required root-directory durability barrier. A planted first barrier failure leaves the exact target for reconciliation but reaches no repository call; the retry repeats and passes the barrier before the sole registration call.
+
+- Task 7 authenticity RED: `4 failed, 1 passed`; GREEN: `5 passed` for unaudited mutation plus stale/missing/duplicate/retained-snapshot cases.
+- Model grammar RED: collection initially failed because the shared validator did not exist; later filename-key and disguised-filename regressions each failed as expected before their fixes.
+- Windows cleanup RED: the capability-failure test returned success; native cleanup failure left a content-bearing `.artifact-stage-*`; and the initial path fallback had a name-swap race. Handle cleanup paths now remove the stage, while terminal double-disposition failure leaves only a verified zero-byte placeholder and never invokes path unlink.
+- Retry barrier RED: the exact retry returned after only one fsync call; a stricter follow-up proved its stage deletion occurred after the barrier. Both are GREEN, with stage deletion before the second barrier and repository calls `0` then `1`.
+- Current focused command: `.\.venv\Scripts\python.exe -m pytest -p no:cacheprovider tests/test_artifacts.py`.
+- Current focused result: `48 passed`.
+
 ## Delivered design
 
 ### Domain and safe errors
@@ -67,6 +91,7 @@ No test uses GPU, network, MinerU, Paddle, external services, or real sleeps.
 - Exact final/original/audit canonical bytes, available explicitly named MinerU files, and only referenced images are included. Images are deduplicated by SHA-256 and their live bytes must match Task 7 audit bindings.
 - `artifact_manifest.json` records identities, versions, ordered non-self entries and their sizes/hashes, counts, engine/model identifiers, warnings/errors, caller times, the content-free audit digest/count, and the SQLite archive-hash binding. The non-circular archive SHA-256 and artifact-manifest SHA-256 live in the returned bundle and SQLite index.
 - Publication stages in bounded chunks, fsyncs files/directories where supported, and atomically publishes without replacement. Exact retries verify the complete existing archive and manifest. Conflicts fail safely.
+- The final canonical V2 is independently reconstructed from the original and exact Task 7 audit semantics; Task 7 hashes are bindings, not authority for arbitrary caller-supplied mutations.
 
 ### SQLite index and audit metadata
 
@@ -136,9 +161,23 @@ Post-report gate from `951993d`:
 5. `git status --short`
    - Exit 0 with no output; the worktree was clean.
 
+Post-controller-closure pre-commit gate:
+
+1. `.\.venv\Scripts\python.exe -m pytest -p no:cacheprovider`
+   - Exit 0: `622 passed, 5 skipped in 6.64s` (before the final three review regressions; a fresh final gate follows the closure commit).
+2. `.\.venv\Scripts\python.exe -m pytest -p no:cacheprovider tests/test_artifacts.py`
+   - Exit 0: `48 passed in 0.97s`.
+
+Final controller-closure gate:
+
+1. `.\.venv\Scripts\python.exe -m pytest -p no:cacheprovider`
+   - Exit 0: `629 passed, 5 skipped in 7.20s`.
+2. Independent isolated focused run
+   - Exit 0: `48 passed`; final verdict `READY` with no Critical or Important findings.
+
 ## Review closure and remaining concerns
 
-- Independent review completed three rounds. All image binding, bounded-write, publication race, exact-audit, content-free metadata, and HTML-escaping findings are closed; final verdict READY.
+- Independent review completed the original three rounds and all controller-closure rounds. The final verdict is `READY` with no Critical or Important findings.
 - POSIX immutable publication deliberately requires `O_TMPFILE` and `linkat(AT_EMPTY_PATH)`. If the deployment filesystem lacks that Ubuntu-targeted capability, publication fails safely with no insecure named-stage fallback.
 - The SQLite MVP still uses `create_all` rather than an Alembic migration. Existing local databases must be recreated to receive the new tables/columns.
 - Artifact-manifest and archive hashes cannot be self-embedded without circularity; SQLite and the returned immutable result are the authoritative bindings.

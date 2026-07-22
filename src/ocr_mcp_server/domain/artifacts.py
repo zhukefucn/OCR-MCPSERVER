@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
 import json
+import re
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
@@ -13,6 +14,72 @@ from typing import Mapping
 from .merge import ReplacementDecision, ReplacementReason
 from .models import SecondaryOCREngine
 from .secondary_ocr import OrthogonalAngle, SecondaryResultKind
+
+
+_MODEL_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}")
+_CLIENT_FILE_SUFFIXES = (
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".txt",
+    ".md",
+    ".html",
+    ".htm",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tif",
+    ".tiff",
+)
+
+
+def _looks_like_client_filename(value: str) -> bool:
+    folded = value.casefold()
+    return any(
+        (index := folded.find(suffix)) >= 0
+        and (
+            index + len(suffix) == len(folded)
+            or folded[index + len(suffix)] in "._+-"
+        )
+        for suffix in _CLIENT_FILE_SUFFIXES
+    )
+
+
+def validate_content_free_model_versions(value: Mapping[str, str]) -> dict[str, str]:
+    """Return bounded model tokens that cannot encode paths or client filenames."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError("invalid model metadata") from None
+    try:
+        versions = dict(value)
+    except BaseException:
+        raise ValueError("invalid model metadata") from None
+    if not versions:
+        return versions
+    for key, item in versions.items():
+        if (
+            not isinstance(key, str)
+            or not isinstance(item, str)
+            or _MODEL_TOKEN.fullmatch(key) is None
+            or _MODEL_TOKEN.fullmatch(item) is None
+            or ".." in key
+            or ".." in item
+            or key.endswith(".")
+            or item.endswith(".")
+            or _looks_like_client_filename(key)
+            or _looks_like_client_filename(item)
+        ):
+            raise ValueError("invalid model metadata") from None
+    encoded = json.dumps(
+        versions, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    if len(encoded) > 4096:
+        raise ValueError("invalid model metadata") from None
+    return versions
 
 
 @dataclass(frozen=True, slots=True)

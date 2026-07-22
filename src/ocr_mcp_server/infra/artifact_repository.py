@@ -15,6 +15,7 @@ from ..domain.artifacts import (
     ArtifactSnapshot,
     ReplacementAuditMetadataSnapshot,
     replacement_audit_metadata_sha256,
+    validate_content_free_model_versions,
 )
 from ..domain.errors import ArtifactErrorCode, ArtifactFailure
 from ..domain.merge import ReplacementAuditRecord, ReplacementDecision, ReplacementReason
@@ -44,19 +45,8 @@ def _database_utc(value: datetime) -> datetime:
 
 def _canonical_models(value) -> str:
     try:
-        models = dict(value)
-        safe = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+/@-]{0,127}")
-        if any(
-            not isinstance(key, str)
-            or not isinstance(item, str)
-            or safe.fullmatch(key) is None
-            or safe.fullmatch(item) is None
-            for key, item in models.items()
-        ):
-            raise ValueError
+        models = validate_content_free_model_versions(value)
         encoded = json.dumps(models, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        if len(encoded.encode("utf-8")) > 4096:
-            raise ValueError
         return encoded
     except BaseException:
         _fail(ArtifactErrorCode.INDEX_CONFLICT)

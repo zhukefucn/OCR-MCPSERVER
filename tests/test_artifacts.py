@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import zipfile
 
@@ -23,6 +24,7 @@ from ocr_mcp_server.domain import (
     SecondaryOCREngine,
     SecondaryResultKind,
     replacement_audit_metadata_sha256,
+    validate_content_free_model_versions,
 )
 from ocr_mcp_server.infra.artifact_repository import ArtifactRepository
 from ocr_mcp_server.infra.database import (
@@ -49,7 +51,21 @@ def _canonical(value: object) -> bytes:
     ).encode()
 
 
-def _audit_record() -> ReplacementAuditRecord:
+def _audit_record(
+    original_node: dict | None = None,
+    replacement_node: dict | None = None,
+) -> ReplacementAuditRecord:
+    original_node = original_node or {
+        "type": "image",
+        "content": {"image_source": {"path": "images/used.png"}},
+    }
+    replacement_node = replacement_node or {
+        "type": "table",
+        "content": {
+            "html": "<table><tr><td>值</td></tr></table>",
+            "image_source": {"path": "images/used.png"},
+        },
+    }
     image_sha256 = sha256(b"used-image").hexdigest()
     candidate_id = "candidate-" + sha256(
         ("image-candidate\0file-a\0" f"1\0{image_sha256}").encode()
@@ -83,8 +99,12 @@ def _audit_record() -> ReplacementAuditRecord:
         decision=ReplacementDecision.REPLACED,
         reason=ReplacementReason.REPLACED_TABLE,
         timestamp=NOW,
-        original_node_snapshot='{"secret":"not metadata"}',
-        replacement_node_snapshot='{"recognized":"not metadata"}',
+        original_node_snapshot=json.dumps(
+            original_node, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ),
+        replacement_node_snapshot=json.dumps(
+            replacement_node, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ),
     )
 
 
@@ -128,6 +148,7 @@ def _inputs(tmp_path: Path):
     original = [[
         {"type": "title", "content": {"text": "标题"}},
         {"type": "image", "content": {"image_source": {"path": "images/used.png"}}},
+        {"type": "mystery", "content": {"text": "never render"}},
     ]]
     final = [[
         {"type": "title", "content": {"text": "标题"}},
@@ -160,7 +181,7 @@ def _inputs(tmp_path: Path):
     publication_dir.mkdir(parents=True)
     original_bytes = _canonical(original)
     final_bytes = _canonical(final)
-    record = _audit_record()
+    record = _audit_record(original[0][1], final[0][1])
     audit_bytes = _canonical(_audit_document(record))
     files = {
         "original_content_list_v2.json": original_bytes,
@@ -195,6 +216,25 @@ def _inputs(tmp_path: Path):
     return result, publication, files, record
 
 
+def _replace_task7_file(
+    publication: MergePublicationResult,
+    name: str,
+    content: bytes,
+) -> MergePublicationResult:
+    path = publication.publication_directory / name
+    path.write_bytes(content)
+    binding_path = publication.publication_directory / "publication_manifest.json"
+    binding = json.loads(binding_path.read_bytes())
+    binding["files"][name] = sha256(content).hexdigest()
+    binding_path.write_bytes(_canonical(binding))
+    field = {
+        "content_list_v2.json": "manifest_sha256",
+        "original_content_list_v2.json": "original_sha256",
+        "secondary_ocr_audit.json": "audit_sha256",
+    }[name]
+    return replace(publication, **{field: sha256(content).hexdigest()})
+
+
 def test_artifact_settings_have_positive_mvp_defaults_and_reject_booleans() -> None:
     settings = ArtifactSettings()
     assert settings.max_artifact_bytes == 1024**3
@@ -206,6 +246,41 @@ def test_artifact_settings_have_positive_mvp_defaults_and_reject_booleans() -> N
     ):
         with pytest.raises(ValueError):
             ArtifactSettings(**{name: False})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "C:/Clients/acme.pdf",
+        "srv/acme/model",
+        r"\\server\share\model",
+        "../model",
+        "client.pdf",
+        "acme.pdf.v1",
+        "team:secret",
+        "a..b",
+        "document text",
+    ],
+)
+def test_content_free_model_version_grammar_rejects_paths_and_content(value: str) -> None:
+    with pytest.raises(ValueError):
+        validate_content_free_model_versions({"pipeline": value})
+
+
+@pytest.mark.parametrize(
+    "value", ["v1.2.3", "PP-StructureV3", "2026.07-rc1", "abc123def456"]
+)
+def test_content_free_model_version_grammar_accepts_realistic_tokens(value: str) -> None:
+    assert validate_content_free_model_versions({"pipeline_id": value}) == {
+        "pipeline_id": value
+    }
+
+
+def test_content_free_model_version_grammar_rejects_filename_keys_and_non_mappings() -> None:
+    with pytest.raises(ValueError):
+        validate_content_free_model_versions({"client.pdf": "v1"})
+    with pytest.raises(ValueError):
+        validate_content_free_model_versions([])  # type: ignore[arg-type]
 
 
 def test_markdown_renderer_is_conservative_deterministic_and_warns_on_unknown() -> None:
@@ -362,27 +437,365 @@ def test_zip_rejects_forged_audit_even_when_caller_updates_hash_binding(tmp_path
     assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
 
 
-def test_zip_rejects_unsafe_model_identifier_before_manifest_write(tmp_path: Path) -> None:
-    result, publication, _, record = _inputs(tmp_path)
-    planted = replace(record, model_versions={"pipeline": "document text\n/path/name.pdf"})
-    publication = replace(publication, records=(planted,))
+def test_zip_rejects_unaudited_final_title_mutation_with_recomputed_task7_hashes(tmp_path: Path) -> None:
+    result, publication, _, _ = _inputs(tmp_path)
+    final = json.loads(publication.manifest_path.read_bytes())
+    final[0][0]["content"]["text"] = "unaudited client title"
+    publication = _replace_task7_file(
+        publication, "content_list_v2.json", _canonical(final)
+    )
     with pytest.raises(ArtifactFailure) as caught:
         ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
             result, publication, artifact_root=(tmp_path / "artifacts").absolute(), batch_id="batch-a",
             created_at=NOW, expires_at=NOW + timedelta(hours=24),
         )
     assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
-    assert "document text" not in str(caught.value)
+    assert "client title" not in str(caught.value)
+
+
+@pytest.mark.parametrize("case", ["stale_snapshot", "missing", "duplicate", "retained_replacement"])
+def test_zip_rejects_inconsistent_or_nonexact_audit_coverage(tmp_path: Path, case: str) -> None:
+    result, publication, _, record = _inputs(tmp_path)
+    if case == "stale_snapshot":
+        records = (replace(record, original_node_snapshot='{"type":"text"}'),)
+        replacements, retained = 1, 0
+    elif case == "missing":
+        records = ()
+        replacements, retained = 0, 0
+    elif case == "duplicate":
+        second_id = "audit-" + sha256(
+            (
+                "merge-audit\0file-a\0"
+                f"{1}\0{2}\0{record.candidate_id}\0{1}\0{record.reason.value}"
+            ).encode()
+        ).hexdigest()
+        records = (record, replace(record, audit_id=second_id))
+        replacements, retained = 2, 0
+    else:
+        records = (
+            replace(
+                record,
+                decision=ReplacementDecision.RETAINED,
+                reason=ReplacementReason.OTHER_IMAGE,
+            ),
+        )
+        replacements, retained = 0, 1
+    publication = replace(
+        publication,
+        records=records,
+        replacement_count=replacements,
+        retained_count=retained,
+    )
+    audit_bytes = _canonical({
+        "task_id": "file-a",
+        "source_version": 1,
+        "output_version": 2,
+        "records": [_audit_document(item)["records"][0] for item in records],
+    })
+    publication = _replace_task7_file(
+        publication, "secondary_ocr_audit.json", audit_bytes
+    )
+    with pytest.raises(ArtifactFailure) as caught:
+        ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
+            result, publication, artifact_root=(tmp_path / "artifacts").absolute(), batch_id="batch-a",
+            created_at=NOW, expires_at=NOW + timedelta(hours=24),
+        )
+    assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
+
+
+def test_zip_rejects_replacement_kind_inconsistent_with_task7_reason(
+    tmp_path: Path,
+) -> None:
+    result, publication, _, record = _inputs(tmp_path)
+    planted = replace(record, kind=SecondaryResultKind.FORMULA)
+    publication = replace(publication, records=(planted,))
+    publication = _replace_task7_file(
+        publication,
+        "secondary_ocr_audit.json",
+        _canonical(_audit_document(planted)),
+    )
+    with pytest.raises(ArtifactFailure) as caught:
+        ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
+            result,
+            publication,
+            artifact_root=(tmp_path / "artifacts").absolute(),
+            batch_id="batch-a",
+            created_at=NOW,
+            expires_at=NOW + timedelta(hours=24),
+        )
+    assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [ReplacementReason.ALREADY_STRUCTURED, ReplacementReason.STALE_REFERENCE],
+)
+def test_zip_rejects_impossible_retained_task7_reason(
+    tmp_path: Path, reason: ReplacementReason
+) -> None:
+    result, publication, _, record = _inputs(tmp_path)
+    planted = replace(
+        record,
+        audit_id="audit-"
+        + sha256(
+            (
+                "merge-audit\0file-a\0"
+                f"{1}\0{2}\0{record.candidate_id}\0{0}\0{reason.value}"
+            ).encode()
+        ).hexdigest(),
+        decision=ReplacementDecision.RETAINED,
+        reason=reason,
+        replacement_node_snapshot=None,
+    )
+    publication = replace(
+        publication,
+        records=(planted,),
+        replacement_count=0,
+        retained_count=1,
+    )
+    publication = _replace_task7_file(
+        publication,
+        "content_list_v2.json",
+        publication.original_snapshot_path.read_bytes(),
+    )
+    publication = _replace_task7_file(
+        publication,
+        "secondary_ocr_audit.json",
+        _canonical(_audit_document(planted)),
+    )
+    with pytest.raises(ArtifactFailure) as caught:
+        ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
+            result,
+            publication,
+            artifact_root=(tmp_path / "artifacts").absolute(),
+            batch_id="batch-a",
+            created_at=NOW,
+            expires_at=NOW + timedelta(hours=24),
+        )
+    assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
+
+
+def test_zip_rejects_pointerless_nonstandalone_audit(tmp_path: Path) -> None:
+    result, publication, _, record = _inputs(tmp_path)
+    extra = replace(
+        record,
+        audit_id="audit-"
+        + sha256(
+            (
+                "merge-audit\0file-a\0"
+                f"{1}\0{2}\0{record.candidate_id}\0{1}\0"
+                f"{ReplacementReason.OTHER_IMAGE.value}"
+            ).encode()
+        ).hexdigest(),
+        json_pointer=None,
+        page_index=None,
+        node_index=None,
+        original_node_type=None,
+        kind=SecondaryResultKind.OTHER,
+        decision=ReplacementDecision.RETAINED,
+        reason=ReplacementReason.OTHER_IMAGE,
+        replacement_node_snapshot=None,
+    )
+    records = (record, extra)
+    publication = replace(
+        publication,
+        records=records,
+        replacement_count=1,
+        retained_count=1,
+    )
+    publication = _replace_task7_file(
+        publication,
+        "secondary_ocr_audit.json",
+        _canonical(
+            {
+                "task_id": "file-a",
+                "source_version": 1,
+                "output_version": 2,
+                "records": [
+                    _audit_document(item)["records"][0] for item in records
+                ],
+            }
+        ),
+    )
+    with pytest.raises(ArtifactFailure) as caught:
+        ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
+            result,
+            publication,
+            artifact_root=(tmp_path / "artifacts").absolute(),
+            batch_id="batch-a",
+            created_at=NOW,
+            expires_at=NOW + timedelta(hours=24),
+        )
+    assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
+
+
+def test_zip_rejects_unsafe_model_identifier_before_manifest_write(tmp_path: Path) -> None:
+    result, publication, _, record = _inputs(tmp_path)
+    planted = replace(record, model_versions={"pipeline": "C:/Clients/acme.pdf"})
+    publication = replace(publication, records=(planted,))
+    publication = _replace_task7_file(
+        publication,
+        "secondary_ocr_audit.json",
+        _canonical(_audit_document(planted)),
+    )
+    with pytest.raises(ArtifactFailure) as caught:
+        ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
+            result, publication, artifact_root=(tmp_path / "artifacts").absolute(), batch_id="batch-a",
+            created_at=NOW, expires_at=NOW + timedelta(hours=24),
+        )
+    assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
+    assert "acme.pdf" not in str(caught.value)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows stage lifecycle contract")
+def test_windows_cleanup_capability_failure_aborts_before_publication(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result, publication, _, _ = _inputs(tmp_path)
+    artifact_root = (tmp_path / "artifacts").absolute()
+    from ocr_mcp_server.services import artifacts as module
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("planted cleanup capability failure")
+
+    monkeypatch.setattr(module._PinnedArtifactRoot, "arm_stage_cleanup", unavailable)
+    with pytest.raises(ArtifactFailure) as caught:
+        ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
+            result,
+            publication,
+            artifact_root=artifact_root,
+            batch_id="batch-a",
+            created_at=NOW,
+            expires_at=NOW + timedelta(hours=24),
+        )
+    assert caught.value.code == ArtifactErrorCode.PUBLISH_FAILED.value
+    assert not list(artifact_root.glob("artifact-*.zip"))
+    assert not list(artifact_root.glob(".artifact-stage-*"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows stage lifecycle contract")
+def test_windows_native_cleanup_failure_uses_handle_bound_fallback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result, publication, _, _ = _inputs(tmp_path)
+    artifact_root = (tmp_path / "artifacts").absolute()
+    from ocr_mcp_server.services import artifacts as module
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("planted native disposition failure")
+
+    monkeypatch.setattr(module._PinnedArtifactRoot, "_set_stage_cleanup", unavailable)
+    with pytest.raises(ArtifactFailure) as caught:
+        ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
+            result,
+            publication,
+            artifact_root=artifact_root,
+            batch_id="batch-a",
+            created_at=NOW,
+            expires_at=NOW + timedelta(hours=24),
+        )
+    assert caught.value.code == ArtifactErrorCode.PUBLISH_FAILED.value
+    assert not list(artifact_root.glob("artifact-*.zip"))
+    assert not list(artifact_root.glob(".artifact-stage-*"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows stage lifecycle contract")
+def test_windows_double_cleanup_api_failure_scrubs_unpublished_stage(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result, publication, _, _ = _inputs(tmp_path)
+    artifact_root = (tmp_path / "artifacts").absolute()
+    from ocr_mcp_server.services import artifacts as module
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("planted disposition failure")
+
+    monkeypatch.setattr(module._PinnedArtifactRoot, "_set_stage_cleanup", unavailable)
+    monkeypatch.setattr(
+        module._PinnedArtifactRoot, "_set_stage_cleanup_extended", unavailable
+    )
+
+    artifact_root.mkdir(parents=True)
+    replacement = artifact_root / "attacker-replacement.bin"
+    replacement.write_bytes(b"must survive")
+
+    def forbidden_unlink(*_args, **_kwargs):
+        raise AssertionError("path cleanup must not run after handle cleanup fails")
+
+    monkeypatch.setattr(module.os, "unlink", forbidden_unlink)
+    with pytest.raises(ArtifactFailure) as caught:
+        ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
+            result,
+            publication,
+            artifact_root=artifact_root,
+            batch_id="batch-a",
+            created_at=NOW,
+            expires_at=NOW + timedelta(hours=24),
+        )
+    assert caught.value.code == ArtifactErrorCode.PUBLISH_FAILED.value
+    assert not list(artifact_root.glob("artifact-*.zip"))
+    stages = list(artifact_root.glob(".artifact-stage-*"))
+    assert len(stages) == 1
+    assert stages[0].read_bytes() == b""
+    assert replacement.read_bytes() == b"must survive"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows stage lifecycle contract")
+def test_windows_truncate_failure_uses_handle_scrub_and_always_closes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result, publication, _, _ = _inputs(tmp_path)
+    artifact_root = (tmp_path / "artifacts").absolute()
+    from ocr_mcp_server.services import artifacts as module
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("planted disposition failure")
+
+    attempted_descriptors: list[int] = []
+
+    def unavailable_truncate(descriptor: int, _size: int):
+        attempted_descriptors.append(descriptor)
+        raise OSError("planted ftruncate failure")
+
+    monkeypatch.setattr(module._PinnedArtifactRoot, "_set_stage_cleanup", unavailable)
+    monkeypatch.setattr(
+        module._PinnedArtifactRoot, "_set_stage_cleanup_extended", unavailable
+    )
+    monkeypatch.setattr(module.os, "ftruncate", unavailable_truncate)
+    with pytest.raises(ArtifactFailure) as caught:
+        ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
+            result,
+            publication,
+            artifact_root=artifact_root,
+            batch_id="batch-a",
+            created_at=NOW,
+            expires_at=NOW + timedelta(hours=24),
+        )
+    assert caught.value.code == ArtifactErrorCode.PUBLISH_FAILED.value
+    assert len(attempted_descriptors) == 1
+    descriptor = attempted_descriptors[0]
+    try:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+        stages = list(artifact_root.glob(".artifact-stage-*"))
+        assert len(stages) == 1
+        assert stages[0].read_bytes() == b""
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
 
 
 def test_publish_interruption_leaves_no_visible_target_or_stage(tmp_path: Path, monkeypatch) -> None:
     result, publication, _, _ = _inputs(tmp_path)
     artifact_root = (tmp_path / "artifacts").absolute()
+    from ocr_mcp_server.services import artifacts as module
 
     def interrupted(*_args, **_kwargs):
         raise OSError("planted path and content")
 
-    monkeypatch.setattr("ocr_mcp_server.services.artifacts.os.link", interrupted)
+    monkeypatch.setattr(module._PinnedArtifactRoot, "link_no_replace", interrupted)
     with pytest.raises(ArtifactFailure) as caught:
         ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)).publish(
             result, publication, artifact_root=artifact_root, batch_id="batch-a",
@@ -559,6 +972,71 @@ async def test_packaging_step_reports_exact_packaging_then_publishing_counters(t
 
 
 @pytest.mark.asyncio
+async def test_exact_retry_requires_fsync_before_repository_registration(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result, publication, _, _ = _inputs(tmp_path)
+    artifact_root = (tmp_path / "artifacts").absolute()
+    from ocr_mcp_server.services import artifacts as module
+
+    original_fsync = module._PinnedArtifactRoot.fsync
+    fsync_calls = 0
+
+    def fail_first_fsync(self):
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 1:
+            raise OSError("planted durability failure")
+        assert not list(artifact_root.glob(".artifact-stage-*"))
+        return original_fsync(self)
+
+    monkeypatch.setattr(module._PinnedArtifactRoot, "fsync", fail_first_fsync)
+
+    sentinel = object()
+
+    class Repository:
+        calls = 0
+
+        async def register(self, _bundle, _records):
+            self.calls += 1
+            return sentinel
+
+    class Progress:
+        async def report(self, _stage, _counters=None):
+            return None
+
+    class Cancellation:
+        def checkpoint(self):
+            return None
+
+    repository = Repository()
+    step = ArtifactPackagingStep(
+        ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000)),
+        repository,
+    )
+    arguments = dict(
+        artifact_root=artifact_root,
+        batch_id="batch-a",
+        created_at=NOW,
+        expires_at=NOW + timedelta(hours=24),
+        progress=Progress(),
+        cancellation=Cancellation(),
+    )
+    with pytest.raises(ArtifactFailure) as caught:
+        await step.run(result, publication, **arguments)
+    assert caught.value.code == ArtifactErrorCode.PUBLISH_FAILED.value
+    assert fsync_calls == 1
+    assert repository.calls == 0
+    assert len(list(artifact_root.glob("artifact-*.zip"))) == 1
+    assert not list(artifact_root.glob(".artifact-stage-*"))
+
+    assert await step.run(result, publication, **arguments) is sentinel
+    assert fsync_calls == 2
+    assert repository.calls == 1
+    assert not list(artifact_root.glob(".artifact-stage-*"))
+
+
+@pytest.mark.asyncio
 async def test_repository_rejects_content_planted_in_model_metadata_on_first_insert(tmp_path: Path, artifact_repository) -> None:
     repository, _, batch_id = artifact_repository
     result, publication, _, record = _inputs(tmp_path)
@@ -566,11 +1044,11 @@ async def test_repository_rejects_content_planted_in_model_metadata_on_first_ins
         result, publication, artifact_root=(tmp_path / "artifacts").absolute(), batch_id=batch_id,
         created_at=NOW, expires_at=NOW + timedelta(hours=24),
     )
-    unsafe = replace(record, model_versions={"pipeline": "client name.pdf\n/document text"})
+    unsafe = replace(record, model_versions={"pipeline": "C:/Clients/acme.pdf"})
     forged_digest = replacement_audit_metadata_sha256(batch_id, "file-a", (unsafe,))
     with pytest.raises(ArtifactFailure) as caught:
         await repository.register(
             replace(bundle, audit_metadata_sha256=forged_digest), (unsafe,)
         )
     assert caught.value.code == ArtifactErrorCode.INDEX_CONFLICT.value
-    assert "document text" not in str(caught.value)
+    assert "acme.pdf" not in str(caught.value)

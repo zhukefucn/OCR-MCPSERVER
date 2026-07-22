@@ -34,6 +34,7 @@ from .artifacts import (
     ArtifactSnapshot,
     ReplacementAuditMetadataSnapshot,
     replacement_audit_metadata_sha256,
+    validate_content_free_model_versions,
 )
 from .progress import ProgressCounters, ProgressUnit, map_stage_progress
 from .merge import (
@@ -114,6 +115,7 @@ __all__ = [
     "ReplacementAuditRecord",
     "ReplacementAuditMetadataSnapshot",
     "replacement_audit_metadata_sha256",
+    "validate_content_free_model_versions",
     "ReplacementDecision",
     "ReplacementReason",
     "RollbackPublicationResult",
