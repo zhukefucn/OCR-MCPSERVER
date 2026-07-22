@@ -467,6 +467,68 @@ def test_posix_confined_open_anchors_every_root_component(
     assert opened.parent_descriptor == open_calls[-1][1]
 
 
+def test_posix_confined_open_closes_parent_and_child_on_keyboard_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ocr_mcp_server.services.candidate_collection as module
+
+    root = (tmp_path / "published" / "parse" / "images").absolute()
+    candidate = root / "image.png"
+    opened_descriptors: list[int] = []
+    closed_descriptors: list[int] = []
+    fstat_calls = 0
+
+    def fake_open(path, flags, mode=0o777, *, dir_fd=None):
+        del path, flags, mode, dir_fd
+        descriptor = 100 + len(opened_descriptors)
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    def interrupt_child_validation(descriptor: int):
+        nonlocal fstat_calls
+        del descriptor
+        fstat_calls += 1
+        if fstat_calls == 2:
+            raise KeyboardInterrupt("cancel traversal")
+        return type("DirectoryStat", (), {"st_mode": os.stat(tmp_path).st_mode})()
+
+    monkeypatch.setattr(module.os, "open", fake_open)
+    monkeypatch.setattr(module.os, "fstat", interrupt_child_validation)
+    monkeypatch.setattr(module.os, "close", closed_descriptors.append)
+
+    with pytest.raises(KeyboardInterrupt, match="cancel traversal"):
+        module._open_posix_confined(candidate, root)
+
+    assert closed_descriptors == [opened_descriptors[1], opened_descriptors[0]]
+
+
+def test_windows_handle_conversion_closes_handle_on_system_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import msvcrt
+
+    import ocr_mcp_server.services.candidate_collection as module
+
+    closed_handles: list[int] = []
+
+    def interrupt_conversion(handle: int, flags: int):
+        del handle, flags
+        raise SystemExit("stop conversion")
+
+    monkeypatch.setattr(msvcrt, "open_osfhandle", interrupt_conversion)
+    monkeypatch.setattr(
+        module,
+        "_windows_close_handle",
+        closed_handles.append,
+        raising=False,
+    )
+
+    with pytest.raises(SystemExit, match="stop conversion"):
+        module._windows_handle_to_descriptor(321)
+
+    assert closed_handles == [321]
+
+
 @pytest.mark.parametrize("fault_stage", ["fstat", "fdopen_value", "close"])
 def test_descriptor_faults_are_normalized_without_retaining_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault_stage: str
@@ -609,6 +671,32 @@ def test_nonstandard_pillow_runtime_error_is_normalized_without_context(
     assert secret not in repr(exc_info.value)
     assert exc_info.value.__context__ is None
     assert exc_info.value.__cause__ is None
+
+
+def test_manifest_and_pillow_boundaries_do_not_swallow_base_exceptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ocr_mcp_server.services.candidate_collection as module
+
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(
+        module.json,
+        "loads",
+        lambda value: (_ for _ in ()).throw(KeyboardInterrupt("manifest cancelled")),
+    )
+    with pytest.raises(KeyboardInterrupt, match="manifest cancelled"):
+        module._read_manifest(manifest)
+
+    monkeypatch.setattr(
+        module.Image,
+        "open",
+        lambda value: (_ for _ in ()).throw(SystemExit("decode cancelled")),
+    )
+    with pytest.raises(SystemExit, match="decode cancelled"):
+        module._decode_image(
+            object(), expected_extension=".png", max_image_pixels=100
+        )
 
 
 def test_windows_containment_accepts_short_path_alias_of_canonical_root(

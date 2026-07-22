@@ -379,7 +379,7 @@ def _open_posix_confined(path: Path, root: Path) -> _OpenedCandidate:
             try:
                 if not stat.S_ISDIR(os.fstat(child).st_mode):
                     raise OSError("component is not a directory")
-            except Exception:
+            except BaseException:
                 _close_descriptor_ignoring_errors(child)
                 raise
             current = _transfer_directory_ownership(current, child)
@@ -395,7 +395,7 @@ def _open_posix_confined(path: Path, root: Path) -> _OpenedCandidate:
             initial_name_stat = os.stat(
                 final_name, dir_fd=current, follow_symlinks=False
             )
-        except Exception:
+        except BaseException:
             _close_descriptor_ignoring_errors(descriptor)
             raise
         return _OpenedCandidate(
@@ -405,7 +405,7 @@ def _open_posix_confined(path: Path, root: Path) -> _OpenedCandidate:
             parent_descriptor=current,
             final_name=final_name,
         )
-    except Exception:
+    except BaseException:
         _close_descriptor_ignoring_errors(current)
         raise
 
@@ -423,7 +423,6 @@ def _transfer_directory_ownership(current: int, child: int) -> int:
 def _windows_open_no_reparse(path: Path) -> int:
     import ctypes
     from ctypes import wintypes
-    import msvcrt
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     create_file = kernel32.CreateFileW
@@ -470,15 +469,28 @@ def _windows_open_no_reparse(path: Path) -> int:
         ctypes.byref(attribute_info),
         ctypes.sizeof(attribute_info),
     ) or attribute_info.FileAttributes & _FILE_ATTRIBUTE_REPARSE_POINT:
-        kernel32.CloseHandle(handle)
+        _windows_close_handle(int(handle))
         raise OSError("invalid reparse target")
+    return _windows_handle_to_descriptor(int(handle))
+
+
+def _windows_handle_to_descriptor(handle: int) -> int:
+    import msvcrt
+
     try:
         return msvcrt.open_osfhandle(
-            int(handle), os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            handle, os.O_RDONLY | getattr(os, "O_BINARY", 0)
         )
-    except Exception:
-        kernel32.CloseHandle(handle)
+    except BaseException:
+        _windows_close_handle(handle)
         raise
+
+
+def _windows_close_handle(handle: int) -> None:
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle(handle)
 
 
 def _assert_windows_descriptor_path(
