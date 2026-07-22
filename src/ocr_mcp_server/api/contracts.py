@@ -8,6 +8,7 @@ from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import (
+    AfterValidator,
     AnyHttpUrl,
     BaseModel,
     ConfigDict,
@@ -43,7 +44,9 @@ def _canonical_uuid(value: str) -> str:
     return canonical
 
 
-CanonicalId = Annotated[str, Field(min_length=36, max_length=36)]
+CanonicalId = Annotated[
+    str, Field(min_length=36, max_length=36), AfterValidator(_canonical_uuid)
+]
 
 
 class DocumentSource(StrictContract):

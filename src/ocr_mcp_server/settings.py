@@ -14,6 +14,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SecretStr,
     ValidationError,
     field_validator,
     model_validator,
@@ -45,6 +46,32 @@ class _SettingsSection(BaseModel):
 class ServerSettings(_SettingsSection):
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65535)
+
+
+class AuthenticationSettings(_SettingsSection):
+    """API keys remain secret in model representations and error paths."""
+
+    api_keys: list[SecretStr] = Field(default_factory=list, max_length=32)
+
+    @field_validator("api_keys", mode="before")
+    @classmethod
+    def validate_api_keys(cls, value: object) -> object:
+        if not isinstance(value, list):
+            raise ValueError("API keys must be a list")
+        canonical: list[str] = []
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, str):
+                raise ValueError("API keys must be strings")
+            if (
+                not 24 <= len(item) <= 256
+                or item.strip() != item
+                or any(ord(character) < 33 or ord(character) > 126 for character in item)
+            ):
+                raise ValueError("API key is malformed")
+            if item in canonical:
+                raise ValueError("API keys must be unique")
+            canonical.append(item)
+        return canonical
 
 
 class LimitsSettings(_SettingsSection):
@@ -303,6 +330,7 @@ class AppSettings(BaseSettings):
     )
 
     server: ServerSettings = Field(default_factory=ServerSettings)
+    auth: AuthenticationSettings = Field(default_factory=AuthenticationSettings)
     data_root: Path = Path("data")
     limits: LimitsSettings = Field(default_factory=LimitsSettings)
     remote_import: RemoteImportSettings = Field(default_factory=RemoteImportSettings)

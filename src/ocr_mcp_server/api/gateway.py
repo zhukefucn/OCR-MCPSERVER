@@ -23,8 +23,10 @@ class DocumentGateway(Protocol):
         self,
         content: AsyncIterable[bytes],
         *,
+        display_name: str,
         media_type: str,
         content_length: int | None,
+        idempotency_key: str | None,
     ) -> UploadReceipt: ...
 
     async def parse_documents(
@@ -69,6 +71,10 @@ class GatewayCapacityExceeded(GatewayFailure):
     safe_message = "The request exceeds a service capacity limit."
 
 
+class GatewayUploadTooLarge(GatewayCapacityExceeded):
+    """Transport-specific status while retaining the stable capacity code."""
+
+
 class GatewayUnavailable(GatewayFailure):
     code = "service_unavailable"
     safe_message = "The service is temporarily unavailable."
@@ -77,3 +83,8 @@ class GatewayUnavailable(GatewayFailure):
 class GatewayInvalidRequest(GatewayFailure):
     code = "invalid_request"
     safe_message = "The request is invalid."
+
+
+class GatewayUnsupportedMediaType(GatewayFailure):
+    code = "unsupported_media_type"
+    safe_message = "The document media type is not supported."

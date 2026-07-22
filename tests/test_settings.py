@@ -60,6 +60,20 @@ def test_settings_defaults_match_domain_constraints() -> None:
     assert settings.remote_import.max_redirects == 3
     assert settings.remote_import.timeout_seconds == 30
     assert settings.remote_import.max_image_pixels == 100_000_000
+    assert settings.auth.api_keys == []
+
+
+def test_authentication_keys_are_secret_and_reject_unsafe_values() -> None:
+    secret = "a-secure-api-key-0000000000000001"
+    settings = AppSettings(auth={"api_keys": [secret]})
+
+    assert settings.auth.api_keys[0].get_secret_value() == secret
+    assert secret not in repr(settings)
+    assert secret not in str(settings.model_dump())
+
+    for keys in ([""], ["short"], [secret, secret], [True]):
+        with pytest.raises(ValidationError):
+            AppSettings(auth={"api_keys": keys})
 
 
 @pytest.mark.parametrize(

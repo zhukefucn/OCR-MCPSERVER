@@ -2,6 +2,10 @@ server:
   host: 127.0.0.1
   port: 8000
 
+auth:
+  # Configure through OCR_AUTH__API_KEYS in production; empty means fail closed.
+  api_keys: []
+
 data_root: data
 
 database:
