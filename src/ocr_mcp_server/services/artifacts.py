@@ -712,29 +712,27 @@ class _PinnedArtifactRoot:
             try:
                 renameat2 = libc.renameat2
             except AttributeError:
-                renameat2 = None
-            if renameat2 is not None:
-                renameat2.argtypes = (
-                    ctypes.c_int,
-                    ctypes.c_char_p,
-                    ctypes.c_int,
-                    ctypes.c_char_p,
-                    ctypes.c_uint,
-                )
-                renameat2.restype = ctypes.c_int
-                if renameat2(
-                    self.descriptor,
-                    os.fsencode(stage_name),
-                    self.descriptor,
-                    os.fsencode(target_name),
-                    1,
-                ) == 0:
-                    return
-                error_number = ctypes.get_errno()
-                if error_number == errno.EEXIST:
-                    raise FileExistsError(error_number, os.strerror(error_number))
-                if error_number not in {errno.ENOSYS, errno.EINVAL}:
-                    raise OSError(error_number, os.strerror(error_number))
+                raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS)) from None
+            renameat2.argtypes = (
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            renameat2.restype = ctypes.c_int
+            if renameat2(
+                self.descriptor,
+                os.fsencode(stage_name),
+                self.descriptor,
+                os.fsencode(target_name),
+                1,
+            ) == 0:
+                return
+            error_number = ctypes.get_errno()
+            if error_number == errno.EEXIST:
+                raise FileExistsError(error_number, os.strerror(error_number))
+            raise OSError(error_number, os.strerror(error_number))
         linkat = libc.linkat
         linkat.argtypes = (
             ctypes.c_int,
@@ -751,7 +749,6 @@ class _PinnedArtifactRoot:
             os.fsencode(target_name),
             0x1000,
         ) == 0:
-            self.unlink_stage(stage_descriptor, stage_name)
             return
         error_number = ctypes.get_errno()
         if error_number in {errno.ENOENT, errno.EPERM, errno.EACCES}:
@@ -763,24 +760,11 @@ class _PinnedArtifactRoot:
                 os.fsencode(target_name),
                 0x400,
             ) == 0:
-                self.unlink_stage(stage_descriptor, stage_name)
                 return
             error_number = ctypes.get_errno()
         if error_number == errno.EEXIST:
             raise FileExistsError(error_number, os.strerror(error_number))
         raise OSError(error_number, os.strerror(error_number))
-
-    def unlink_stage(self, stage_descriptor: int, stage_name: str | None) -> None:
-        if stage_name is None or self.descriptor is None:
-            return
-        try:
-            opened = os.fstat(stage_descriptor)
-            named = self._named_stat(stage_name)
-        except FileNotFoundError:
-            return
-        if not _same_object(opened, named):
-            return
-        os.unlink(stage_name, dir_fd=self.descriptor)
 
     def arm_stage_cleanup(self, stage_descriptor: int, stage_name: str | None) -> None:
         if stage_name is None:
@@ -855,7 +839,6 @@ class _PinnedArtifactRoot:
             return
         if self.descriptor is not None:
             self.scrub_stage(stage_descriptor)
-            self.unlink_stage(stage_descriptor, stage_name)
             return
         try:
             self._set_stage_cleanup(stage_descriptor, True)

@@ -300,3 +300,38 @@ returned `READY` with no Critical, Important, or Minor findings. Its independent
 Windows artifact run completed with `58 passed, 5 skipped`.
 
 No push or deployment was performed.
+
+## Named-stage cleanup TOCTOU closure (2026-07-22)
+
+Controller review of `df8d6d5` demonstrated that checking a live stage-name inode and
+then unlinking that name is not safe: a deterministic swap between `stat` and `unlink`
+caused cleanup to delete an attacker replacement. This supersedes the preceding
+overlay-closure claim that inode-checked path removal was safe.
+
+POSIX named-stage cleanup is now path-inert. Failure and exact-retry cleanup scrub only
+the owned open descriptor and may leave a randomized, content-free stage name. It
+never deletes a name that could have been replaced. Tests distinguish this safe
+zero-byte residue from a visible final artifact or leaked business content.
+
+Named POSIX publication now succeeds only through the genuinely atomic
+`renameat2(..., RENAME_NOREPLACE)` path. A missing symbol, `ENOSYS`, `EINVAL`, or any
+other rename error fails publication safely; there is no named `linkat` plus unlink
+fallback. Anonymous stages retain descriptor-bound `linkat(AT_EMPTY_PATH)` and the
+restricted `/proc/self/fd` form because they have no source pathname to clean up.
+Target no-replace behavior and final descriptor-bound size, SHA-256, manifest, name,
+inode, and `publication_identity` validation remain unchanged.
+
+Strict TDD and verification evidence:
+
+1. Before the fix, a deterministic swap after named stat and before unlink deleted the
+   replacement (`FileNotFoundError` at the preservation assertion).
+2. Before the fix, the missing-`renameat2` case attempted the forbidden non-atomic
+   fallback instead of returning `ENOSYS`.
+3. Linux overlay focused run: `4 passed, 62 deselected`.
+4. Linux overlay artifact suite: `61 passed, 5 skipped in 1.39s`.
+5. Linux overlay full suite: `677 passed, 11 skipped in 9.20s`.
+6. Windows artifact suite: `58 passed, 8 skipped in 1.82s`.
+7. Windows full suite: `675 passed, 13 skipped in 9.68s`.
+8. `pip check`, `compileall -q src tests`, and `git diff --check`: exit 0.
+
+No push or deployment was performed.

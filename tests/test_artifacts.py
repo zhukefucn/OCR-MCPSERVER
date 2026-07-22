@@ -826,7 +826,7 @@ def test_windows_truncate_failure_uses_handle_scrub_and_always_closes(
             pass
 
 
-def test_publish_interruption_leaves_no_visible_target_or_stage(tmp_path: Path, monkeypatch) -> None:
+def test_publish_interruption_leaves_no_visible_target_or_stage_content(tmp_path: Path, monkeypatch) -> None:
     result, publication, _, _ = _inputs(tmp_path)
     artifact_root = (tmp_path / "artifacts").absolute()
     from ocr_mcp_server.services import artifacts as module
@@ -841,8 +841,11 @@ def test_publish_interruption_leaves_no_visible_target_or_stage(tmp_path: Path, 
             created_at=NOW, expires_at=NOW + timedelta(hours=24),
         )
     assert caught.value.code == ArtifactErrorCode.PUBLISH_FAILED.value
-    assert not list(artifact_root.rglob("*.zip"))
-    assert not list(artifact_root.rglob(".artifact-stage-*"))
+    assert not list(artifact_root.rglob("artifact-*.zip"))
+    assert all(
+        stage.read_bytes() == b""
+        for stage in artifact_root.rglob(".artifact-stage-*")
+    )
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX anonymous publication contract")
@@ -885,6 +888,9 @@ def test_posix_publication_falls_back_when_empty_path_link_is_restricted(
     with module._PinnedArtifactRoot(root, os.lstat(root)) as pinned:
         descriptor, stage_name, _stage_path = pinned.create_stage()
         try:
+            if stage_name is not None:
+                pinned.force_stage_cleanup(descriptor, stage_name)
+                pytest.skip("backing filesystem does not provide anonymous staging")
             os.write(descriptor, b"descriptor-bound-stage")
             os.fsync(descriptor)
             pinned.link_no_replace(descriptor, stage_name, "published.zip")
@@ -942,7 +948,7 @@ def test_posix_publication_falls_back_when_otmpfile_is_unsupported(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX named publication fallback")
-def test_posix_named_stage_cleanup_removes_only_the_owned_name(
+def test_posix_named_stage_cleanup_scrubs_owned_inode_without_path_deletion(
     tmp_path: Path, monkeypatch
 ) -> None:
     from ocr_mcp_server.services import artifacts as module
@@ -966,13 +972,13 @@ def test_posix_named_stage_cleanup_removes_only_the_owned_name(
             os.fsync(descriptor)
             pinned.force_stage_cleanup(descriptor, stage_name)
             assert os.fstat(descriptor).st_size == 0
-            assert not (root / stage_name).exists()
+            assert (root / stage_name).read_bytes() == b""
         finally:
             os.close(descriptor)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX named publication fallback")
-def test_posix_named_publication_does_not_require_renameat2(
+def test_posix_named_cleanup_name_swap_before_unlink_preserves_replacement(
     tmp_path: Path, monkeypatch
 ) -> None:
     from ocr_mcp_server.services import artifacts as module
@@ -981,36 +987,70 @@ def test_posix_named_publication_does_not_require_renameat2(
     root.mkdir()
     real_open = module.os.open
     temporary_flag = getattr(module.os, "O_TMPFILE", 0)
-    real_libc = module.ctypes.CDLL(None, use_errno=True)
-    real_linkat = real_libc.linkat
-    real_linkat.argtypes = (
-        module.ctypes.c_int,
-        module.ctypes.c_char_p,
-        module.ctypes.c_int,
-        module.ctypes.c_char_p,
-        module.ctypes.c_int,
-    )
-    real_linkat.restype = module.ctypes.c_int
-    calls: list[tuple[bytes, int]] = []
 
     def without_otmpfile(path, flags, *args, **kwargs):
         if temporary_flag and flags & temporary_flag == temporary_flag:
             raise OSError(errno.EOPNOTSUPP, "planted unsupported anonymous stage")
         return real_open(path, flags, *args, **kwargs)
 
-    class RestrictedLinkAt:
-        argtypes = None
-        restype = None
+    monkeypatch.setattr(module.os, "open", without_otmpfile)
+    with module._PinnedArtifactRoot(root, os.lstat(root)) as pinned:
+        descriptor, stage_name, _stage_path = pinned.create_stage()
+        assert stage_name is not None
+        moved = root / ".attacker-moved-owned-stage"
+        replacement = b"attacker replacement must survive"
+        original_named_stat = module._PinnedArtifactRoot._named_stat
+        swapped = False
 
-        def __call__(self, source_fd, source_name, root_fd, target_name, flags):
-            calls.append((source_name, flags))
-            if source_name == b"":
-                module.ctypes.set_errno(errno.ENOENT)
-                return -1
-            return real_linkat(source_fd, source_name, root_fd, target_name, flags)
+        def swap_after_named_stat(self, name):
+            nonlocal swapped
+            value = original_named_stat(self, name)
+            if name == stage_name and not swapped:
+                os.rename(root / stage_name, moved)
+                (root / stage_name).write_bytes(replacement)
+                swapped = True
+            return value
+
+        try:
+            os.write(descriptor, b"verified stage content")
+            os.fsync(descriptor)
+            monkeypatch.setattr(
+                module._PinnedArtifactRoot,
+                "_named_stat",
+                swap_after_named_stat,
+            )
+            pinned.force_stage_cleanup(descriptor, stage_name)
+            if not swapped:
+                os.rename(root / stage_name, moved)
+                (root / stage_name).write_bytes(replacement)
+                swapped = True
+            assert os.fstat(descriptor).st_size == 0
+            assert moved.read_bytes() == b""
+            assert (root / stage_name).read_bytes() == replacement
+        finally:
+            os.close(descriptor)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX named publication fallback")
+def test_posix_named_publication_fails_safely_without_renameat2(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from ocr_mcp_server.services import artifacts as module
+
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    real_open = module.os.open
+    temporary_flag = getattr(module.os, "O_TMPFILE", 0)
+    def without_otmpfile(path, flags, *args, **kwargs):
+        if temporary_flag and flags & temporary_flag == temporary_flag:
+            raise OSError(errno.EOPNOTSUPP, "planted unsupported anonymous stage")
+        return real_open(path, flags, *args, **kwargs)
 
     class LibCWithoutRenameAt2:
-        linkat = RestrictedLinkAt()
+        def __getattr__(self, name):
+            if name == "renameat2":
+                raise AttributeError(name)
+            raise AssertionError(f"unexpected non-atomic fallback: {name}")
 
     monkeypatch.setattr(module.os, "open", without_otmpfile)
     monkeypatch.setattr(
@@ -1024,21 +1064,15 @@ def test_posix_named_publication_does_not_require_renameat2(
         try:
             os.write(descriptor, b"descriptor-bound-stage")
             os.fsync(descriptor)
-            pinned.link_no_replace(descriptor, stage_name, "published.zip")
-            assert module._same_object(
-                os.fstat(descriptor),
-                os.stat(
-                    "published.zip",
-                    dir_fd=pinned.descriptor,
-                    follow_symlinks=False,
-                ),
-            )
+            with pytest.raises(OSError) as caught:
+                pinned.link_no_replace(descriptor, stage_name, "published.zip")
+            assert caught.value.errno == errno.ENOSYS
+            pinned.force_stage_cleanup(descriptor, stage_name)
         finally:
             os.close(descriptor)
-    assert calls[0] == (b"", 0x1000)
-    assert calls[1][0].startswith(b"/proc/self/fd/") and calls[1][1] == 0x400
-    assert (root / "published.zip").read_bytes() == b"descriptor-bound-stage"
-    assert not list(root.glob(".artifact-stage-*"))
+    assert not (root / "published.zip").exists()
+    stages = list(root.glob(".artifact-stage-*"))
+    assert len(stages) == 1 and stages[0].read_bytes() == b""
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX named publication fallback")
@@ -1868,12 +1902,18 @@ async def test_exact_retry_requires_fsync_before_repository_registration(
     assert repository.calls == 0
     assert repository.released == 1
     assert len(list((artifact_root / BATCH_ID).glob("artifact-*.zip"))) == 1
-    assert not list((artifact_root / BATCH_ID).glob(".artifact-stage-*"))
+    assert all(
+        stage.read_bytes() == b""
+        for stage in (artifact_root / BATCH_ID).glob(".artifact-stage-*")
+    )
 
     assert await step.run(result, publication, **arguments) is sentinel
     assert fsync_calls == 2
     assert repository.calls == 1
-    assert not list((artifact_root / BATCH_ID).glob(".artifact-stage-*"))
+    assert all(
+        stage.read_bytes() == b""
+        for stage in (artifact_root / BATCH_ID).glob(".artifact-stage-*")
+    )
 
 
 @pytest.mark.asyncio
