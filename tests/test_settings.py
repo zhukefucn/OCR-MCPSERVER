@@ -26,6 +26,18 @@ def test_settings_defaults_match_domain_constraints() -> None:
     assert settings.retention.result_hours == 24
     assert settings.retention.audit_metadata_days == 30
     assert settings.mineru.backend == "vlm-http-client"
+    assert settings.mineru.connect_timeout_seconds == 10
+    assert settings.mineru.read_timeout_seconds == 60
+    assert settings.mineru.write_timeout_seconds == 60
+    assert settings.mineru.pool_timeout_seconds == 10
+    assert settings.mineru.task_deadline_seconds == 900
+    assert settings.mineru.poll_interval_seconds == 1
+    assert settings.mineru.retry_attempts == 3
+    assert settings.mineru.retry_backoff_seconds == 0.5
+    assert settings.mineru.retry_max_backoff_seconds == 8
+    assert settings.mineru.max_compressed_bytes == 512 * 1024 * 1024
+    assert settings.mineru.max_uncompressed_bytes == 2 * 1024**3
+    assert settings.mineru.max_archive_entries == 10_000
     assert settings.secondary_ocr.engine is SecondaryOCREngine.PP_STRUCTURE_V3
     assert settings.database.url == "sqlite+aiosqlite:///data/ocr.sqlite3"
     assert settings.database.busy_timeout_ms == 5000
@@ -187,3 +199,86 @@ def test_load_settings_rejects_a_changed_mineru_backend_without_leaking_it(
 
     assert str(exc_info.value) == "Service configuration is invalid."
     assert sensitive_value not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("connect_timeout_seconds", 0),
+        ("read_timeout_seconds", 0),
+        ("write_timeout_seconds", 0),
+        ("pool_timeout_seconds", 0),
+        ("task_deadline_seconds", 0),
+        ("poll_interval_seconds", 0),
+        ("retry_attempts", -1),
+        ("retry_attempts", 11),
+        ("retry_backoff_seconds", 0),
+        ("retry_max_backoff_seconds", 0),
+        ("max_compressed_bytes", 0),
+        ("max_uncompressed_bytes", 0),
+        ("max_archive_entries", 0),
+    ],
+)
+def test_mineru_rejects_invalid_timeout_retry_and_archive_limits(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(mineru={field: value})
+
+
+def test_mineru_rejects_retry_backoff_cap_below_initial_delay() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(
+            mineru={
+                "retry_backoff_seconds": 2,
+                "retry_max_backoff_seconds": 1,
+            }
+        )
+
+
+def test_example_yaml_documents_mineru_adapter_defaults() -> None:
+    mineru = load_settings(config_file=Path("config/example.yaml")).mineru
+
+    assert mineru.backend == "vlm-http-client"
+    assert mineru.connect_timeout_seconds == 10
+    assert mineru.read_timeout_seconds == 60
+    assert mineru.write_timeout_seconds == 60
+    assert mineru.pool_timeout_seconds == 10
+    assert mineru.task_deadline_seconds == 900
+    assert mineru.poll_interval_seconds == 1
+    assert mineru.retry_attempts == 3
+    assert mineru.retry_backoff_seconds == 0.5
+    assert mineru.retry_max_backoff_seconds == 8
+    assert mineru.max_compressed_bytes == 512 * 1024 * 1024
+    assert mineru.max_uncompressed_bytes == 2 * 1024**3
+    assert mineru.max_archive_entries == 10_000
+
+
+def test_project_metadata_has_no_local_mineru_or_torch_dependency() -> None:
+    metadata = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    dependencies = [
+        item.lower()
+        for group in (
+            metadata["project"]["dependencies"],
+            metadata["project"]["optional-dependencies"]["dev"],
+        )
+        for item in group
+    ]
+
+    assert not any(
+        item.startswith(("mineru", "torch", "transformers", "vllm"))
+        for item in dependencies
+    )
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "https://user:password@api.example.test",
+        "https://api.example.test/tasks?secret=value",
+        "https://api.example.test/tasks#secret",
+    ],
+)
+def test_mineru_api_base_rejects_credentials_query_and_fragment(api_url: str) -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(mineru={"api_url": api_url})

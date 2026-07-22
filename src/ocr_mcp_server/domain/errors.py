@@ -95,3 +95,45 @@ class FileIntakeFailure(DomainError):
         self.code = code.value
         self.safe_message = _FILE_INTAKE_SAFE_MESSAGES[code]
         Exception.__init__(self, self.safe_message)
+
+
+class MinerUErrorCode(StrEnum):
+    """Stable machine codes for failures at the MinerU boundary."""
+
+    UNAVAILABLE = "mineru_unavailable"
+    AMBIGUOUS_SUBMISSION = "mineru_submission_ambiguous"
+    DEADLINE_EXCEEDED = "mineru_deadline_exceeded"
+    UPSTREAM_FAILURE = "mineru_upstream_failed"
+    INVALID_RESPONSE = "mineru_response_invalid"
+    UNSAFE_ARCHIVE = "mineru_archive_unsafe"
+
+
+_MINERU_SAFE_MESSAGES = {
+    MinerUErrorCode.UNAVAILABLE: "The document parsing service is unavailable.",
+    MinerUErrorCode.AMBIGUOUS_SUBMISSION: "The document submission outcome is uncertain.",
+    MinerUErrorCode.DEADLINE_EXCEEDED: "The document parsing deadline was exceeded.",
+    MinerUErrorCode.UPSTREAM_FAILURE: "The document parsing service rejected or failed the task.",
+    MinerUErrorCode.INVALID_RESPONSE: "The document parsing service returned an invalid response.",
+    MinerUErrorCode.UNSAFE_ARCHIVE: "The document parsing result archive is unsafe or too large.",
+}
+
+
+class MinerUFailure(DomainError):
+    """A safe MinerU error that never retains an unsafe upstream cause."""
+
+    def __init__(
+        self,
+        code: MinerUErrorCode,
+        *,
+        retry_file_task_safe: bool | None = None,
+        cause: BaseException | None = None,
+    ) -> None:
+        del cause
+        self.code = code.value
+        self.safe_message = _MINERU_SAFE_MESSAGES[code]
+        self.retry_file_task_safe = (
+            code is MinerUErrorCode.UNAVAILABLE
+            if retry_file_task_safe is None
+            else retry_file_task_safe
+        )
+        Exception.__init__(self, self.safe_message)

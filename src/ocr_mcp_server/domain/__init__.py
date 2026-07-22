@@ -7,6 +7,8 @@ from .errors import (
     FileIntakeFailure,
     InputValidationError,
     LeaseConflictError,
+    MinerUErrorCode,
+    MinerUFailure,
     PersistenceError,
     StateTransitionError,
 )
@@ -18,6 +20,13 @@ from .models import (
     SecondaryOCREngine,
     new_id,
     utc_now,
+)
+from .mineru import (
+    MinerUDocumentResult,
+    MinerUParseRequest,
+    MinerUProgress,
+    MinerUProgressStatus,
+    MinerUSubmission,
 )
 from .tasks import BatchSnapshot, CreateBatchResult, FileTaskSnapshot, LeaseClaim
 
@@ -33,6 +42,13 @@ __all__ = [
     "IncomingFile",
     "LeaseClaim",
     "LeaseConflictError",
+    "MinerUDocumentResult",
+    "MinerUErrorCode",
+    "MinerUFailure",
+    "MinerUParseRequest",
+    "MinerUProgress",
+    "MinerUProgressStatus",
+    "MinerUSubmission",
     "PersistenceError",
     "ProcessingStage",
     "SecondaryOCREngine",

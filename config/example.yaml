@@ -30,6 +30,18 @@ mineru:
   api_url: http://127.0.0.1:8001
   vlm_server_url: http://127.0.0.1:30000
   backend: vlm-http-client
+  connect_timeout_seconds: 10
+  read_timeout_seconds: 60
+  write_timeout_seconds: 60
+  pool_timeout_seconds: 10
+  task_deadline_seconds: 900
+  poll_interval_seconds: 1
+  retry_attempts: 3
+  retry_backoff_seconds: 0.5
+  retry_max_backoff_seconds: 8
+  max_compressed_bytes: 536870912
+  max_uncompressed_bytes: 2147483648
+  max_archive_entries: 10000
 
 secondary_ocr:
   engine: pp_structure_v3

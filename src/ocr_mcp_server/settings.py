@@ -16,6 +16,7 @@ from pydantic import (
     Field,
     ValidationError,
     field_validator,
+    model_validator,
 )
 from pydantic_settings import (
     BaseSettings,
@@ -103,6 +104,31 @@ class MinerUSettings(_SettingsSection):
     api_url: AnyHttpUrl = AnyHttpUrl("http://127.0.0.1:8001")
     vlm_server_url: AnyHttpUrl = AnyHttpUrl("http://127.0.0.1:30000")
     backend: Literal["vlm-http-client"] = "vlm-http-client"
+    connect_timeout_seconds: float = Field(default=10, gt=0)
+    read_timeout_seconds: float = Field(default=60, gt=0)
+    write_timeout_seconds: float = Field(default=60, gt=0)
+    pool_timeout_seconds: float = Field(default=10, gt=0)
+    task_deadline_seconds: float = Field(default=900, gt=0)
+    poll_interval_seconds: float = Field(default=1, gt=0)
+    retry_attempts: int = Field(default=3, ge=0, le=10)
+    retry_backoff_seconds: float = Field(default=0.5, gt=0)
+    retry_max_backoff_seconds: float = Field(default=8, gt=0)
+    max_compressed_bytes: int = Field(default=512 * 1024 * 1024, ge=1)
+    max_uncompressed_bytes: int = Field(default=2 * 1024**3, ge=1)
+    max_archive_entries: int = Field(default=10_000, ge=1)
+
+    @field_validator("api_url")
+    @classmethod
+    def require_safe_api_base(cls, value: AnyHttpUrl) -> AnyHttpUrl:
+        if value.username or value.password or value.query or value.fragment:
+            raise ValueError("MinerU API URL must be an origin and path only")
+        return value
+
+    @model_validator(mode="after")
+    def validate_retry_backoff(self) -> MinerUSettings:
+        if self.retry_max_backoff_seconds < self.retry_backoff_seconds:
+            raise ValueError("retry backoff cap must not be below its initial delay")
+        return self
 
 
 class SecondaryOCRSettings(_SettingsSection):
