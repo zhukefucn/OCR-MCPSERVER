@@ -15,6 +15,7 @@ ASGIApp = Callable[
     [dict[str, Any], Callable[[], Awaitable[dict[str, Any]]], Callable[[dict[str, Any]], Awaitable[None]]],
     Awaitable[None],
 ]
+_AUTH_BYPASS_PATHS = frozenset({"/health/live", "/health/ready", "/metrics"})
 
 
 class ApiKeyAuthMiddleware:
@@ -32,7 +33,7 @@ class ApiKeyAuthMiddleware:
             await self.app(scope, receive, send)
             return
         path = scope.get("path", "")
-        if path == "/health/live":
+        if path in _AUTH_BYPASS_PATHS:
             await self.app(scope, receive, send)
             return
         if not self._key_digests:

@@ -29,6 +29,45 @@ def test_liveness_is_public_and_contains_no_configuration_detail() -> None:
     assert response.json() == {"status": "ok"}
 
 
+def test_auth_bypass_is_exactly_the_three_observability_paths() -> None:
+    gateway = CountingGateway()
+    with _client([], gateway) as client:
+        public = [
+            client.get("/health/live"),
+            client.get("/health/ready"),
+            client.get("/metrics"),
+        ]
+        protected = [
+            client.get("/health/live/"),
+            client.get("/health/live-extra"),
+            client.get("/prefix/health/live"),
+            client.get("//health/live"),
+            client.get("/health/ready/"),
+            client.get("/metrics/"),
+            client.get("/metrics.json"),
+            client.post("/mcp"),
+            client.get(f"/v1/tasks/{uuid4()}"),
+        ]
+
+    assert [response.status_code for response in public] == [200, 404, 200]
+    assert all(response.status_code == 503 for response in protected)
+    assert all(
+        response.json()["error"]["code"] == "authentication_unavailable"
+        for response in protected
+    )
+    assert gateway.calls == 0
+
+
+def test_query_strings_do_not_expand_or_disable_the_exact_path_bypass() -> None:
+    with _client([], CountingGateway()) as client:
+        public = client.get("/metrics?token=private-query-value")
+        protected = client.get("/metrics.json?path=/metrics")
+
+    assert public.status_code == 200
+    assert protected.status_code == 503
+    assert "private-query-value" not in public.text
+
+
 def test_protected_api_fails_closed_when_no_key_is_configured() -> None:
     gateway = CountingGateway()
     with _client([], gateway) as client:

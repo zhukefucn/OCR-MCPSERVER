@@ -1,0 +1,167 @@
+"""Content-free structured event logging."""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from enum import StrEnum
+from uuid import UUID
+
+from ocr_mcp_server.domain.models import ProcessingStage
+
+
+_MAX_COUNT = 1_000_000
+_ERROR_CODES = frozenset(
+    {
+        "authentication_failed",
+        "authentication_unavailable",
+        "capacity_exceeded",
+        "conflict",
+        "internal_error",
+        "invalid_request",
+        "not_found",
+        "orientation_uncertain",
+        "service_unavailable",
+        "unsupported_media_type",
+    }
+)
+
+
+class SafeLogEventName(StrEnum):
+    HTTP_REQUEST_COMPLETED = "http_request_completed"
+    TASK_COMPLETED = "task_completed"
+    PIPELINE_STAGE_COMPLETED = "pipeline_stage_completed"
+    RECOVERY_COMPLETED = "recovery_completed"
+    READINESS_CHECKED = "readiness_checked"
+    OBSERVABILITY_FAILURE = "observability_failure"
+
+
+def _invalid() -> ValueError:
+    return ValueError("invalid log event")
+
+
+def _canonical_id(value: object) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = UUID(value)
+    except (ValueError, AttributeError):
+        return False
+    return str(parsed) == value
+
+
+def _count(value: object) -> bool:
+    return (
+        value is None
+        or (
+            not isinstance(value, bool)
+            and isinstance(value, int)
+            and 0 <= value <= _MAX_COUNT
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SafeLogEvent:
+    """A finite event whose fields cannot carry arbitrary business content."""
+
+    event: SafeLogEventName
+    batch_id: str | None = None
+    file_id: str | None = None
+    recovery_id: str | None = None
+    stage: ProcessingStage | None = None
+    error_code: str | None = None
+    duration_ms: float | None = None
+    item_count: int | None = None
+    success_count: int | None = None
+    failure_count: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.event, SafeLogEventName):
+            raise _invalid()
+        if not all(
+            _canonical_id(value)
+            for value in (self.batch_id, self.file_id, self.recovery_id)
+        ):
+            raise _invalid()
+        if self.stage is not None and not isinstance(self.stage, ProcessingStage):
+            raise _invalid()
+        if self.error_code is not None and (
+            not isinstance(self.error_code, str)
+            or self.error_code not in _ERROR_CODES
+        ):
+            raise _invalid()
+        if self.duration_ms is not None and (
+            isinstance(self.duration_ms, bool)
+            or not isinstance(self.duration_ms, (int, float))
+            or not math.isfinite(self.duration_ms)
+            or self.duration_ms < 0
+        ):
+            raise _invalid()
+        if not all(
+            _count(value)
+            for value in (self.item_count, self.success_count, self.failure_count)
+        ):
+            raise _invalid()
+
+
+class JsonEventFormatter(logging.Formatter):
+    """Format only the validated event attached by :class:`SafeEventLogger`."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        event = getattr(record, "safe_event", None)
+        if not isinstance(event, SafeLogEvent):
+            event = SafeLogEvent(event=SafeLogEventName.OBSERVABILITY_FAILURE)
+        payload: dict[str, object] = {
+            "timestamp": datetime.fromtimestamp(record.created, UTC)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z"),
+            "level": record.levelname
+            if record.levelname in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+            else "INFO",
+        }
+        for key, value in asdict(event).items():
+            if value is None:
+                continue
+            payload[key] = value.value if isinstance(value, StrEnum) else value
+        return json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+
+
+class SafeEventLogger:
+    """Emit validated events without allowing logging failures to escape."""
+
+    def __init__(self, logger: logging.Logger) -> None:
+        if not isinstance(logger, logging.Logger):
+            raise ValueError("invalid logger")
+        self._logger = logger
+
+    def emit(self, event: SafeLogEvent) -> None:
+        if not isinstance(event, SafeLogEvent):
+            raise _invalid()
+        try:
+            record = self._logger.makeRecord(
+                self._logger.name,
+                logging.INFO,
+                "",
+                0,
+                "",
+                (),
+                None,
+            )
+            record.safe_event = event
+            self._logger.handle(record)
+        except Exception:
+            return
+
+
+__all__ = [
+    "JsonEventFormatter",
+    "SafeEventLogger",
+    "SafeLogEvent",
+    "SafeLogEventName",
+]
