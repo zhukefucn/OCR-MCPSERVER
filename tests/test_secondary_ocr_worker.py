@@ -22,6 +22,14 @@ from ocr_mcp_server.domain import (
 )
 
 
+class QueueObservability:
+    def __init__(self) -> None:
+        self.depths = []
+
+    def set_secondary_ocr_queue_depth(self, depth):
+        self.depths.append(depth)
+
+
 def _candidate(tmp_path: Path, name: str = "one") -> ImageCandidate:
     path = tmp_path / f"{name}.png"
     path.write_bytes(b"not-read-by-worker")
@@ -125,6 +133,33 @@ async def test_worker_serializes_fifo_and_enforces_waiting_queue_bound(
     await asyncio.gather(first, second)
     await worker.close()
     assert [entry[2] for entry in events if entry[0] == "recognize"] == ["one", "two"]
+
+
+@pytest.mark.asyncio
+async def test_worker_queue_gauge_counts_waiters_not_active_or_stop(tmp_path: Path) -> None:
+    from ocr_mcp_server.infra.secondary_ocr import SingleOwnerSecondaryOcrWorker
+
+    entered, release = threading.Event(), threading.Event()
+    observations = QueueObservability()
+    worker = SingleOwnerSecondaryOcrWorker(
+        lambda: _Backend(entered, release, []), queue_capacity=1,
+        observability=observations,
+    )
+    await worker.start()
+    first = asyncio.create_task(worker.recognize(_candidate(tmp_path, "one")))
+    assert await asyncio.to_thread(entered.wait, 2)
+    assert worker.queue_depth == 0
+    second = asyncio.create_task(worker.recognize(_candidate(tmp_path, "two")))
+    await asyncio.sleep(0)
+    assert worker.queue_depth == 1
+    second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await second
+    release.set()
+    await first
+    await worker.close()
+    assert observations.depths[-1] == worker.queue_depth == 0
+    assert 1 in observations.depths
 
 
 @pytest.mark.asyncio

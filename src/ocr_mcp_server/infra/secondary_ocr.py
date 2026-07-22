@@ -17,6 +17,7 @@ from ..domain import (
     SecondaryOcrFailure,
     SecondaryOcrResult,
 )
+from ..services.observability import NullObservability, ObservabilitySink, best_effort
 
 
 class SynchronousSecondaryOcrBackend(Protocol):
@@ -55,10 +56,14 @@ class SingleOwnerSecondaryOcrWorker:
         backend_factory: Callable[[], SynchronousSecondaryOcrBackend],
         *,
         queue_capacity: int,
+        observability: ObservabilitySink | None = None,
     ) -> None:
         if isinstance(queue_capacity, bool) or queue_capacity < 1:
             raise ValueError("queue capacity must be positive")
         self._factory = backend_factory
+        self._observability = (
+            observability if observability is not None else NullObservability()
+        )
         self._queue: Queue[_Job | object] = Queue(maxsize=queue_capacity)
         self._lock = threading.RLock()
         self._lifecycle = SecondaryOcrWorkerLifecycle.CREATED
@@ -66,6 +71,7 @@ class SingleOwnerSecondaryOcrWorker:
         self._bootstrap: Future[None] | None = None
         self._done: Future[None] | None = None
         self._detached_outcomes: set[asyncio.Future[SecondaryOcrResult]] = set()
+        self._waiting_jobs = 0
 
     @property
     def lifecycle(self) -> SecondaryOcrWorkerLifecycle:
@@ -74,7 +80,12 @@ class SingleOwnerSecondaryOcrWorker:
 
     @property
     def queue_depth(self) -> int:
-        return self._queue.qsize()
+        with self._lock:
+            return self._waiting_jobs
+
+    def _observe_queue_depth(self) -> None:
+        depth = self.queue_depth
+        best_effort(lambda: self._observability.set_secondary_ocr_queue_depth(depth))
 
     @property
     def owner_thread_alive(self) -> bool:
@@ -124,6 +135,9 @@ class SingleOwnerSecondaryOcrWorker:
                 self._queue.put_nowait(job)
             except Full:
                 saturated = True
+            else:
+                self._waiting_jobs += 1
+            self._observe_queue_depth()
         if saturated:
             raise SecondaryOcrFailure(SecondaryOcrErrorCode.QUEUE_SATURATED)
         wrapped = asyncio.wrap_future(outcome)
@@ -132,6 +146,7 @@ class SingleOwnerSecondaryOcrWorker:
         except asyncio.CancelledError:
             self._detached_outcomes.add(wrapped)
             wrapped.add_done_callback(self._consume_detached_outcome)
+            self._observe_queue_depth()
             raise
 
     def _consume_detached_outcome(
@@ -147,9 +162,11 @@ class SingleOwnerSecondaryOcrWorker:
     async def close(self) -> None:
         with self._lock:
             if self._lifecycle is SecondaryOcrWorkerLifecycle.CLOSED:
+                self._observe_queue_depth()
                 return
             if self._lifecycle is SecondaryOcrWorkerLifecycle.CREATED:
                 self._lifecycle = SecondaryOcrWorkerLifecycle.CLOSED
+                self._observe_queue_depth()
                 return
             if self._lifecycle is SecondaryOcrWorkerLifecycle.CLOSING:
                 done = self._done
@@ -185,12 +202,14 @@ class SingleOwnerSecondaryOcrWorker:
                 return
             try:
                 if isinstance(item, _Job):
+                    self._waiting_jobs -= 1
                     _set_exception_if_pending(
                         item.outcome,
                         SecondaryOcrFailure(SecondaryOcrErrorCode.NOT_STARTED),
                     )
             finally:
                 self._queue.task_done()
+                self._observe_queue_depth()
 
     def _run(self) -> None:
         backend: SynchronousSecondaryOcrBackend | None = None
@@ -205,6 +224,8 @@ class SingleOwnerSecondaryOcrWorker:
                 with self._lock:
                     if self._lifecycle is not SecondaryOcrWorkerLifecycle.CLOSING:
                         self._lifecycle = SecondaryOcrWorkerLifecycle.FAILED
+                    self._waiting_jobs = 0
+                self._observe_queue_depth()
                 assert self._bootstrap is not None
                 _set_exception_if_pending(self._bootstrap, failure)
                 return
@@ -223,6 +244,10 @@ class SingleOwnerSecondaryOcrWorker:
 
             while True:
                 item = self._queue.get()
+                if isinstance(item, _Job):
+                    with self._lock:
+                        self._waiting_jobs -= 1
+                    self._observe_queue_depth()
                 try:
                     if item is _STOP:
                         break
@@ -262,6 +287,8 @@ class SingleOwnerSecondaryOcrWorker:
             with self._lock:
                 if self._lifecycle is not SecondaryOcrWorkerLifecycle.FAILED:
                     self._lifecycle = SecondaryOcrWorkerLifecycle.CLOSED
+                self._waiting_jobs = 0
+            self._observe_queue_depth()
             if self._done is not None:
                 if close_failure is None:
                     _set_result_if_pending(self._done, None)

@@ -20,6 +20,13 @@ from ..domain.progress import ProgressCounters, ProgressUnit
 from ..domain.tasks import FileTaskSnapshot, LeaseClaim
 from ..infra.task_repository import TaskRepository
 from ..settings import OrchestrationSettings
+from .observability import (
+    NullObservability,
+    ObservabilitySink,
+    StageOutcome,
+    TaskOutcome,
+    best_effort,
+)
 
 
 class PipelineErrorCode(StrEnum):
@@ -294,12 +301,14 @@ class _LeaseProgressReporter:
         cancellation: PipelineCancellation,
         notifier: _NotificationDispatcher,
         clock: OrchestrationClock,
+        attempt_observer: _AttemptObserver,
     ) -> None:
         self._repository = repository
         self._claim = claim
         self._cancellation = cancellation
         self._notifier = notifier
         self._clock = clock
+        self._attempt_observer = attempt_observer
 
     async def report(
         self,
@@ -320,9 +329,42 @@ class _LeaseProgressReporter:
         except LeaseConflictError:
             self._cancellation._cancel()
             raise
+        self._attempt_observer.transition(snapshot.stage)
         await self._notifier.emit(snapshot)
         self._cancellation.checkpoint()
         return snapshot
+
+
+class _AttemptObserver:
+    def __init__(
+        self,
+        sink: ObservabilitySink,
+        clock: OrchestrationClock,
+        stage: ProcessingStage,
+    ) -> None:
+        self._sink, self._clock, self._stage = sink, clock, stage
+        self._started = clock.monotonic()
+
+    def transition(self, stage: ProcessingStage) -> None:
+        if stage is self._stage:
+            return
+        now = self._clock.monotonic()
+        best_effort(
+            lambda: self._sink.observe_stage(
+                self._stage,
+                StageOutcome.COMPLETED,
+                max(0.0, now - self._started),
+            )
+        )
+        self._stage, self._started = stage, now
+
+    def finish(self, outcome: StageOutcome) -> None:
+        now = self._clock.monotonic()
+        best_effort(
+            lambda: self._sink.observe_stage(
+                self._stage, outcome, max(0.0, now - self._started)
+            )
+        )
 
 
 class OrchestrationService:
@@ -337,6 +379,7 @@ class OrchestrationService:
         notification_sink: ProgressNotificationSink | None = None,
         clock: OrchestrationClock | None = None,
         worker_identity: str,
+        observability: ObservabilitySink | None = None,
     ) -> None:
         if (
             not isinstance(worker_identity, str)
@@ -350,6 +393,9 @@ class OrchestrationService:
         self._settings = settings
         self._clock = clock or _SystemClock()
         self._worker_identity = worker_identity
+        self._observability = (
+            observability if observability is not None else NullObservability()
+        )
         self._wake_queue: asyncio.Queue[None] = asyncio.Queue(
             maxsize=settings.wake_queue_capacity
         )
@@ -386,11 +432,14 @@ class OrchestrationService:
 
     def notify_work(self) -> bool:
         if self._closed or self._closing:
+            self._observe_queue_depth()
             return False
         try:
             self._wake_queue.put_nowait(None)
         except asyncio.QueueFull:
+            self._observe_queue_depth()
             return False
+        self._observe_queue_depth()
         return True
 
     async def close(self) -> None:
@@ -408,6 +457,17 @@ class OrchestrationService:
                 task.add_done_callback(self._consume_task_result)
         self._tasks.clear()
         self._active_file_ids.clear()
+        while not self._wake_queue.empty():
+            try:
+                self._wake_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._wake_queue.task_done()
+        self._observe_queue_depth()
+
+    def _observe_queue_depth(self) -> None:
+        depth = self._wake_queue.qsize()
+        best_effort(lambda: self._observability.set_orchestration_queue_depth(depth))
 
     def _create_task(self, coroutine, name: str) -> None:
         task = asyncio.create_task(coroutine, name=name)
@@ -431,6 +491,7 @@ class OrchestrationService:
         worker_id = f"{self._worker_identity}:{number}"
         while not self._closing:
             await self._wake_queue.get()
+            self._observe_queue_depth()
             try:
                 while not self._closing:
                     try:
@@ -450,8 +511,15 @@ class OrchestrationService:
                         break
             finally:
                 self._wake_queue.task_done()
+                self._observe_queue_depth()
 
     async def _execute_claim(self, claim: LeaseClaim) -> None:
+        attempt_started = self._clock.monotonic()
+        task_outcome = TaskOutcome.CANCELLED
+        stage_outcome = StageOutcome.CANCELLED
+        attempt_observer = _AttemptObserver(
+            self._observability, self._clock, claim.file.stage
+        )
         cancellation = PipelineCancellation()
         await self._notifier.emit(claim.file)
         heartbeat: asyncio.Task[None] | None = None
@@ -459,6 +527,13 @@ class OrchestrationService:
         while claim.file.id in self._active_file_ids and not self._closing:
             await asyncio.sleep(0)
         if self._closing:
+            attempt_observer.finish(StageOutcome.CANCELLED)
+            duration = max(0.0, self._clock.monotonic() - attempt_started)
+            best_effort(
+                lambda: self._observability.observe_task(
+                    TaskOutcome.CANCELLED, duration
+                )
+            )
             return
         self._active_file_ids.add(claim.file.id)
         try:
@@ -468,6 +543,7 @@ class OrchestrationService:
                 cancellation,
                 self._notifier,
                 self._clock,
+                attempt_observer,
             )
             identity = PipelineFileIdentity(
                 claim.file.id,
@@ -491,6 +567,12 @@ class OrchestrationService:
                     with_warnings=result.with_warnings,
                     now=self._clock.now(),
                 )
+                task_outcome = (
+                    TaskOutcome.WARNING
+                    if result.with_warnings
+                    else TaskOutcome.COMPLETED
+                )
+                stage_outcome = StageOutcome.COMPLETED
                 await self._notifier.emit(snapshot)
             except PipelineFailure as failure:
                 if failure.retryable:
@@ -507,19 +589,29 @@ class OrchestrationService:
                         error_code=failure.code,
                         now=self._clock.now(),
                     )
-                await self._notifier.emit(snapshot)
                 if snapshot.status is FileStatus.QUEUED:
+                    task_outcome = TaskOutcome.RETRY
                     self.notify_work()
+                else:
+                    task_outcome = TaskOutcome.FAILED
+                stage_outcome = StageOutcome.FAILED
+                await self._notifier.emit(snapshot)
             except LeaseConflictError:
                 cancellation._cancel()
+                task_outcome = TaskOutcome.LEASE_CONFLICT
+                stage_outcome = StageOutcome.FAILED
             except asyncio.CancelledError:
                 cancellation._cancel()
                 current = asyncio.current_task()
                 if current is not None and current.cancelling():
                     raise
             except PersistenceError:
+                task_outcome = TaskOutcome.UNEXPECTED_FAILURE
+                stage_outcome = StageOutcome.FAILED
                 raise
             except Exception:
+                task_outcome = TaskOutcome.UNEXPECTED_FAILURE
+                stage_outcome = StageOutcome.FAILED
                 try:
                     snapshot = await self._repository.fail_file(
                         claim.file.id,
@@ -529,10 +621,14 @@ class OrchestrationService:
                     )
                 except LeaseConflictError:
                     cancellation._cancel()
+                    task_outcome = TaskOutcome.LEASE_CONFLICT
                 else:
                     await self._notifier.emit(snapshot)
         finally:
             cancellation._cancel()
+            attempt_observer.finish(stage_outcome)
+            duration = max(0.0, self._clock.monotonic() - attempt_started)
+            best_effort(lambda: self._observability.observe_task(task_outcome, duration))
             if heartbeat is not None:
                 heartbeat.cancel()
                 await asyncio.gather(heartbeat, return_exceptions=True)

@@ -30,7 +30,24 @@ from ocr_mcp_server.services.orchestration import (
     ProgressReporter,
     ServiceLifecycleError,
 )
+from ocr_mcp_server.services.observability import StageOutcome, TaskOutcome
 from ocr_mcp_server.settings import OrchestrationSettings
+
+
+class RecordingObservability:
+    def __init__(self) -> None:
+        self.queue_depths = []
+        self.tasks = []
+        self.stages = []
+
+    def set_orchestration_queue_depth(self, depth):
+        self.queue_depths.append(depth)
+
+    def observe_task(self, outcome, duration):
+        self.tasks.append((outcome, duration))
+
+    def observe_stage(self, stage, outcome, duration):
+        self.stages.append((stage, outcome, duration))
 
 
 class ManualClock:
@@ -89,6 +106,19 @@ async def wait_until(predicate: Callable[[], Awaitable[bool]]) -> None:
     raise AssertionError("condition did not become true")
 
 
+@pytest.mark.asyncio
+async def test_wake_queue_gauge_uses_replacement_semantics_and_close_drains() -> None:
+    observations = RecordingObservability()
+    service = OrchestrationService(
+        object(), object(), OrchestrationSettings(wake_queue_capacity=1),
+        worker_identity="worker", observability=observations,
+    )
+    assert service.notify_work() is True
+    assert service.notify_work() is False
+    await service.close()
+    assert observations.queue_depths == [1, 1, 0]
+
+
 @pytest_asyncio.fixture
 async def orchestration_repository(tmp_path: Path):
     engine = create_database_engine(
@@ -123,6 +153,7 @@ async def test_success_progress_is_persisted_before_throttled_notifications(
             self.items.append(notification)
 
     sink = CheckingSink()
+    observations = RecordingObservability()
 
     async def run_pipeline(file, progress, cancellation):
         assert file.file_id == "file-a"
@@ -153,6 +184,7 @@ async def test_success_progress_is_persisted_before_throttled_notifications(
         notification_sink=sink,
         clock=clock,
         worker_identity="worker",
+        observability=observations,
     )
     await service.start()
 
@@ -184,6 +216,13 @@ async def test_success_progress_is_persisted_before_throttled_notifications(
         item.progress for item in sink.items
     )
     assert service.notification_tracking_size == 0
+    assert observations.tasks == [(TaskOutcome.WARNING, 2.0)]
+    assert [(stage, outcome) for stage, outcome, _ in observations.stages] == [
+        (ProcessingStage.QUEUED, StageOutcome.COMPLETED),
+        (ProcessingStage.MINERU_PARSING, StageOutcome.COMPLETED),
+        (ProcessingStage.MERGING, StageOutcome.COMPLETED),
+    ]
+    assert [duration for _, _, duration in observations.stages] == [0.0, 2.0, 0.0]
 
 
 @pytest.mark.asyncio

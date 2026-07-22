@@ -1,40 +1,77 @@
 # OCR MCP Server
 
-这是面向 Ubuntu Server 的 Python 3.11 OCR 服务仓库。目前只包含仓库骨架、部署配置、基础领域契约、FastAPI 应用工厂和不依赖外部服务的 `/health/live`；尚未实现 OCR 业务处理、数据库、MCP 工具或业务 REST 接口。
+Python 3.11 OCR service for Ubuntu Server. The repository contains the durable
+SQLite task model, bounded orchestration and secondary-OCR workers, REST and MCP
+transports, artifact handling, orientation recovery, health endpoints, safe
+logging, and Prometheus metrics. The container intentionally excludes the heavy
+MinerU and Paddle runtime dependencies until their deployment task composes them.
+REST 与 MCP 共享同一服务层（services），业务状态转换不绑定到传输协议。
+项目已从最初的仓库骨架发展为经过测试的服务实现。
 
-## 本地安装
+## Local setup and startup
 
 ```bash
 uv venv --python 3.11
 source .venv/bin/activate
 uv pip install -e ".[dev]"
-```
-
-复制 `config/example.yaml` 为本地配置文件，并通过 `OCR_CONFIG_FILE` 指定它。所有设置也可使用 `OCR_` 前缀的环境变量覆盖；嵌套字段用双下划线分隔，例如：
-
-```bash
-export OCR_CONFIG_FILE=config/local.yaml
-export OCR_SERVER__PORT=9000
-export OCR_SECONDARY_OCR__ENGINE=pp_structure_v3
-```
-
-环境变量优先于 YAML。二次 OCR 引擎是进程启动时的部署选项，不是请求参数。
-
-## 启动
-
-```bash
 python -m ocr_mcp_server
-# 或
-ocr-mcp-server
 ```
 
-当前 FastAPI `api` 包是 REST 路由承载层。后续 REST API 与 MCP 接口会共用 `services` 服务层，避免把业务逻辑绑定到任一传输协议；本任务只提供存活探针。
+Copy `config/example.yaml` for local configuration and select it with
+`OCR_CONFIG_FILE`. Settings use the `OCR_` prefix and `__` for nested fields.
+The secondary OCR engine is a deployment setting, never a request parameter.
 
-## 文件接入安全部署
+## Health and traffic routing
 
-`data_root` 必须位于服务端受控文件系统，归服务账户所有，并且只允许该账户写入（Ubuntu 建议目录权限 `0700`、文件权限 `0600`）。不得让 Web 用户、共享组或其他进程修改 `data_root`、`.locks`、batch 或 `input` 路径；代码会拒绝 symlink/reparse 路径并使用目录/文件 handle 与原子 no-replace publication，但服务账户独占写权限仍是抵御祖先目录替换的必要边界。
+`GET /health/live` is an unauthenticated process-liveness check. Docker keeps its
+`HEALTHCHECK` on this endpoint using only Python's standard library. Liveness must
+not be replaced by dependency readiness or require an API key.
 
-远程导入在每次请求和每级 redirect 前重新校验 HTTPS URL、精确 hostname 白名单及全部 DNS 地址。HTTPX 默认传输不会把已校验 IP 固定到 socket，因此应用校验不能单独完全消除 DNS rebinding；生产环境必须再通过出口防火墙或受控代理禁止访问私网、loopback、link-local 和保留地址。
+`GET /health/ready` is strict traffic-routing readiness. It returns 503 unless
+every required dependency is ready. It deliberately remains 503 until Task 13
+composes live SQLite, MinerU, and Paddle probes; operators must not route customer
+traffic based only on `/health/live`.
+
+## Metrics and safe telemetry
+
+`GET /metrics` is unauthenticated for scraper compatibility. Expose it only on a
+trusted private network or behind an infrastructure access-control boundary.
+Metric observations are best effort and never control request, queue, task, or
+recovery behavior.
+
+Exact application metric names are:
+
+- `ocr_http_requests_total`
+- `ocr_http_request_duration_seconds`
+- `ocr_tasks_total`
+- `ocr_task_duration_seconds`
+- `ocr_pipeline_stage_duration_seconds`
+- `ocr_orchestration_queue_depth`
+- `ocr_secondary_ocr_queue_depth`
+- `ocr_dependency_ready`
+- `ocr_recovery_total`
+
+Labels are finite and low-cardinality: allowlisted HTTP method/route/status class,
+finite task/stage/recovery outcomes, finite processing stages, and the fixed
+SQLite/MinerU/Paddle dependency set. Never add file or batch identifiers, URLs,
+paths, filenames, OCR text, API keys, Authorization values, recovery tokens,
+exception text, engine/model identifiers, page numbers, or angles to labels.
+
+The same content is forbidden from logs. Log only validated event names, finite
+codes, bounded counters, and explicitly safe scalar fields. Do not log raw request
+bodies, headers, tokens, OCR content, filenames, URLs, filesystem paths, exception
+objects, or exception messages.
+
+## Deployment safety
+
+The service account must exclusively own and write `data_root` (recommended
+directory mode `0700`, file mode `0600`). Do not grant web users or unrelated
+processes write access. Remote imports require HTTPS allowlisting plus egress
+firewall or controlled-proxy enforcement to prevent access to private, loopback,
+link-local, and reserved networks.
+
+Build, deployment, and remote Ubuntu verification are controller-owned release
+gates; feature tasks run local tests only and do not push, sync, build, or deploy.
 
 ## 远程 Ubuntu 容器验证
 

@@ -108,6 +108,7 @@ class OrientationRecoveryRepository:
                 result_batch_id=None,
                 result_version=None,
                 error_code=None,
+                terminal_observed=False,
                 created_at=now,
                 updated_at=now,
                 version=1,
@@ -568,6 +569,39 @@ class OrientationRecoveryRepository:
             raise OrientationFailure(
                 OrientationErrorCode.PERSISTENCE_FAILED
             ) from None
+        except Exception:
+            raise OrientationFailure(
+                OrientationErrorCode.PERSISTENCE_FAILED
+            ) from None
+
+    async def mark_terminal_observed(self, claim_id: str) -> bool:
+        """Atomically reserve the one terminal metric for a recovery claim."""
+        if (
+            not isinstance(claim_id, str)
+            or re.fullmatch(r"claim-[0-9a-f]+", claim_id) is None
+        ):
+            raise OrientationFailure(OrientationErrorCode.CLAIM_CONFLICT) from None
+        try:
+            async with self._sessions() as session:
+                await session.execute(text("BEGIN IMMEDIATE"))
+                record = await session.scalar(
+                    select(OrientationRecoveryRecord).where(
+                        OrientationRecoveryRecord.claim_id == claim_id
+                    )
+                )
+                if record is None or record.state not in {
+                    RecoveryState.COMPLETED.value,
+                    RecoveryState.FAILED.value,
+                    RecoveryState.UNCERTAIN.value,
+                }:
+                    raise OrientationFailure(OrientationErrorCode.CLAIM_CONFLICT)
+                if record.terminal_observed:
+                    return False
+                record.terminal_observed = True
+                await session.commit()
+                return True
+        except OrientationFailure:
+            raise
         except Exception:
             raise OrientationFailure(
                 OrientationErrorCode.PERSISTENCE_FAILED

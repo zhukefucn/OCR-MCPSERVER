@@ -30,6 +30,12 @@ from ..domain.models import BatchStatus, utc_now
 from ..domain.retention import ContentWriteGuard
 from ..domain.secondary_ocr import OrthogonalAngle
 from .file_storage import BatchLockLease
+from .observability import (
+    NullObservability,
+    ObservabilitySink,
+    RecoveryOutcome,
+    best_effort,
+)
 
 
 ProgressCallback: TypeAlias = Callable[[int, int], Awaitable[None]]
@@ -224,6 +230,8 @@ class OrientationRecoveryState(Protocol):
         self, *, now: datetime, limit: int
     ) -> tuple[RecoveryClaim, ...]: ...
 
+    async def mark_terminal_observed(self, claim_id: str) -> bool: ...
+
 
 class RecoveryStorage(Protocol):
     def batch_lock(
@@ -397,6 +405,7 @@ class OrientationRecoveryCoordinator:
         content_write_guards: RecoveryContentWriteGuards,
         now_factory: Callable[[], datetime] = utc_now,
         write_lease_seconds: int = 900,
+        observability: ObservabilitySink | None = None,
     ) -> None:
         if type(write_lease_seconds) is not int or write_lease_seconds < 1:
             raise ValueError("invalid recovery write lease")
@@ -409,6 +418,10 @@ class OrientationRecoveryCoordinator:
         self._content_write_guards = content_write_guards
         self._now_factory = now_factory
         self._write_lease_seconds = write_lease_seconds
+        self._observability = (
+            observability if observability is not None else NullObservability()
+        )
+        self._observed_claims: set[str] = set()
 
     async def reparse(
         self,
@@ -439,6 +452,15 @@ class OrientationRecoveryCoordinator:
             ):
                 raise RuntimeError("invalid recovery claim")
         except OrientationFailure as exc:
+            if exc.code == OrientationErrorCode.TOKEN_INVALID.value:
+                self._observe_recovery(RecoveryOutcome.INVALID_TOKEN)
+            elif exc.code in {
+                OrientationErrorCode.REQUEST_CONFLICT.value,
+                OrientationErrorCode.CLAIM_CONFLICT.value,
+            }:
+                self._observe_recovery(RecoveryOutcome.CONFLICT)
+            else:
+                self._observe_recovery(RecoveryOutcome.UNAVAILABLE)
             raise _map_orientation_failure(exc) from None
         except (ValueError, TypeError):
             raise RecoveryServiceFailure(
@@ -527,6 +549,7 @@ class OrientationRecoveryCoordinator:
                         raise RecoveryServiceFailure(
                             RecoveryServiceErrorCode.UNAVAILABLE
                         ) from None
+                    await self._record_terminal(claim, RecoveryOutcome.COMPLETED)
                     await _safe_progress(progress, 100)
                     return OrientationRecoverySubmission(
                         batch_id=submission.batch_id,
@@ -608,6 +631,7 @@ class OrientationRecoveryCoordinator:
                         accepted_input_size_bytes=submission.accepted_input_size_bytes,
                         now=self._now_factory(),
                     )
+                    await self._record_terminal(claim, RecoveryOutcome.COMPLETED)
                     completed += 1
                 except Exception:
                     deferred += 1
@@ -627,6 +651,7 @@ class OrientationRecoveryCoordinator:
                     error_code="orientation_recovery_interrupted",
                     now=self._now_factory(),
                 )
+                await self._record_terminal(claim, RecoveryOutcome.FAILED)
                 failed += 1
             except Exception:
                 deferred += 1
@@ -637,6 +662,26 @@ class OrientationRecoveryCoordinator:
             failed=failed,
             deferred=deferred,
         )
+
+    def _observe_recovery(self, outcome: RecoveryOutcome) -> None:
+        best_effort(lambda: self._observability.observe_recovery(outcome))
+
+    async def _record_terminal(
+        self, claim: RecoveryClaim, outcome: RecoveryOutcome
+    ) -> None:
+        marker = getattr(self._repository, "mark_terminal_observed", None)
+        if marker is not None:
+            try:
+                reserved = await marker(claim.claim_id)
+            except Exception:
+                return
+            if not reserved:
+                return
+        elif claim.claim_id in self._observed_claims:
+            return
+        else:
+            self._observed_claims.add(claim.claim_id)
+        self._observe_recovery(outcome)
 
     async def _replay(
         self, snapshot: RecoverySnapshot, progress: ProgressCallback | None
@@ -837,6 +882,18 @@ class OrientationRecoveryCoordinator:
             await self._repository.fail(
                 claim, state=state, error_code=error_code, now=self._now_factory()
             )
+            if state is RecoveryState.UNCERTAIN:
+                outcome = RecoveryOutcome.UNCERTAIN
+            elif error_code == "orientation_content_unavailable":
+                outcome = RecoveryOutcome.CONFLICT
+            elif error_code in {
+                "orientation_detector_unavailable",
+                "orientation_pipeline_failed",
+            }:
+                outcome = RecoveryOutcome.UNAVAILABLE
+            else:
+                outcome = RecoveryOutcome.FAILED
+            await self._record_terminal(claim, outcome)
         except Exception:
             raise RecoveryServiceFailure(
                 RecoveryServiceErrorCode.UNAVAILABLE

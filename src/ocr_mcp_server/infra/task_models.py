@@ -313,6 +313,9 @@ class OrientationRecoveryRecord(Base):
     accepted_input_sha256: Mapped[str | None] = mapped_column(String(64))
     accepted_input_size_bytes: Mapped[int | None] = mapped_column(Integer)
     error_code: Mapped[str | None] = mapped_column(String(64))
+    terminal_observed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)

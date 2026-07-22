@@ -35,6 +35,7 @@ from ocr_mcp_server.services.orientation_recovery import (
     FullRecoveryPipelineSubmission,
     OrientationRecoveryCoordinator,
 )
+from ocr_mcp_server.services.observability import RecoveryOutcome
 from ocr_mcp_server.domain.models import BatchStatus
 from ocr_mcp_server.domain.errors import RetentionErrorCode, RetentionFailure
 from ocr_mcp_server.services.retention import RetentionService
@@ -99,6 +100,7 @@ async def test_schema_upgrade_adds_durable_takeover_proof_columns(
             "corrected_input_sha256",
             "corrected_input_size_bytes",
             "expected_corrected_input_version",
+            "terminal_observed",
         }.issubset(columns)
     finally:
         await engine.dispose()
@@ -345,6 +347,12 @@ async def test_concurrent_restart_reconciliation_converges_without_running_work(
             raise AssertionError("restart reconciliation cannot run work")
 
     runner = Runner()
+    class Sink:
+        def __init__(self):
+            self.outcomes = []
+        def observe_recovery(self, outcome):
+            self.outcomes.append(outcome)
+    sink = Sink()
     service = OrientationRecoveryCoordinator(
         repository=repo,
         detector=object(),
@@ -354,6 +362,7 @@ async def test_concurrent_restart_reconciliation_converges_without_running_work(
         marker_registry=object(),
         content_write_guards=object(),
         now_factory=lambda: NOW,
+        observability=sink,
     )
 
     first, second = await asyncio.gather(
@@ -365,6 +374,7 @@ async def test_concurrent_restart_reconciliation_converges_without_running_work(
     assert first.completed + first.deferred == 1
     assert second.completed + second.deferred == 1
     assert runner.run_calls == 0
+    assert sink.outcomes == [RecoveryOutcome.COMPLETED]
     resolved = await repo.resolve(issue.token, now=NOW)
     assert resolved.state is RecoveryState.COMPLETED
     assert (resolved.result_batch_id, resolved.result_version) == (result_batch_id, 3)

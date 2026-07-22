@@ -38,6 +38,7 @@ from ocr_mcp_server.services.orientation_recovery import (
     OrientationRecoverySubmission,
     RecoveryServiceFailure,
 )
+from ocr_mcp_server.services.observability import RecoveryOutcome
 from ocr_mcp_server.services.file_storage import BatchLockLease, FileStorage
 from ocr_mcp_server.services.file_validation import FileValidator
 
@@ -311,7 +312,7 @@ def public(service):
     return OrientationRecoveryGateway(_UnusedDelegate(), service)
 
 
-def coordinator(*, repo=None, decisions=None, detector=None):
+def coordinator(*, repo=None, decisions=None, detector=None, observability=None):
     global STORAGE
     STORAGE = Storage()
     guards = Guards(STORAGE)
@@ -330,8 +331,28 @@ def coordinator(*, repo=None, decisions=None, detector=None):
         marker_registry=MARKERS,
         content_write_guards=guards,
         now_factory=lambda: NOW,
+        observability=observability,
     )
     return service, guards, detector, corrector, runner
+
+
+class RecoveryObservability:
+    def __init__(self):
+        self.outcomes = []
+
+    def observe_recovery(self, outcome):
+        self.outcomes.append(outcome)
+
+
+@pytest.mark.asyncio
+async def test_recovery_observes_new_completion_once_but_not_completed_replay():
+    repo = Repo()
+    observations = RecoveryObservability()
+    service, *_ = coordinator(repo=repo, observability=observations)
+    command = OrientationRecoveryCommand(recovery_token="or_" + "x" * 32)
+    await service.reparse(command)
+    await service.reparse(command)
+    assert observations.outcomes == [RecoveryOutcome.COMPLETED]
 
 
 @pytest.mark.asyncio
