@@ -502,6 +502,7 @@ def test_posix_confined_open_closes_parent_and_child_on_keyboard_interrupt(
     assert closed_descriptors == [opened_descriptors[1], opened_descriptors[0]]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows HANDLE ownership contract")
 def test_windows_handle_conversion_closes_handle_on_system_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
