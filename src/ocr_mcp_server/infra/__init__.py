@@ -7,6 +7,7 @@ from .database import (
     initialize_schema,
 )
 from .task_repository import TaskRepository
+from .artifact_repository import ArtifactRepository
 from .mineru_adapter import MinerUAdapter, ProgressCallback
 from .secondary_ocr import (
     SecondaryOcrWorkerLifecycle,
@@ -15,6 +16,7 @@ from .secondary_ocr import (
 )
 
 __all__ = [
+    "ArtifactRepository",
     "SessionFactory",
     "MinerUAdapter",
     "ProgressCallback",

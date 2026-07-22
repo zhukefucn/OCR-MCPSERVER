@@ -240,3 +240,42 @@ class MergeFailure(DomainError):
         self.code = code.value
         self.safe_message = _MERGE_SAFE_MESSAGES[code]
         Exception.__init__(self, self.safe_message)
+
+
+class ArtifactErrorCode(StrEnum):
+    """Stable content-free codes for result artifact generation and indexing."""
+
+    INVALID_INPUT = "artifact_input_invalid"
+    UNSAFE_SOURCE = "artifact_source_unsafe"
+    UNSAFE_IMAGE = "artifact_image_unsafe"
+    UNSUPPORTED_NODE = "artifact_markdown_node_unsupported"
+    LIMIT_EXCEEDED = "artifact_limit_exceeded"
+    PUBLISH_CONFLICT = "artifact_publish_conflict"
+    PUBLISH_FAILED = "artifact_publish_failed"
+    INDEX_CONFLICT = "artifact_index_conflict"
+    INDEX_FAILED = "artifact_index_failed"
+
+
+_ARTIFACT_SAFE_MESSAGES = {
+    ArtifactErrorCode.INVALID_INPUT: "Artifact inputs are invalid or inconsistent.",
+    ArtifactErrorCode.UNSAFE_SOURCE: "An artifact source is unsafe or unavailable.",
+    ArtifactErrorCode.UNSAFE_IMAGE: "A referenced artifact image is unsafe or unavailable.",
+    ArtifactErrorCode.UNSUPPORTED_NODE: "A structured node cannot be rendered.",
+    ArtifactErrorCode.LIMIT_EXCEEDED: "An artifact limit was exceeded.",
+    ArtifactErrorCode.PUBLISH_CONFLICT: "The artifact location contains different content.",
+    ArtifactErrorCode.PUBLISH_FAILED: "The artifact could not be published.",
+    ArtifactErrorCode.INDEX_CONFLICT: "Artifact metadata conflicts with an immutable record.",
+    ArtifactErrorCode.INDEX_FAILED: "Artifact metadata could not be registered.",
+}
+
+
+class ArtifactFailure(DomainError):
+    """Artifact failure that discards paths, content, backend text, and causes."""
+
+    def __init__(
+        self, code: ArtifactErrorCode, *, cause: BaseException | None = None
+    ) -> None:
+        del cause
+        self.code = code.value
+        self.safe_message = _ARTIFACT_SAFE_MESSAGES[code]
+        Exception.__init__(self, self.safe_message)

@@ -1,6 +1,8 @@
 """Shared domain contracts for the OCR service."""
 
 from .errors import (
+    ArtifactErrorCode,
+    ArtifactFailure,
     CandidateCollectionErrorCode,
     CandidateCollectionFailure,
     ConfigurationError,
@@ -26,6 +28,12 @@ from .models import (
     SecondaryOCREngine,
     new_id,
     utc_now,
+)
+from .artifacts import (
+    ArtifactBundle,
+    ArtifactSnapshot,
+    ReplacementAuditMetadataSnapshot,
+    replacement_audit_metadata_sha256,
 )
 from .progress import ProgressCounters, ProgressUnit, map_stage_progress
 from .merge import (
@@ -66,6 +74,10 @@ from .secondary_ocr import (
 )
 
 __all__ = [
+    "ArtifactBundle",
+    "ArtifactErrorCode",
+    "ArtifactFailure",
+    "ArtifactSnapshot",
     "BatchStatus",
     "BatchSnapshot",
     "CandidateCollection",
@@ -100,6 +112,8 @@ __all__ = [
     "ProgressCounters",
     "ProgressUnit",
     "ReplacementAuditRecord",
+    "ReplacementAuditMetadataSnapshot",
+    "replacement_audit_metadata_sha256",
     "ReplacementDecision",
     "ReplacementReason",
     "RollbackPublicationResult",

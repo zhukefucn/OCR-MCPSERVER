@@ -200,6 +200,36 @@ class StructuredContentSettings(_SettingsSection):
         return StructuredContentLimits(**self.model_dump())
 
 
+class ArtifactSettings(_SettingsSection):
+    max_artifact_bytes: int = Field(default=1024**3, ge=1)
+    max_entry_bytes: int = Field(default=256 * 1024**2, ge=1)
+    max_entry_count: int = Field(default=20_000, ge=1)
+    max_markdown_bytes: int = Field(default=256 * 1024**2, ge=1)
+
+    @field_validator(
+        "max_artifact_bytes",
+        "max_entry_bytes",
+        "max_entry_count",
+        "max_markdown_bytes",
+        mode="before",
+    )
+    @classmethod
+    def reject_boolean_limits(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("boolean values are not artifact limits")
+        return value
+
+    def to_limits(self):
+        from .services.artifacts import ArtifactLimits
+
+        return ArtifactLimits(
+            self.max_artifact_bytes,
+            self.max_entry_bytes,
+            self.max_entry_count,
+            self.max_markdown_bytes,
+        )
+
+
 class DatabaseSettings(_SettingsSection):
     url: str = "sqlite+aiosqlite:///data/ocr.sqlite3"
     busy_timeout_ms: int = Field(default=5000, ge=1)
@@ -258,6 +288,7 @@ class AppSettings(BaseSettings):
     limits: LimitsSettings = Field(default_factory=LimitsSettings)
     remote_import: RemoteImportSettings = Field(default_factory=RemoteImportSettings)
     retention: RetentionSettings = Field(default_factory=RetentionSettings)
+    artifacts: ArtifactSettings = Field(default_factory=ArtifactSettings)
     mineru: MinerUSettings = Field(default_factory=MinerUSettings)
     secondary_ocr: SecondaryOCRSettings = Field(default_factory=SecondaryOCRSettings)
     structured_content: StructuredContentSettings = Field(default_factory=StructuredContentSettings)

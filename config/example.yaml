@@ -34,6 +34,12 @@ retention:
   result_hours: 24
   audit_metadata_days: 30
 
+artifacts:
+  max_artifact_bytes: 1073741824
+  max_entry_bytes: 268435456
+  max_entry_count: 20000
+  max_markdown_bytes: 268435456
+
 mineru:
   api_url: http://127.0.0.1:8001
   vlm_server_url: http://127.0.0.1:30000

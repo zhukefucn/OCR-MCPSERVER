@@ -5,8 +5,10 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -92,3 +94,71 @@ class StageEventRecord(Base):
     error_code: Mapped[str | None] = mapped_column(String(128))
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ArtifactRecord(Base):
+    __tablename__ = "artifacts"
+    __table_args__ = (
+        UniqueConstraint("file_id", "result_version"),
+        UniqueConstraint("storage_key"),
+        CheckConstraint("source_version >= 1"),
+        CheckConstraint("result_version >= 1"),
+        CheckConstraint("size_bytes >= 0"),
+        CheckConstraint("audit_record_count >= 0"),
+        CheckConstraint("version >= 1"),
+    )
+
+    id: Mapped[str] = mapped_column(String(73), primary_key=True)
+    file_id: Mapped[str] = mapped_column(
+        String(512), ForeignKey("file_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    batch_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("batches.id", ondelete="CASCADE"), nullable=False
+    )
+    source_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    result_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    storage_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    audit_metadata_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    audit_record_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+
+class ReplacementAuditMetadataRecord(Base):
+    __tablename__ = "replacement_audit_metadata"
+    __table_args__ = (
+        CheckConstraint("source_version >= 1"),
+        CheckConstraint("output_version >= 1"),
+        CheckConstraint("confidence >= 0 AND confidence <= 1"),
+    )
+
+    audit_id: Mapped[str] = mapped_column(String(71), primary_key=True)
+    artifact_id: Mapped[str] = mapped_column(
+        String(73), ForeignKey("artifacts.id", ondelete="CASCADE"), nullable=False
+    )
+    record_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    candidate_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    file_id: Mapped[str] = mapped_column(
+        String(512), ForeignKey("file_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    batch_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("batches.id", ondelete="CASCADE"), nullable=False
+    )
+    source_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    output_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    image_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    decision: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    angle: Mapped[int] = mapped_column(Integer, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    engine: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_versions_json: Mapped[str] = mapped_column(String(4096), nullable=False)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
