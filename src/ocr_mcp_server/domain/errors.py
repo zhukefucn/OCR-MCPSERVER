@@ -203,3 +203,40 @@ class SecondaryOcrFailure(DomainError):
         self.code = code.value
         self.safe_message = _SECONDARY_OCR_SAFE_MESSAGES[code]
         Exception.__init__(self, self.safe_message)
+
+
+class MergeErrorCode(StrEnum):
+    """Stable safe codes for merge, publication, and rollback failures."""
+
+    INVALID_COVERAGE = "merge_coverage_invalid"
+    INVARIANT_VIOLATION = "merge_invariant_invalid"
+    INVALID_SOURCE_MANIFEST = "merge_source_manifest_invalid"
+    INVALID_STRUCTURED_CONTENT = "merge_structured_content_invalid"
+    UNSAFE_REFERENCE = "merge_reference_unsafe"
+    UNSAFE_PUBLICATION_PATH = "merge_publication_path_unsafe"
+    PUBLICATION_CONFLICT = "merge_publication_conflict"
+    PUBLICATION_FAILED = "merge_publication_failed"
+    ROLLBACK_VERIFICATION_FAILED = "merge_rollback_verification_failed"
+
+
+_MERGE_SAFE_MESSAGES = {
+    MergeErrorCode.INVALID_COVERAGE: "Secondary OCR result coverage is invalid.",
+    MergeErrorCode.INVARIANT_VIOLATION: "Merge inputs are inconsistent.",
+    MergeErrorCode.INVALID_SOURCE_MANIFEST: "The source structured result is invalid.",
+    MergeErrorCode.INVALID_STRUCTURED_CONTENT: "Structured recognized content is invalid.",
+    MergeErrorCode.UNSAFE_REFERENCE: "A structured result reference is unsafe.",
+    MergeErrorCode.UNSAFE_PUBLICATION_PATH: "The publication location is unsafe.",
+    MergeErrorCode.PUBLICATION_CONFLICT: "The result version already contains different content.",
+    MergeErrorCode.PUBLICATION_FAILED: "The result version could not be published.",
+    MergeErrorCode.ROLLBACK_VERIFICATION_FAILED: "The rollback source could not be verified.",
+}
+
+
+class MergeFailure(DomainError):
+    """A merge-layer failure that never retains unsafe content or causes."""
+
+    def __init__(self, code: MergeErrorCode, *, cause: BaseException | None = None) -> None:
+        del cause
+        self.code = code.value
+        self.safe_message = _MERGE_SAFE_MESSAGES[code]
+        Exception.__init__(self, self.safe_message)

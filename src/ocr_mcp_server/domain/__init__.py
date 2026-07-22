@@ -11,6 +11,8 @@ from .errors import (
     LeaseConflictError,
     MinerUErrorCode,
     MinerUFailure,
+    MergeErrorCode,
+    MergeFailure,
     PersistenceError,
     SecondaryOcrErrorCode,
     SecondaryOcrFailure,
@@ -24,6 +26,13 @@ from .models import (
     SecondaryOCREngine,
     new_id,
     utc_now,
+)
+from .merge import (
+    MergePublicationResult,
+    ReplacementAuditRecord,
+    ReplacementDecision,
+    ReplacementReason,
+    RollbackPublicationResult,
 )
 from .mineru import (
     MinerUDocumentResult,
@@ -70,6 +79,9 @@ __all__ = [
     "MinerUDocumentResult",
     "MinerUErrorCode",
     "MinerUFailure",
+    "MergeErrorCode",
+    "MergeFailure",
+    "MergePublicationResult",
     "MinerUParseRequest",
     "MinerUProgress",
     "MinerUProgressStatus",
@@ -78,6 +90,10 @@ __all__ = [
     "OrthogonalAngle",
     "PersistenceError",
     "ProcessingStage",
+    "ReplacementAuditRecord",
+    "ReplacementDecision",
+    "ReplacementReason",
+    "RollbackPublicationResult",
     "SecondaryOCREngine",
     "SecondaryOcrErrorCode",
     "SecondaryOcrFailure",

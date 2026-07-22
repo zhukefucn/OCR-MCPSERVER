@@ -50,3 +50,13 @@ secondary_ocr:
   classification_threshold: 0.8
   paddlex_config: null
   formula_model_name: PP-FormulaNet_plus-S
+
+structured_content:
+  max_characters: 1000000
+  max_utf8_bytes: 4000000
+  max_html_depth: 64
+  max_html_elements: 20000
+  max_table_rows: 5000
+  max_table_cells: 10000
+  max_latex_repetition: 128
+  max_artifact_bytes: 67108864

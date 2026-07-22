@@ -155,6 +155,51 @@ class SecondaryOCRSettings(_SettingsSection):
         return identity
 
 
+class StructuredContentSettings(_SettingsSection):
+    max_characters: int = Field(default=1_000_000, ge=1)
+    max_utf8_bytes: int = Field(default=4_000_000, ge=1)
+    max_html_depth: int = Field(default=64, ge=1)
+    max_html_elements: int = Field(default=20_000, ge=1)
+    max_table_rows: int = Field(default=5_000, ge=1)
+    max_table_cells: int = Field(default=10_000, ge=1)
+    max_latex_repetition: int = Field(default=128, ge=1)
+    max_artifact_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
+
+    @field_validator(
+        "max_characters",
+        "max_utf8_bytes",
+        "max_html_depth",
+        "max_html_elements",
+        "max_table_rows",
+        "max_table_cells",
+        "max_latex_repetition",
+        "max_artifact_bytes",
+        mode="before",
+    )
+    @classmethod
+    def reject_boolean_numeric_values(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("boolean values are not numeric deployment settings")
+        return value
+
+    @model_validator(mode="after")
+    def validate_consistent_bounds(self) -> StructuredContentSettings:
+        if (
+            self.max_utf8_bytes < self.max_characters
+            or self.max_artifact_bytes < self.max_utf8_bytes
+            or self.max_html_depth > self.max_html_elements
+            or self.max_table_rows > self.max_html_elements
+            or self.max_table_cells > self.max_html_elements
+        ):
+            raise ValueError("structured-content limits are contradictory")
+        return self
+
+    def to_limits(self):
+        from .services.structured_content import StructuredContentLimits
+
+        return StructuredContentLimits(**self.model_dump())
+
+
 class DatabaseSettings(_SettingsSection):
     url: str = "sqlite+aiosqlite:///data/ocr.sqlite3"
     busy_timeout_ms: int = Field(default=5000, ge=1)
@@ -183,6 +228,7 @@ class AppSettings(BaseSettings):
     retention: RetentionSettings = Field(default_factory=RetentionSettings)
     mineru: MinerUSettings = Field(default_factory=MinerUSettings)
     secondary_ocr: SecondaryOCRSettings = Field(default_factory=SecondaryOCRSettings)
+    structured_content: StructuredContentSettings = Field(default_factory=StructuredContentSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
 
     @classmethod

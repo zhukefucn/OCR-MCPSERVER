@@ -44,12 +44,38 @@ def test_settings_defaults_match_domain_constraints() -> None:
     assert settings.secondary_ocr.classification_threshold == 0.8
     assert settings.secondary_ocr.paddlex_config is None
     assert settings.secondary_ocr.formula_model_name == "PP-FormulaNet_plus-S"
+    assert settings.structured_content.max_utf8_bytes >= settings.structured_content.max_characters
+    assert settings.structured_content.max_html_elements >= settings.structured_content.max_table_cells
+    assert settings.structured_content.max_artifact_bytes >= settings.structured_content.max_utf8_bytes
     assert settings.database.url == "sqlite+aiosqlite:///data/ocr.sqlite3"
     assert settings.database.busy_timeout_ms == 5000
     assert settings.remote_import.allowed_hosts == []
     assert settings.remote_import.max_redirects == 3
     assert settings.remote_import.timeout_seconds == 30
     assert settings.remote_import.max_image_pixels == 100_000_000
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_characters",
+        "max_utf8_bytes",
+        "max_html_depth",
+        "max_html_elements",
+        "max_table_rows",
+        "max_table_cells",
+        "max_latex_repetition",
+        "max_artifact_bytes",
+    ],
+)
+def test_structured_content_settings_reject_boolean_numbers(field: str) -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(structured_content={field: True})
+
+
+def test_structured_content_settings_reject_contradictory_limits() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(structured_content={"max_characters": 1000, "max_utf8_bytes": 999})
 
 
 def test_remote_import_hosts_are_canonicalized_and_deduplicated() -> None:
@@ -314,6 +340,13 @@ def test_example_yaml_documents_secondary_ocr_deployment_defaults() -> None:
     assert settings.classification_threshold == 0.8
     assert settings.paddlex_config is None
     assert settings.formula_model_name == "PP-FormulaNet_plus-S"
+
+
+def test_example_yaml_documents_structured_merge_safety_limits() -> None:
+    structured = load_settings(config_file=Path("config/example.yaml")).structured_content
+    assert structured.max_characters > 0
+    assert structured.max_html_elements >= structured.max_table_cells
+    assert structured.max_artifact_bytes >= structured.max_utf8_bytes
 
 
 def test_project_metadata_has_no_local_mineru_or_torch_dependency() -> None:

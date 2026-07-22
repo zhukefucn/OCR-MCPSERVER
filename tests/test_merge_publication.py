@@ -1,0 +1,364 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import UTC, datetime
+from hashlib import sha256
+import json
+from pathlib import Path
+
+import pytest
+
+from ocr_mcp_server.domain import (
+    CandidateCollection,
+    CandidateReference,
+    CandidateSourceKind,
+    ImageCandidate,
+    MergeErrorCode,
+    MergeFailure,
+    MinerUDocumentResult,
+    MinerUImageFormat,
+    OrthogonalAngle,
+    ReplacementDecision,
+    ReplacementReason,
+    SecondaryContentFormat,
+    SecondaryOCREngine,
+    SecondaryOcrResult,
+    SecondaryProcessingRecord,
+    SecondaryResultKind,
+    SecondaryResultState,
+)
+from ocr_mcp_server.services.merge_publication import (
+    merge_and_publish,
+    rollback_publication,
+)
+from ocr_mcp_server.services.structured_content import StructuredContentLimits
+
+
+NOW = datetime(2026, 7, 22, 8, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+def limits() -> StructuredContentLimits:
+    return StructuredContentLimits(
+        max_characters=10_000,
+        max_utf8_bytes=20_000,
+        max_html_depth=16,
+        max_html_elements=100,
+        max_table_rows=20,
+        max_table_cells=100,
+        max_latex_repetition=20,
+        max_artifact_bytes=1_000_000,
+    )
+
+
+def _setup(tmp_path: Path, nodes: list[dict], *, references=None):
+    source = tmp_path / "mineru"
+    images = source / "images"
+    images.mkdir(parents=True)
+    image = images / "a.png"
+    image.write_bytes(b"immutable-image")
+    manifest_path = source / "doc_content_list_v2.json"
+    manifest_path.write_text(json.dumps([nodes]), encoding="utf-8")
+    result = MinerUDocumentResult(
+        file_task_id="file-123",
+        upstream_task_id="upstream-1",
+        result_root=source,
+        markdown_path=None,
+        middle_json_path=None,
+        content_list_v2_path=manifest_path,
+        legacy_content_list_path=None,
+        images_directory=images,
+    )
+    if references is None:
+        references = (
+            CandidateReference(
+                source_kind=CandidateSourceKind.MINERU_NODE,
+                page_index=0,
+                node_index=0,
+                json_pointer="/0/0",
+                original_node_type=nodes[0]["type"],
+            ),
+        )
+    candidate = ImageCandidate(
+        candidate_id="candidate-1",
+        file_task_id="file-123",
+        result_version=1,
+        sha256=sha256(b"immutable-image").hexdigest(),
+        size_bytes=15,
+        image_format=MinerUImageFormat.PNG,
+        width=10,
+        height=10,
+        primary_path=image,
+        alias_paths=(image,),
+        references=tuple(references),
+        node_type_hints=tuple(dict.fromkeys(r.original_node_type for r in references if r.original_node_type)),
+    )
+    record = SecondaryProcessingRecord.pending_for(candidate, engine=SecondaryOCREngine.PP_STRUCTURE_V3)
+    collection = CandidateCollection(
+        file_task_id="file-123",
+        result_version=1,
+        candidates=(candidate,),
+        processing_records=(record,),
+    )
+    return result, collection, candidate, manifest_path.read_bytes()
+
+
+def _ocr(kind=SecondaryResultKind.TABLE, content="<table><tr><td>识别</td></tr></table>", *, state=SecondaryResultState.VALID):
+    return SecondaryOcrResult(
+        kind=kind,
+        angle=OrthogonalAngle.DEG_90,
+        content=content if kind in {SecondaryResultKind.TABLE, SecondaryResultKind.FORMULA} else None,
+        content_format=(SecondaryContentFormat.HTML if kind is SecondaryResultKind.TABLE else SecondaryContentFormat.LATEX if kind is SecondaryResultKind.FORMULA else None),
+        confidence=0.98,
+        engine=SecondaryOCREngine.PP_STRUCTURE_V3,
+        model_versions={"pipeline": "trusted-v1"},
+        state=state,
+    )
+
+
+def test_table_replacement_publishes_immutable_version_and_audit(tmp_path, limits):
+    original_node = {"type": "image", "bbox": [1, 2, 3, 4], "content": {"image_source": {"path": "images/a.png"}, "note": "safe"}}
+    result, collection, candidate, source_bytes = _setup(tmp_path, [original_node])
+    source_object = json.loads(result.content_list_v2_path.read_text(encoding="utf-8"))
+    publication = merge_and_publish(
+        result, collection, {candidate.candidate_id: _ocr()},
+        publication_root=tmp_path / "published", output_version=2,
+        timestamp=NOW, limits=limits,
+    )
+    final = json.loads(publication.manifest_path.read_text(encoding="utf-8"))
+    node = final[0][0]
+    assert node["type"] == "table"
+    assert node["content"]["image_source"] == {"path": "images/a.png"}
+    assert node["content"]["note"] == "safe"
+    assert node["content"]["html"].startswith("<table>")
+    assert publication.source_version == 1 and publication.output_version == 2
+    assert publication.replacement_count == 1 and publication.retained_count == 0
+    assert publication.records[0].decision is ReplacementDecision.REPLACED
+    assert publication.records[0].reason is ReplacementReason.REPLACED_TABLE
+    assert json.loads(publication.records[0].original_node_snapshot) == original_node
+    assert result.content_list_v2_path.read_bytes() == source_bytes
+    assert source_object == json.loads(result.content_list_v2_path.read_text(encoding="utf-8"))
+
+
+def test_formula_replacement_preserves_fields(tmp_path, limits):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}, "keep": 7}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    publication = merge_and_publish(
+        result, collection, {candidate.candidate_id: _ocr(SecondaryResultKind.FORMULA, r"x_{i}")},
+        publication_root=tmp_path / "published", output_version=2, timestamp=NOW, limits=limits,
+    )
+    changed = json.loads(publication.manifest_path.read_text(encoding="utf-8"))[0][0]
+    assert changed == {"type": "equation_interline", "content": {"image_source": {"path": "images/a.png"}, "math_content": r"x_{i}", "math_type": "latex"}, "keep": 7}
+    assert publication.records[0].reason is ReplacementReason.REPLACED_FORMULA
+
+
+@pytest.mark.parametrize(
+    "ocr,reason",
+    [
+        (_ocr(SecondaryResultKind.OTHER, None), ReplacementReason.OTHER_IMAGE),
+        (_ocr(state=SecondaryResultState.UNCERTAIN), ReplacementReason.UNCERTAIN),
+        (_ocr(state=SecondaryResultState.FAILED), ReplacementReason.FAILED),
+        (_ocr(state=SecondaryResultState.INVALID), ReplacementReason.INVALID_RESULT),
+        (_ocr(content="<table><tr><td></td></tr></table>"), ReplacementReason.INVALID_CONTENT),
+    ],
+)
+def test_noneligible_results_retain_exact_node(tmp_path, limits, ocr, reason):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    publication = merge_and_publish(result, collection, {candidate.candidate_id: ocr}, publication_root=tmp_path / "published", output_version=2, timestamp=NOW, limits=limits)
+    assert json.loads(publication.manifest_path.read_text(encoding="utf-8"))[0][0] == node
+    assert publication.records[0].reason is reason
+
+
+@pytest.mark.parametrize(
+    "node,ocr",
+    [
+        ({"type": "table", "content": {"image_source": {"path": "images/a.png"}, "html": "<table><tr><td>原始</td></tr></table>"}}, _ocr()),
+        ({"type": "equation_interline", "content": {"image_source": {"path": "images/a.png"}, "math_content": "x+y", "math_type": "latex"}}, _ocr(SecondaryResultKind.FORMULA, "z")),
+    ],
+)
+def test_valid_existing_structure_is_diagnostic_only(tmp_path, limits, node, ocr):
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    publication = merge_and_publish(result, collection, {candidate.candidate_id: ocr}, publication_root=tmp_path / "published", output_version=2, timestamp=NOW, limits=limits)
+    assert json.loads(publication.manifest_path.read_text(encoding="utf-8"))[0][0] == node
+    assert publication.records[0].reason is ReplacementReason.ALREADY_STRUCTURED
+
+
+def test_invalid_existing_structure_can_be_replaced(tmp_path, limits):
+    node = {"type": "table", "content": {"image_source": {"path": "images/a.png"}, "html": "<table></table>"}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    publication = merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=tmp_path / "published", output_version=2, timestamp=NOW, limits=limits)
+    assert publication.replacement_count == 1
+
+
+def test_stale_reference_and_standalone_are_each_audited_without_fake_nodes(tmp_path, limits):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    refs = (
+        CandidateReference(source_kind=CandidateSourceKind.MINERU_NODE, page_index=0, node_index=0, json_pointer="/0/0", original_node_type="chart"),
+        CandidateReference.standalone_input(),
+    )
+    result, collection, candidate, _ = _setup(tmp_path, [node], references=refs)
+    publication = merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=tmp_path / "published", output_version=2, timestamp=NOW, limits=limits)
+    assert [record.reason for record in publication.records] == [ReplacementReason.STALE_REFERENCE, ReplacementReason.STANDALONE_REFERENCE]
+    assert publication.records[1].json_pointer is None
+
+
+def test_one_candidate_updates_every_real_reference_in_deterministic_order(tmp_path, limits):
+    nodes = [
+        {"type": "image", "content": {"image_source": {"path": "images/a.png"}}, "slot": 1},
+        {"type": "chart", "content": {"image_source": {"path": "images/a.png"}}, "slot": 2},
+    ]
+    refs = (
+        CandidateReference(source_kind=CandidateSourceKind.MINERU_NODE, page_index=0, node_index=0, json_pointer="/0/0", original_node_type="image"),
+        CandidateReference(source_kind=CandidateSourceKind.MINERU_NODE, page_index=0, node_index=1, json_pointer="/0/1", original_node_type="chart"),
+    )
+    result, collection, candidate, _ = _setup(tmp_path, nodes, references=refs)
+    publication = merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=tmp_path / "published", output_version=2, timestamp=NOW, limits=limits)
+    final = json.loads(publication.manifest_path.read_text(encoding="utf-8"))[0]
+    assert [node["type"] for node in final] == ["table", "table"]
+    assert [record.json_pointer for record in publication.records] == ["/0/0", "/0/1"]
+    assert publication.replacement_count == 2
+    assert len({record.audit_id for record in publication.records}) == 2
+
+
+def test_source_manifest_symlink_is_rejected_without_publication(tmp_path, limits):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    actual = result.content_list_v2_path.with_name("actual.json")
+    result.content_list_v2_path.replace(actual)
+    try:
+        result.content_list_v2_path.symlink_to(actual)
+    except OSError:
+        pytest.skip("symlink privilege unavailable")
+    with pytest.raises(MergeFailure) as raised:
+        merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=tmp_path / "published", output_version=2, timestamp=NOW, limits=limits)
+    assert raised.value.code == MergeErrorCode.INVALID_SOURCE_MANIFEST.value
+    assert not (tmp_path / "published" / "version-00000002").exists()
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "engine", "task", "version", "duplicate_pointer"])
+def test_global_coverage_and_identity_mismatch_publishes_nothing(tmp_path, limits, mutation):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    results = {candidate.candidate_id: _ocr()}
+    if mutation == "missing": results = {}
+    elif mutation == "extra": results["extra"] = _ocr()
+    elif mutation == "engine": results[candidate.candidate_id] = replace(_ocr(), engine=SecondaryOCREngine.PADDLEOCR_VL)
+    elif mutation == "task": result = replace(result, file_task_id="other")
+    elif mutation == "version": pass
+    elif mutation == "duplicate_pointer":
+        other = replace(candidate, candidate_id="candidate-2", sha256="b" * 64)
+        other_record = SecondaryProcessingRecord.pending_for(other, engine=SecondaryOCREngine.PP_STRUCTURE_V3)
+        collection = CandidateCollection(file_task_id="file-123", result_version=1, candidates=(candidate, other), processing_records=(collection.processing_records[0], other_record))
+        results[other.candidate_id] = _ocr()
+    with pytest.raises((MergeFailure, ValueError)):
+        merge_and_publish(result, collection, results, publication_root=tmp_path / "published", output_version=1 if mutation == "version" else 2, timestamp=NOW, limits=limits)
+    assert not (tmp_path / "published" / "version-00000002").exists()
+
+
+def test_malformed_manifest_fails_safely_and_does_not_leak(tmp_path, limits, caplog):
+    planted = "SECRET_PATH_AND_JSON"
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    result.content_list_v2_path.write_text(planted, encoding="utf-8")
+    with pytest.raises(MergeFailure) as raised:
+        merge_and_publish(result, collection, {candidate.candidate_id: _ocr(content=f"<table><tr><td>{planted}</td></tr></table>")}, publication_root=tmp_path / "published", output_version=2, timestamp=NOW, limits=limits)
+    assert raised.value.code == MergeErrorCode.INVALID_SOURCE_MANIFEST.value
+    assert planted not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert planted not in caplog.text
+
+
+def test_idempotent_retry_verifies_bytes_and_conflict_is_safe(tmp_path, limits):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    kwargs = dict(publication_root=tmp_path / "published", output_version=2, timestamp=NOW, limits=limits)
+    first = merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, **kwargs)
+    second = merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, **kwargs)
+    assert first.manifest_sha256 == second.manifest_sha256
+    first.manifest_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(MergeFailure) as raised:
+        merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, **kwargs)
+    assert raised.value.code == MergeErrorCode.PUBLICATION_CONFLICT.value
+
+
+def test_publish_failure_cleans_only_own_stage(tmp_path, limits, monkeypatch):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    root = tmp_path / "published"; root.mkdir(); unrelated = root / ".staging-unrelated"; unrelated.mkdir()
+    monkeypatch.setattr("ocr_mcp_server.services.merge_publication.publish_directory_no_replace", lambda *_: (_ for _ in ()).throw(OSError("SECRET")))
+    with pytest.raises(MergeFailure):
+        merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=root, output_version=2, timestamp=NOW, limits=limits)
+    assert unrelated.exists()
+    assert not list(root.glob(".merge-stage-*"))
+
+
+def test_symlink_publication_root_is_rejected(tmp_path, limits):
+    if not hasattr(Path, "symlink_to"):
+        pytest.skip("symlinks unavailable")
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    real = tmp_path / "real"; real.mkdir(); link = tmp_path / "link"
+    try: link.symlink_to(real, target_is_directory=True)
+    except OSError: pytest.skip("symlink privilege unavailable")
+    with pytest.raises(MergeFailure):
+        merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=link, output_version=2, timestamp=NOW, limits=limits)
+
+
+def test_publication_root_below_symlinked_parent_is_rejected(tmp_path, limits):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    real = tmp_path / "real-parent"; real.mkdir(); link = tmp_path / "linked-parent"
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink privilege unavailable")
+    with pytest.raises(MergeFailure) as raised:
+        merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=link / "child", output_version=2, timestamp=NOW, limits=limits)
+    assert raised.value.code == MergeErrorCode.UNSAFE_PUBLICATION_PATH.value
+    assert not (real / "child" / "version-00000002").exists()
+
+
+def test_rollback_publishes_new_version_equal_to_original_and_detects_tampering(tmp_path, limits):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    root = tmp_path / "published"
+    merged = merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=root, output_version=2, timestamp=NOW, limits=limits)
+    rollback = rollback_publication(merged, publication_root=root, output_version=3, timestamp=NOW, limits=limits)
+    assert rollback.manifest_path.read_bytes() == merged.original_snapshot_path.read_bytes()
+    assert merged.manifest_path.exists()
+    again = rollback_publication(merged, publication_root=root, output_version=3, timestamp=NOW, limits=limits)
+    assert again.manifest_sha256 == rollback.manifest_sha256
+    merged.original_snapshot_path.write_text("[]", encoding="utf-8")
+    with pytest.raises(MergeFailure) as raised:
+        rollback_publication(merged, publication_root=root, output_version=4, timestamp=NOW, limits=limits)
+    assert raised.value.code == MergeErrorCode.ROLLBACK_VERIFICATION_FAILED.value
+
+
+def test_rollback_rejects_tampered_final_manifest_and_conflicting_retry(tmp_path, limits):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    root = tmp_path / "published"
+    merged = merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=root, output_version=2, timestamp=NOW, limits=limits)
+    rollback = rollback_publication(merged, publication_root=root, output_version=3, timestamp=NOW, limits=limits)
+    rollback.audit_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(MergeFailure) as conflict:
+        rollback_publication(merged, publication_root=root, output_version=3, timestamp=NOW, limits=limits)
+    assert conflict.value.code == MergeErrorCode.PUBLICATION_CONFLICT.value
+    merged.manifest_path.write_text("[]", encoding="utf-8")
+    with pytest.raises(MergeFailure) as tampered:
+        rollback_publication(merged, publication_root=root, output_version=4, timestamp=NOW, limits=limits)
+    assert tampered.value.code == MergeErrorCode.ROLLBACK_VERIFICATION_FAILED.value
+
+
+def test_rollback_rejects_hash_adjusted_invalid_publication_schema(tmp_path, limits):
+    node = {"type": "image", "content": {"image_source": {"path": "images/a.png"}}}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    root = tmp_path / "published"
+    merged = merge_and_publish(result, collection, {candidate.candidate_id: _ocr()}, publication_root=root, output_version=2, timestamp=NOW, limits=limits)
+    invalid = b"{}\n"
+    merged.manifest_path.write_bytes(invalid)
+    forged = replace(merged, manifest_sha256=sha256(invalid).hexdigest())
+    with pytest.raises(MergeFailure) as raised:
+        rollback_publication(forged, publication_root=root, output_version=3, timestamp=NOW, limits=limits)
+    assert raised.value.code == MergeErrorCode.ROLLBACK_VERIFICATION_FAILED.value
