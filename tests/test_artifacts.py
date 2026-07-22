@@ -1036,6 +1036,129 @@ def test_posix_named_target_late_swap_never_returns_success(
     assert set(replacement_target.read_bytes()) == {ord("x")}
 
 
+def test_exact_retry_same_size_target_swap_never_returns_success(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result, publication, _, _ = _inputs(tmp_path)
+    artifact_root = (tmp_path / "artifacts").absolute()
+    bundler = ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000))
+    kwargs = dict(
+        artifact_root=artifact_root,
+        batch_id=BATCH_ID,
+        created_at=NOW,
+        expires_at=NOW + timedelta(hours=24),
+    )
+    first = bundler.publish(result, publication, **kwargs)
+    from ocr_mcp_server.services import artifacts as module
+
+    original_fsync = module._PinnedArtifactRoot.fsync
+    moved_target = first.path.with_name(".attacker-moved-exact-target")
+    replacement = b"x" * first.size_bytes
+
+    def swap_during_retry_fsync(self):
+        os.rename(first.path, moved_target)
+        first.path.write_bytes(replacement)
+        return original_fsync(self)
+
+    monkeypatch.setattr(module._PinnedArtifactRoot, "fsync", swap_during_retry_fsync)
+    with pytest.raises(ArtifactFailure) as caught:
+        bundler.publish(result, publication, **kwargs)
+
+    assert caught.value.code == ArtifactErrorCode.PUBLISH_CONFLICT.value
+    assert first.path.read_bytes() == replacement
+    assert sha256(moved_target.read_bytes()).hexdigest() == first.sha256
+
+
+def test_exact_retry_same_inode_content_mutation_never_returns_success(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result, publication, _, _ = _inputs(tmp_path)
+    artifact_root = (tmp_path / "artifacts").absolute()
+    bundler = ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000))
+    kwargs = dict(
+        artifact_root=artifact_root,
+        batch_id=BATCH_ID,
+        created_at=NOW,
+        expires_at=NOW + timedelta(hours=24),
+    )
+    first = bundler.publish(result, publication, **kwargs)
+    from ocr_mcp_server.services import artifacts as module
+
+    original_fsync = module._PinnedArtifactRoot.fsync
+    replacement = b"y" * first.size_bytes
+
+    def mutate_during_retry_fsync(self):
+        with first.path.open("r+b") as target:
+            target.write(replacement)
+            target.flush()
+            os.fsync(target.fileno())
+        return original_fsync(self)
+
+    monkeypatch.setattr(module._PinnedArtifactRoot, "fsync", mutate_during_retry_fsync)
+    with pytest.raises(ArtifactFailure) as caught:
+        bundler.publish(result, publication, **kwargs)
+
+    assert caught.value.code == ArtifactErrorCode.PUBLISH_CONFLICT.value
+    assert first.path.read_bytes() == replacement
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX named publication fallback")
+def test_posix_named_stage_replacement_on_exact_retry_never_succeeds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result, publication, _, _ = _inputs(tmp_path)
+    artifact_root = (tmp_path / "artifacts").absolute()
+    bundler = ArtifactBundler(ArtifactLimits(1_000_000, 100_000, 20, 100_000))
+    kwargs = dict(
+        artifact_root=artifact_root,
+        batch_id=BATCH_ID,
+        created_at=NOW,
+        expires_at=NOW + timedelta(hours=24),
+    )
+    first = bundler.publish(result, publication, **kwargs)
+    from ocr_mcp_server.services import artifacts as module
+
+    real_open = module.os.open
+    temporary_flag = getattr(module.os, "O_TMPFILE", 0)
+
+    def without_otmpfile(path, flags, *args, **kwargs):
+        if temporary_flag and flags & temporary_flag == temporary_flag:
+            raise OSError(errno.EOPNOTSUPP, "planted unsupported anonymous stage")
+        return real_open(path, flags, *args, **kwargs)
+
+    moved_stage: Path | None = None
+    replacement_stage: Path | None = None
+
+    def replace_stage_then_report_existing(self, _descriptor, stage_name, _target_name):
+        nonlocal moved_stage, replacement_stage
+        assert stage_name is not None and self.descriptor is not None
+        moved_stage = self.path / ".attacker-moved-retry-stage"
+        replacement_stage = self.path / stage_name
+        os.rename(
+            stage_name,
+            moved_stage.name,
+            src_dir_fd=self.descriptor,
+            dst_dir_fd=self.descriptor,
+        )
+        replacement_stage.write_bytes(b"attacker stage replacement")
+        raise FileExistsError(errno.EEXIST, "planted exact-existing target")
+
+    monkeypatch.setattr(module.os, "open", without_otmpfile)
+    monkeypatch.setattr(
+        module._PinnedArtifactRoot,
+        "link_no_replace",
+        replace_stage_then_report_existing,
+    )
+    with pytest.raises(ArtifactFailure) as caught:
+        bundler.publish(result, publication, **kwargs)
+
+    assert caught.value.code == ArtifactErrorCode.PUBLISH_FAILED.value
+    assert moved_stage is not None and moved_stage.read_bytes() == b""
+    assert replacement_stage is not None
+    assert replacement_stage.read_bytes() == b"attacker stage replacement"
+    assert sha256(first.path.read_bytes()).hexdigest() == first.sha256
+
+
 def test_post_link_identity_swap_never_returns_success(tmp_path: Path, monkeypatch) -> None:
     result, publication, _, _ = _inputs(tmp_path)
     artifact_root = (tmp_path / "artifacts").absolute()

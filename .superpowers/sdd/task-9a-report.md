@@ -220,3 +220,45 @@ Final verification:
 7. `git diff --check`: exit 0 (line-ending conversion warnings only).
 
 No push or deployment was performed.
+
+## Descriptor-bound success finalization closure (2026-07-22)
+
+A subsequent review found that the exact-existing retry released its no-follow target
+descriptor before the artifact-root durability barrier. The later path-only check
+validated type and size, so a same-size inode replacement or same-inode content
+mutation during root `fsync` could return metadata for bytes that were not finally
+verified. The named-stage `EEXIST` branch also accepted an exact target without first
+proving that the stage name still identified the open, owned stage descriptor.
+
+The exact-existing verifier now returns its verified target descriptor open. Both new
+publication and exact-existing retry pass through one post-`fsync` finalizer that:
+
+- scans and hashes the same open descriptor under the artifact byte limit;
+- re-reads `artifact_manifest.json` from that descriptor;
+- verifies stable descriptor metadata and final no-follow name binding;
+- requires the final descriptor to be the originally verified inode; and
+- derives `publication_identity` only from the final verified descriptor stat.
+
+Before entering the exact-existing branch for a named stage, the publisher now also
+requires the live stage name stat to match the original open stage identity. A moved
+owned stage is scrubbed through its descriptor while an attacker-created replacement
+name is preserved.
+
+Strict TDD evidence:
+
+1. Before the production change, same-size exact-target replacement and same-inode
+   mutation both returned success on Windows and Linux (`DID NOT RAISE`).
+2. Before the production change, POSIX named-stage replacement followed by `EEXIST`
+   also returned success (`DID NOT RAISE`).
+3. After the production change, the exact-retry focus is `2 passed, 1 skipped` on
+   Windows and `4 passed` in the Ubuntu container.
+4. Windows artifact suite: `58 passed, 5 skipped in 1.63s`.
+5. Ubuntu container artifact suite: `59 passed, 4 skipped in 1.41s`.
+6. Windows full suite: `675 passed, 10 skipped in 9.66s`.
+7. Ubuntu container full suite: `674 passed, 10 skipped, 1 failed in 9.02s`.
+   The sole failure remains the separately scoped retention regression
+   `test_owned_root_deletion_leaks_and_preserves_a_concurrent_name_replacement`;
+   all artifact tests pass.
+8. `pip check`, `compileall -q src tests`, and `git diff --check`: exit 0.
+
+No push or deployment was performed.

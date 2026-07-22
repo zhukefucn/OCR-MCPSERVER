@@ -927,6 +927,47 @@ class _PinnedArtifactRoot:
         except BaseException:
             _fail(code)
 
+    def verify_descriptor(
+        self,
+        descriptor: int,
+        name: str,
+        *,
+        expected_identity: os.stat_result,
+        expected_size: int,
+        expected_digest: str,
+        expected_manifest: bytes,
+        limit: int,
+        code: ArtifactErrorCode,
+    ) -> os.stat_result:
+        try:
+            size, digest, initial = self.scan_descriptor(
+                descriptor,
+                name,
+                limit,
+                code,
+            )
+            if (
+                not _same_object(expected_identity, initial)
+                or size != expected_size
+                or digest != expected_digest
+            ):
+                raise OSError
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            with os.fdopen(descriptor, "rb", closefd=False) as source:
+                with zipfile.ZipFile(source) as archive:
+                    if archive.read("artifact_manifest.json") != expected_manifest:
+                        raise OSError
+            final = os.fstat(descriptor)
+            if not _same_stat(initial, final) or not _same_stat(
+                initial, self._named_stat(name)
+            ):
+                raise OSError
+            return final
+        except ArtifactFailure:
+            raise
+        except BaseException:
+            _fail(code)
+
     def verify_existing(
         self,
         name: str,
@@ -935,8 +976,10 @@ class _PinnedArtifactRoot:
         expected_digest: str,
         expected_manifest: bytes,
         limit: int,
-    ) -> None:
+    ) -> tuple[int, os.stat_result, object | None]:
         opened = None
+        descriptor: int | None = None
+        success = False
         try:
             if self.descriptor is None:
                 opened = _open_candidate(self.path / name, confined_root=self.path)
@@ -950,34 +993,30 @@ class _PinnedArtifactRoot:
                     | getattr(os, "O_NOFOLLOW", 0),
                     dir_fd=self.descriptor,
                 )
-            size, digest, initial = self.scan_descriptor(
+            initial = os.fstat(descriptor)
+            final = self.verify_descriptor(
                 descriptor,
                 name,
-                limit,
-                ArtifactErrorCode.PUBLISH_CONFLICT,
+                expected_identity=initial,
+                expected_size=expected_size,
+                expected_digest=expected_digest,
+                expected_manifest=expected_manifest,
+                limit=limit,
+                code=ArtifactErrorCode.PUBLISH_CONFLICT,
             )
-            if size != expected_size or digest != expected_digest:
-                raise OSError
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            with os.fdopen(descriptor, "rb", closefd=False) as source:
-                with zipfile.ZipFile(source) as archive:
-                    if archive.read("artifact_manifest.json") != expected_manifest:
-                        raise OSError
-            if not _same_stat(initial, os.fstat(descriptor)) or not _same_stat(
-                initial, self._named_stat(name)
-            ):
-                raise OSError
+            success = True
+            return descriptor, final, opened
         except ArtifactFailure:
             raise
         except BaseException:
             _fail(ArtifactErrorCode.PUBLISH_CONFLICT)
         finally:
-            if opened is not None:
+            if not success and opened is not None:
                 try:
                     _close_opened(opened)
                 except OSError:
                     _fail(ArtifactErrorCode.PUBLISH_CONFLICT)
-            elif "descriptor" in locals():
+            elif not success and descriptor is not None:
                 try:
                     os.close(descriptor)
                 except OSError:
@@ -1602,6 +1641,9 @@ class ArtifactBundler:
             published = False
             stage_closed = False
             stage_identity = None
+            existing_descriptor: int | None = None
+            existing_identity: os.stat_result | None = None
+            existing_opened = None
             try:
                 try:
                     with os.fdopen(descriptor, "w+b", closefd=False) as raw:
@@ -1651,7 +1693,21 @@ class ArtifactBundler:
                     pinned.link_no_replace(descriptor, stage_name, artifact_name)
                     published = True
                 except FileExistsError:
-                    pinned.verify_existing(
+                    if stage_name is not None:
+                        try:
+                            if not _same_stat(
+                                stage_identity, pinned._named_stat(stage_name)
+                            ):
+                                _fail(ArtifactErrorCode.PUBLISH_FAILED)
+                        except ArtifactFailure:
+                            raise
+                        except BaseException:
+                            _fail(ArtifactErrorCode.PUBLISH_FAILED)
+                    (
+                        existing_descriptor,
+                        existing_identity,
+                        existing_opened,
+                    ) = pinned.verify_existing(
                         artifact_name,
                         expected_size=size,
                         expected_digest=archive_digest,
@@ -1692,18 +1748,29 @@ class ArtifactBundler:
                     or not _same_object(root_identity, os.lstat(artifact_root))
                 ):
                     _fail(ArtifactErrorCode.PUBLISH_FAILED)
-                final_identity = pinned._named_stat(artifact_name)
-                if (
-                    not stat.S_ISREG(final_identity.st_mode)
-                    or final_identity.st_size != size
-                    or (
-                        published
-                        and not _same_object(stage_identity, final_identity)
-                    )
-                ):
-                    if published and pinned.descriptor is not None:
-                        pinned.scrub_stage(descriptor)
+                final_descriptor = descriptor if published else existing_descriptor
+                expected_identity = stage_identity if published else existing_identity
+                if final_descriptor is None or expected_identity is None:
                     _fail(ArtifactErrorCode.PUBLISH_FAILED)
+                try:
+                    final_identity = pinned.verify_descriptor(
+                        final_descriptor,
+                        artifact_name,
+                        expected_identity=expected_identity,
+                        expected_size=size,
+                        expected_digest=archive_digest,
+                        expected_manifest=manifest_bytes,
+                        limit=self._limits.max_artifact_bytes,
+                        code=(
+                            ArtifactErrorCode.PUBLISH_FAILED
+                            if published
+                            else ArtifactErrorCode.PUBLISH_CONFLICT
+                        ),
+                    )
+                except ArtifactFailure:
+                    if published:
+                        pinned.scrub_stage(descriptor)
+                    raise
                 return ArtifactBundle(
                     artifact_id=artifact_id,
                     batch_id=batch_id,
@@ -1727,6 +1794,16 @@ class ArtifactBundler:
                 )
             finally:
                 cleanup_error: BaseException | None = None
+                if existing_opened is not None:
+                    try:
+                        _close_opened(existing_opened)
+                    except OSError as exc:
+                        cleanup_error = exc
+                elif existing_descriptor is not None:
+                    try:
+                        os.close(existing_descriptor)
+                    except OSError as exc:
+                        cleanup_error = exc
                 if not stage_closed:
                     try:
                         if not published and stage_name is not None:
