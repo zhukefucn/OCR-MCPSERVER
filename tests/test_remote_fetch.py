@@ -41,6 +41,12 @@ class ObservedStream(httpx.AsyncByteStream):
         self.closed = True
 
 
+class FailingCloseStream(ObservedStream):
+    async def aclose(self) -> None:
+        self.closed = True
+        raise OSError("sensitive response close detail")
+
+
 async def _consume(incoming) -> bytes:
     return b"".join([chunk async for chunk in incoming.content])
 
@@ -359,6 +365,86 @@ async def test_non_2xx_response_body_and_transport_error_never_enter_failure() -
         assert secret not in str(exc_info.value)
         assert secret not in repr(exc_info.value)
         assert secret not in repr(vars(exc_info.value))
+        assert exc_info.value.__context__ is None
+        assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_dns_failure_has_no_sensitive_exception_context() -> None:
+    async def resolver(hostname: str) -> list[str]:
+        raise OSError("sensitive resolver detail")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: None)) as client:
+        fetcher = RemoteFileFetcher(
+            client=client,
+            allowed_hosts=["files.example.com"],
+            resolver=resolver,
+            max_file_size_bytes=100,
+        )
+        with pytest.raises(FileIntakeFailure) as exc_info:
+            async with fetcher.fetch("https://files.example.com/a.png"):
+                pass
+
+    assert exc_info.value.code == "remote_url_rejected"
+    assert exc_info.value.__context__ is None
+    assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_response_close_failure_does_not_mask_primary_safe_failure() -> None:
+    body = FailingCloseStream([b"12345", b"6"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"Content-Type": "image/png"}, stream=body
+        )
+
+    async def resolver(hostname: str) -> list[str]:
+        return [GLOBAL_V4]
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        fetcher = RemoteFileFetcher(
+            client=client,
+            allowed_hosts=["files.example.com"],
+            resolver=resolver,
+            max_file_size_bytes=5,
+        )
+        with pytest.raises(FileIntakeFailure) as exc_info:
+            async with fetcher.fetch("https://files.example.com/a.png") as incoming:
+                await _consume(incoming)
+
+    assert exc_info.value.code == "file_too_large"
+    assert exc_info.value.__context__ is None
+    assert exc_info.value.__cause__ is None
+    assert body.closed
+
+
+@pytest.mark.asyncio
+async def test_response_close_failure_without_primary_is_safely_wrapped() -> None:
+    body = FailingCloseStream([b"unused"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"Content-Type": "image/png"}, stream=body
+        )
+
+    async def resolver(hostname: str) -> list[str]:
+        return [GLOBAL_V4]
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        fetcher = RemoteFileFetcher(
+            client=client,
+            allowed_hosts=["files.example.com"],
+            resolver=resolver,
+            max_file_size_bytes=100,
+        )
+        with pytest.raises(FileIntakeFailure) as exc_info:
+            async with fetcher.fetch("https://files.example.com/a.png"):
+                pass
+
+    assert exc_info.value.code == "remote_fetch_failed"
+    assert exc_info.value.__context__ is None
+    assert exc_info.value.__cause__ is None
 
 
 @pytest.mark.asyncio

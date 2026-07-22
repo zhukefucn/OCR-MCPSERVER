@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 import warnings
 
 from PIL import Image, UnidentifiedImageError
@@ -50,7 +53,7 @@ class FileValidator:
 
     def validate(
         self,
-        path: Path,
+        source: Path | Callable[[], BinaryIO],
         *,
         display_name: str,
         declared_mime: str,
@@ -64,33 +67,47 @@ class FileValidator:
         if _MIME_TYPES[normalized_mime] is not expected_type:
             raise FileIntakeFailure(FileIntakeErrorCode.MIME_MAGIC_MISMATCH)
 
+        prefix_failed = False
         try:
-            with path.open("rb") as stream:
+            with self._open_source(source) as stream:
                 prefix = stream.read(16)
         except OSError:
-            raise FileIntakeFailure(FileIntakeErrorCode.INVALID_DOCUMENT) from None
+            prefix_failed = True
+            prefix = b""
+        if prefix_failed:
+            raise FileIntakeFailure(FileIntakeErrorCode.INVALID_DOCUMENT)
         if not prefix:
             raise FileIntakeFailure(FileIntakeErrorCode.INVALID_DOCUMENT)
 
         if expected_type is SupportedMediaType.PDF:
             if not prefix.startswith(b"%PDF-"):
                 raise FileIntakeFailure(FileIntakeErrorCode.MIME_MAGIC_MISMATCH)
-            return self._validate_pdf(path, extension)
+            return self._validate_pdf(source, extension)
 
         if prefix.startswith(b"%PDF-"):
             raise FileIntakeFailure(FileIntakeErrorCode.MIME_MAGIC_MISMATCH)
-        return self._validate_image(path, extension, expected_type)
+        return self._validate_image(source, extension, expected_type)
 
-    def _validate_pdf(self, path: Path, extension: str) -> ValidatedFileMetadata:
+    def _validate_pdf(
+        self,
+        source: Path | Callable[[], BinaryIO],
+        extension: str,
+    ) -> ValidatedFileMetadata:
+        invalid_pdf = False
         try:
-            reader = PdfReader(path, strict=True)
-            if reader.is_encrypted:
-                raise FileIntakeFailure(FileIntakeErrorCode.ENCRYPTED_PDF)
-            page_count = len(reader.pages)
+            with self._open_source(source) as stream:
+                reader = PdfReader(stream, strict=True)
+                if reader.is_encrypted:
+                    raise FileIntakeFailure(FileIntakeErrorCode.ENCRYPTED_PDF)
+                page_count = len(reader.pages)
         except FileIntakeFailure:
             raise
         except Exception:
-            raise FileIntakeFailure(FileIntakeErrorCode.INVALID_DOCUMENT) from None
+            invalid_pdf = True
+            page_count = 0
+
+        if invalid_pdf:
+            raise FileIntakeFailure(FileIntakeErrorCode.INVALID_DOCUMENT)
 
         if page_count < 1:
             raise FileIntakeFailure(FileIntakeErrorCode.INVALID_DOCUMENT)
@@ -106,38 +123,45 @@ class FileValidator:
 
     def _validate_image(
         self,
-        path: Path,
+        source: Path | Callable[[], BinaryIO],
         extension: str,
         expected_type: SupportedMediaType,
     ) -> ValidatedFileMetadata:
+        failure_code: FileIntakeErrorCode | None = None
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("error", Image.DecompressionBombWarning)
-                with Image.open(path) as image:
-                    image.verify()
+                with self._open_source(source) as stream, Image.open(stream) as image:
                     decoded_type = _PILLOW_TYPES.get(image.format or "")
-                if decoded_type is not expected_type:
-                    raise FileIntakeFailure(
-                        FileIntakeErrorCode.MIME_MAGIC_MISMATCH
-                    )
-                with Image.open(path) as image:
-                    image.load()
-                    if _PILLOW_TYPES.get(image.format or "") is not expected_type:
+                    if decoded_type is not expected_type:
                         raise FileIntakeFailure(
                             FileIntakeErrorCode.MIME_MAGIC_MISMATCH
                         )
                     width, height = image.size
+                    self._validate_image_dimensions(width, height)
+                    image.verify()
+                with self._open_source(source) as stream, Image.open(stream) as image:
+                    if _PILLOW_TYPES.get(image.format or "") is not expected_type:
+                        raise FileIntakeFailure(
+                            FileIntakeErrorCode.MIME_MAGIC_MISMATCH
+                        )
+                    reopened_width, reopened_height = image.size
+                    if (reopened_width, reopened_height) != (width, height):
+                        raise FileIntakeFailure(
+                            FileIntakeErrorCode.INVALID_DOCUMENT
+                        )
+                    self._validate_image_dimensions(reopened_width, reopened_height)
+                    image.load()
         except FileIntakeFailure:
             raise
         except (Image.DecompressionBombError, Image.DecompressionBombWarning):
-            raise FileIntakeFailure(FileIntakeErrorCode.TOO_MANY_PIXELS) from None
+            failure_code = FileIntakeErrorCode.TOO_MANY_PIXELS
         except (OSError, SyntaxError, ValueError, UnidentifiedImageError):
-            raise FileIntakeFailure(FileIntakeErrorCode.INVALID_DOCUMENT) from None
+            failure_code = FileIntakeErrorCode.INVALID_DOCUMENT
 
-        if width < 1 or height < 1:
-            raise FileIntakeFailure(FileIntakeErrorCode.INVALID_DOCUMENT)
-        if width * height > self._max_image_pixels:
-            raise FileIntakeFailure(FileIntakeErrorCode.TOO_MANY_PIXELS)
+        if failure_code is not None:
+            raise FileIntakeFailure(failure_code)
+
         return ValidatedFileMetadata(
             media_type=expected_type,
             extension=extension,
@@ -145,3 +169,22 @@ class FileValidator:
             width=width,
             height=height,
         )
+
+    def _validate_image_dimensions(self, width: int, height: int) -> None:
+        if width < 1 or height < 1:
+            raise FileIntakeFailure(FileIntakeErrorCode.INVALID_DOCUMENT)
+        if width * height > self._max_image_pixels:
+            raise FileIntakeFailure(FileIntakeErrorCode.TOO_MANY_PIXELS)
+
+    @staticmethod
+    @contextmanager
+    def _open_source(source: Path | Callable[[], BinaryIO]):
+        if isinstance(source, Path):
+            with source.open("rb") as stream:
+                yield stream
+            return
+        stream = source()
+        try:
+            yield stream
+        finally:
+            stream.close()

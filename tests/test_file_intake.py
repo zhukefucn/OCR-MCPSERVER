@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
+import hashlib
 from io import BytesIO
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4, uuid5
 
 import pytest
 from PIL import Image
@@ -179,3 +181,70 @@ async def test_intake_rejects_a_twenty_first_file_before_consuming_stream(
 
     assert exc_info.value.code == "batch_capacity_exceeded"
     assert consumed is False
+
+
+@pytest.mark.asyncio
+async def test_two_service_instances_cannot_publish_past_shared_file_limit(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    batch_id = str(uuid4())
+    first = _service(data_root, max_files=1)
+    second = _service(data_root, max_files=1)
+    first_payload = _pdf_bytes()
+    second_payload = first_payload + b"\n% second distinct payload"
+
+    async def interleaved(payload: bytes) -> AsyncIterator[bytes]:
+        midpoint = len(payload) // 2
+        yield payload[:midpoint]
+        await asyncio.sleep(0.05)
+        yield payload[midpoint:]
+
+    results = await asyncio.gather(
+        first.ingest_upload(
+            batch_id,
+            IncomingFile("first.pdf", "application/pdf", interleaved(first_payload)),
+        ),
+        second.ingest_upload(
+            batch_id,
+            IncomingFile("second.pdf", "application/pdf", interleaved(second_payload)),
+        ),
+        return_exceptions=True,
+    )
+
+    stored = [result for result in results if not isinstance(result, BaseException)]
+    rejected = [result for result in results if isinstance(result, FileIntakeFailure)]
+    assert len(stored) == 1
+    assert len(rejected) == 1
+    assert rejected[0].code == "batch_capacity_exceeded"
+    assert len(list((data_root / batch_id / "input").glob("*.pdf"))) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_equal_hash_uses_batch_scoped_deterministic_uuid(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    batch_id = str(uuid4())
+    payload = _pdf_bytes()
+    expected_id = str(uuid5(UUID(batch_id), hashlib.sha256(payload).hexdigest()))
+    services = (_service(data_root), _service(data_root))
+
+    async def interleaved() -> AsyncIterator[bytes]:
+        midpoint = len(payload) // 2
+        yield payload[:midpoint]
+        await asyncio.sleep(0.05)
+        yield payload[midpoint:]
+
+    first, second = await asyncio.gather(
+        services[0].ingest_upload(
+            batch_id, IncomingFile("first.pdf", "application/pdf", interleaved())
+        ),
+        services[1].ingest_upload(
+            batch_id, IncomingFile("second.pdf", "application/pdf", interleaved())
+        ),
+    )
+
+    assert first == second
+    assert first.file_id == expected_id
+    assert len(list((data_root / batch_id / "input").glob("*.pdf"))) == 1

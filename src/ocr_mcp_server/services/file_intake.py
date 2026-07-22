@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Sequence
 
 from ..domain.constants import DEFAULT_MAX_BATCH_SIZE_BYTES, DEFAULT_MAX_FILES
@@ -51,14 +50,13 @@ class FileIntakeService:
         self._max_files = max_files
         self._max_file_size_bytes = max_file_size_bytes
         self._max_batch_size_bytes = max_batch_size_bytes
-        self._lock = asyncio.Lock()
 
     async def ingest_upload(
         self,
         batch_id: str,
         incoming: IncomingFile,
     ) -> StoredFile:
-        async with self._lock:
+        async with self._storage.batch_lock(batch_id):
             usage = self._storage.batch_usage(batch_id)
             validate_batch_capacity(
                 usage.file_count,

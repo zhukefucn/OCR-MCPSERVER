@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from PIL import Image
+from PIL import Image, PngImagePlugin
 from pypdf import PdfWriter
 
 from ocr_mcp_server.domain.errors import FileIntakeFailure
@@ -127,6 +127,30 @@ def test_validator_rejects_one_pixel_above_configured_limit(tmp_path: Path) -> N
     _assert_code(exc_info, "image_too_many_pixels")
 
 
+def test_pixel_cap_rejects_before_pillow_verify_or_decode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "image.part"
+    _write_image(path, "PNG", (101, 1))
+    verify_called = False
+    original_verify = PngImagePlugin.PngImageFile.verify
+
+    def observed_verify(image) -> None:
+        nonlocal verify_called
+        verify_called = True
+        original_verify(image)
+
+    monkeypatch.setattr(PngImagePlugin.PngImageFile, "verify", observed_verify)
+
+    with pytest.raises(FileIntakeFailure) as exc_info:
+        FileValidator(max_pages=500, max_image_pixels=100).validate(
+            path, display_name="image.png", declared_mime="image/png"
+        )
+
+    _assert_code(exc_info, "image_too_many_pixels")
+    assert verify_called is False
+
+
 def test_validator_converts_pillow_bomb_warning_to_safe_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -184,3 +208,18 @@ def test_validator_rejects_extension_mime_and_content_disagreement(
         )
 
     _assert_code(exc_info, expected_code)
+
+
+def test_validator_oserror_has_no_sensitive_exception_context(tmp_path: Path) -> None:
+    missing = tmp_path / "sensitive-original-name.pdf"
+
+    with pytest.raises(FileIntakeFailure) as exc_info:
+        FileValidator(max_pages=500, max_image_pixels=100).validate(
+            missing,
+            display_name="document.pdf",
+            declared_mime="application/pdf",
+        )
+
+    assert exc_info.value.code == "document_invalid"
+    assert exc_info.value.__context__ is None
+    assert exc_info.value.__cause__ is None

@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from io import BytesIO
 import os
 from pathlib import Path
+import subprocess
 from uuid import UUID, uuid4
 
 import pytest
@@ -141,6 +142,155 @@ async def test_storage_rejects_preexisting_symlink_in_storage_chain(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+async def test_storage_rejects_windows_junction_in_storage_chain(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    batch_id = str(uuid4())
+    batch_dir = data_root / batch_id
+    batch_dir.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    junction = batch_dir / "input"
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip("directory junctions unavailable")
+
+    try:
+        with pytest.raises(FileIntakeFailure) as exc_info:
+            await FileStorage(data_root).store(
+                batch_id,
+                IncomingFile(
+                    "document.pdf", "application/pdf", _chunks(_pdf_bytes())
+                ),
+                max_file_size_bytes=10_000,
+                validator=_validator(),
+            )
+        assert exc_info.value.code == "path_unsafe"
+        assert not list(outside.iterdir())
+    finally:
+        if os.path.lexists(junction):
+            os.rmdir(junction)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="POSIX open directory handle regression")
+async def test_storage_rejects_input_directory_replaced_by_symlink_mid_stream(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    batch_id = str(uuid4())
+    input_dir = data_root / batch_id / "input"
+    moved_dir = data_root / batch_id / "input-held"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    payload = _pdf_bytes()
+
+    async def replaced_directory() -> AsyncIterator[bytes]:
+        yield payload[: len(payload) // 2]
+        part = next(input_dir.glob("*.part"))
+        input_dir.rename(moved_dir)
+        os.symlink(outside, input_dir, target_is_directory=True)
+        (outside / part.name).write_bytes(payload)
+        yield payload[len(payload) // 2 :]
+
+    try:
+        with pytest.raises(FileIntakeFailure) as exc_info:
+            await FileStorage(data_root).store(
+                batch_id,
+                IncomingFile(
+                    "document.pdf", "application/pdf", replaced_directory()
+                ),
+                max_file_size_bytes=10_000,
+                validator=_validator(),
+            )
+        assert exc_info.value.code == "path_unsafe"
+        assert not list(outside.glob("*.pdf"))
+    finally:
+        if input_dir.is_symlink():
+            input_dir.unlink()
+        if moved_dir.exists() and not input_dir.exists():
+            moved_dir.rename(input_dir)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="POSIX staged inode replacement regression")
+async def test_storage_never_validates_or_publishes_replaced_staged_name(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    batch_id = str(uuid4())
+    input_dir = data_root / batch_id / "input"
+    payload = _pdf_bytes()
+    replacement_writer = PdfWriter()
+    replacement_writer.add_blank_page(width=72, height=72)
+    replacement_writer.add_blank_page(width=72, height=72)
+    replacement_output = BytesIO()
+    replacement_writer.write(replacement_output)
+    replacement = replacement_output.getvalue()
+
+    async def replaced_stage() -> AsyncIterator[bytes]:
+        yield payload[: len(payload) // 2]
+        part = next(input_dir.glob("*.part"))
+        part.unlink()
+        part.write_bytes(replacement)
+        yield payload[len(payload) // 2 :]
+
+    try:
+        stored = await FileStorage(data_root).store(
+            batch_id,
+            IncomingFile("document.pdf", "application/pdf", replaced_stage()),
+            max_file_size_bytes=10_000,
+            validator=_validator(),
+        )
+    except FileIntakeFailure as failure:
+        assert failure.code == "path_unsafe"
+        assert not list(input_dir.glob("*.pdf"))
+    else:
+        assert stored.path.read_bytes() == payload
+        assert stored.page_count == 1
+
+
+@pytest.mark.asyncio
+async def test_publication_cleanup_fault_never_escapes_raw_oserror_or_leaves_part(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_unlink = Path.unlink
+    failed_once = False
+
+    def fail_first_part_unlink(path: Path, *args, **kwargs):
+        nonlocal failed_once
+        if path.suffix == ".part" and not failed_once:
+            failed_once = True
+            raise OSError("sensitive cleanup filesystem detail")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_first_part_unlink)
+    data_root = tmp_path / "data"
+    batch_id = str(uuid4())
+    try:
+        stored = await FileStorage(data_root).store(
+            batch_id,
+            IncomingFile("document.pdf", "application/pdf", _chunks(_pdf_bytes())),
+            max_file_size_bytes=10_000,
+            validator=_validator(),
+        )
+    except FileIntakeFailure as failure:
+        assert failure.code == "path_unsafe"
+        assert failure.__context__ is None
+    else:
+        assert stored.path.exists()
+
+    input_dir = data_root / batch_id / "input"
+    assert not list(input_dir.glob("*.part"))
+
+
+@pytest.mark.asyncio
 async def test_storage_never_overwrites_an_existing_target(tmp_path: Path) -> None:
     file_id = "cc13cd13-86e2-4659-8677-959e494f7091"
     batch_id = str(uuid4())
@@ -189,3 +339,102 @@ def test_batch_usage_is_read_only_for_an_absent_batch(tmp_path: Path) -> None:
 
     assert (usage.file_count, usage.total_bytes) == (0, 0)
     assert not data_root.exists()
+
+
+def test_batch_usage_oserror_has_no_sensitive_exception_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root = tmp_path / "data"
+    batch_id = str(uuid4())
+    (data_root / batch_id / "input").mkdir(parents=True)
+
+    def failed_scan(path):
+        raise OSError("sensitive directory scan detail")
+
+    monkeypatch.setattr(os, "scandir", failed_scan)
+    with pytest.raises(FileIntakeFailure) as exc_info:
+        FileStorage(data_root).batch_usage(batch_id)
+
+    assert exc_info.value.code == "path_unsafe"
+    assert exc_info.value.__context__ is None
+    assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_public_store_sanitizes_atomic_publish_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failed_publish(storage, directory, source_name, target_name):
+        raise OSError("sensitive atomic publish detail")
+
+    monkeypatch.setattr(FileStorage, "_publish_no_replace", failed_publish)
+    data_root = tmp_path / "data"
+    batch_id = str(uuid4())
+    with pytest.raises(FileIntakeFailure) as exc_info:
+        await FileStorage(data_root).store(
+            batch_id,
+            IncomingFile("document.pdf", "application/pdf", _chunks(_pdf_bytes())),
+            max_file_size_bytes=10_000,
+            validator=_validator(),
+        )
+
+    assert exc_info.value.code == "path_unsafe"
+    assert exc_info.value.__context__ is None
+    assert exc_info.value.__cause__ is None
+    assert not list((data_root / batch_id / "input").glob("*.part"))
+
+
+def test_hardlink_fallback_retries_transient_source_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = FileStorage(tmp_path)
+    directory = storage._open_directory(tmp_path)
+    source_name = "source.part"
+    target_name = "target.pdf"
+    (tmp_path / source_name).write_bytes(b"payload")
+    original_unlink = storage._unlink_name
+    source_failures = 0
+
+    def transient_unlink(opened, name, *, missing_ok=False):
+        nonlocal source_failures
+        if name == source_name and source_failures == 0:
+            source_failures += 1
+            raise OSError("transient cleanup failure")
+        return original_unlink(opened, name, missing_ok=missing_ok)
+
+    monkeypatch.setattr(storage, "_unlink_name", transient_unlink)
+    try:
+        storage._hardlink_publish(directory, source_name, target_name)
+    finally:
+        if directory.descriptor is not None:
+            os.close(directory.descriptor)
+
+    assert not (tmp_path / source_name).exists()
+    assert (tmp_path / target_name).read_bytes() == b"payload"
+
+
+def test_hardlink_fallback_rolls_back_target_when_source_unlink_persists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = FileStorage(tmp_path)
+    directory = storage._open_directory(tmp_path)
+    source_name = "source.part"
+    target_name = "target.pdf"
+    (tmp_path / source_name).write_bytes(b"payload")
+    original_unlink = storage._unlink_name
+
+    def persistent_unlink(opened, name, *, missing_ok=False):
+        if name == source_name:
+            raise OSError("persistent cleanup failure")
+        return original_unlink(opened, name, missing_ok=missing_ok)
+
+    monkeypatch.setattr(storage, "_unlink_name", persistent_unlink)
+    try:
+        with pytest.raises(OSError):
+            storage._hardlink_publish(directory, source_name, target_name)
+    finally:
+        if directory.descriptor is not None:
+            os.close(directory.descriptor)
+
+    assert (tmp_path / source_name).read_bytes() == b"payload"
+    assert not (tmp_path / target_name).exists()

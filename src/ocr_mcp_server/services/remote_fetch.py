@@ -74,10 +74,18 @@ class RemoteFileFetcher:
             declared_mime=response.headers.get("Content-Type", ""),
             content=self._response_chunks(response),
         )
+        primary: BaseException | None = None
         try:
             yield incoming
-        finally:
-            await response.aclose()
+        except BaseException as exc:
+            primary = exc
+        close_succeeded = await self._close_response(response)
+        if primary is not None:
+            if isinstance(primary, FileIntakeFailure):
+                self._clear_exception_context(primary)
+            raise primary
+        if not close_succeeded:
+            raise FileIntakeFailure(FileIntakeErrorCode.REMOTE_FETCH_FAILED)
 
     async def _open_response(self, url: str) -> tuple[httpx.Response, str]:
         current_url = url
@@ -91,6 +99,7 @@ class RemoteFileFetcher:
                 raise FileIntakeFailure(FileIntakeErrorCode.REMOTE_URL_REJECTED)
             visited.add(cycle_key)
 
+            send_failed = False
             try:
                 request = self._client.build_request(
                     "GET", current_url, timeout=self._timeout
@@ -101,45 +110,49 @@ class RemoteFileFetcher:
                     follow_redirects=False,
                 )
             except Exception:
-                raise FileIntakeFailure(
-                    FileIntakeErrorCode.REMOTE_FETCH_FAILED
-                ) from None
+                send_failed = True
+            if send_failed:
+                raise FileIntakeFailure(FileIntakeErrorCode.REMOTE_FETCH_FAILED)
 
             if response.status_code in _REDIRECT_STATUSES:
                 location = response.headers.get("Location")
-                await response.aclose()
                 if not location or redirects >= self._max_redirects:
+                    await self._close_response(response)
                     raise FileIntakeFailure(
                         FileIntakeErrorCode.REMOTE_URL_REJECTED
+                    )
+                if not await self._close_response(response):
+                    raise FileIntakeFailure(
+                        FileIntakeErrorCode.REMOTE_FETCH_FAILED
                     )
                 current_url = urljoin(current_url, location)
                 redirects += 1
                 continue
 
             if not 200 <= response.status_code < 300:
-                await response.aclose()
+                await self._close_response(response)
                 raise FileIntakeFailure(FileIntakeErrorCode.REMOTE_FETCH_FAILED)
 
             content_length = response.headers.get("Content-Length")
             if content_length is not None:
+                invalid_length = False
                 try:
                     declared_length = int(content_length)
                 except (TypeError, ValueError):
-                    await response.aclose()
-                    raise FileIntakeFailure(
-                        FileIntakeErrorCode.REMOTE_FETCH_FAILED
-                    ) from None
-                if declared_length < 0:
-                    await response.aclose()
+                    invalid_length = True
+                    declared_length = -1
+                if invalid_length or declared_length < 0:
+                    await self._close_response(response)
                     raise FileIntakeFailure(
                         FileIntakeErrorCode.REMOTE_FETCH_FAILED
                     )
                 if declared_length > self._max_file_size_bytes:
-                    await response.aclose()
+                    await self._close_response(response)
                     raise FileIntakeFailure(FileIntakeErrorCode.TOO_LARGE)
             return response, current_url
 
     async def _validate_url_and_dns(self, url: str) -> None:
+        invalid_url = False
         try:
             split = urlsplit(url)
             if split.scheme.lower() != "https":
@@ -163,13 +176,20 @@ class RemoteFileFetcher:
             if hostname not in self._allowed_hosts:
                 raise ValueError
         except (UnicodeError, ValueError):
-            raise FileIntakeFailure(FileIntakeErrorCode.REMOTE_URL_REJECTED) from None
+            invalid_url = True
+            hostname = ""
+        if invalid_url:
+            raise FileIntakeFailure(FileIntakeErrorCode.REMOTE_URL_REJECTED)
 
+        resolution_failed = False
         try:
             addresses = await self._resolver(hostname)
             parsed = tuple(ipaddress.ip_address(address) for address in addresses)
         except Exception:
-            raise FileIntakeFailure(FileIntakeErrorCode.REMOTE_URL_REJECTED) from None
+            resolution_failed = True
+            parsed = ()
+        if resolution_failed:
+            raise FileIntakeFailure(FileIntakeErrorCode.REMOTE_URL_REJECTED)
         if not parsed or any(not address.is_global for address in parsed):
             raise FileIntakeFailure(FileIntakeErrorCode.REMOTE_URL_REJECTED)
 
@@ -177,6 +197,7 @@ class RemoteFileFetcher:
         self, response: httpx.Response
     ) -> AsyncIterator[bytes]:
         total = 0
+        failure: FileIntakeFailure | None = None
         try:
             async for chunk in response.aiter_bytes():
                 if not chunk:
@@ -185,12 +206,28 @@ class RemoteFileFetcher:
                 if total > self._max_file_size_bytes:
                     raise FileIntakeFailure(FileIntakeErrorCode.TOO_LARGE)
                 yield chunk
-        except FileIntakeFailure:
-            raise
+        except FileIntakeFailure as exc:
+            failure = exc
         except Exception:
-            raise FileIntakeFailure(FileIntakeErrorCode.REMOTE_FETCH_FAILED) from None
-        finally:
+            failure = FileIntakeFailure(FileIntakeErrorCode.REMOTE_FETCH_FAILED)
+        if failure is not None:
+            self._clear_exception_context(failure)
+            raise failure
+
+    @staticmethod
+    async def _close_response(response: httpx.Response) -> bool:
+        close_failed = False
+        try:
             await response.aclose()
+        except Exception:
+            close_failed = True
+        return not close_failed
+
+    @staticmethod
+    def _clear_exception_context(failure: FileIntakeFailure) -> None:
+        failure.__context__ = None
+        failure.__cause__ = None
+        failure.__suppress_context__ = True
 
     @staticmethod
     def _canonical_hostname(hostname: str) -> str:
