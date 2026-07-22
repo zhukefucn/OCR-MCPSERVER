@@ -17,10 +17,13 @@ from ctypes import wintypes
 from dataclasses import dataclass
 import errno
 import hashlib
+import io
 import os
 from pathlib import Path
 import stat
 import sys
+import threading
+from typing import BinaryIO
 from uuid import UUID, uuid4, uuid5
 
 from ..domain.constants import SUPPORTED_EXTENSIONS
@@ -57,6 +60,80 @@ class _OpenedDirectory:
     descriptor: int | None
     windows_handle: int | None
     identity: tuple[int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _DerivativeOutcome:
+    stored: StoredFile
+    directory: _OpenedDirectory
+    descriptor: int
+    identity: tuple[int, int]
+    name: str
+
+
+class _BoundedWriter:
+    """Seek-compatible binary writer that rejects growth before it happens."""
+
+    def __init__(self, raw: BinaryIO, limit: int) -> None:
+        self._raw = raw
+        self._limit = limit
+        self._extent = 0
+
+    def write(self, data) -> int:
+        try:
+            view = memoryview(data)
+        except TypeError:
+            raise TypeError("a bytes-like object is required") from None
+        if not view.c_contiguous:
+            raise TypeError("non-contiguous writes are not supported")
+        byte_view = view.cast("B")
+        size = byte_view.nbytes
+        end = self.tell() + size
+        if max(self._extent, end) > self._limit:
+            raise FileIntakeFailure(FileIntakeErrorCode.TOO_LARGE)
+        written = self._raw.write(byte_view)
+        if written is None or written < 0 or written > size:
+            raise OSError("invalid write result")
+        self._extent = max(self._extent, self.tell())
+        return written
+
+    def writelines(self, lines) -> None:
+        for line in lines:
+            self.write(line)
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        return self._raw.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._raw.tell()
+
+    def truncate(self, size: int | None = None) -> int:
+        target = self.tell() if size is None else size
+        if type(target) is not int or target < 0 or target > self._limit:
+            raise FileIntakeFailure(FileIntakeErrorCode.TOO_LARGE)
+        result = self._raw.truncate(target)
+        self._extent = target
+        return result
+
+    def flush(self) -> None:
+        self._raw.flush()
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return False
+
+    def fileno(self) -> int:
+        raise io.UnsupportedOperation("descriptor access is not available")
+
+    @property
+    def closed(self) -> bool:
+        return self._raw.closed
+
 
 
 class FileStorage:
@@ -352,6 +429,375 @@ class FileStorage:
         if cleanup_failed or result is None:
             raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
         return result
+
+    async def create_immutable_derivative(
+        self,
+        batch_id: str,
+        source_file_id: str,
+        extension: str,
+        *,
+        transform: Callable[[BinaryIO, BinaryIO], None],
+        max_file_size_bytes: int,
+        validator: FileValidator,
+    ) -> StoredFile:
+        """Transform a held input into a new server-named sibling atomically.
+
+        Both names are derived solely from canonical UUIDs and a supported
+        extension.  The callback receives duplicate handles, never paths.
+        """
+
+        if type(max_file_size_bytes) is not int or max_file_size_bytes < 1:
+            raise FileIntakeFailure(FileIntakeErrorCode.TOO_LARGE)
+        cancelled = threading.Event()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                self._create_immutable_derivative_sync,
+                batch_id,
+                source_file_id,
+                extension,
+                transform,
+                max_file_size_bytes,
+                validator,
+                cancelled,
+            )
+        )
+        try:
+            outcome = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled.set()
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                except BaseException:
+                    break
+            outcome = None
+            if not worker.cancelled():
+                try:
+                    outcome = worker.result()
+                except BaseException:
+                    pass
+            if isinstance(outcome, _DerivativeOutcome):
+                rollback = asyncio.create_task(
+                    asyncio.to_thread(
+                        self._scrub_immutable_derivative_sync,
+                        batch_id,
+                        outcome,
+                    )
+                )
+                while not rollback.done():
+                    try:
+                        await asyncio.shield(rollback)
+                    except asyncio.CancelledError:
+                        continue
+                    except BaseException:
+                        break
+                try:
+                    rollback.result()
+                except BaseException:
+                    raise FileIntakeFailure(
+                        FileIntakeErrorCode.UNSAFE_PATH
+                    ) from None
+            raise
+        # This is the commit linearization point.  It deliberately contains no
+        # await: only held-descriptor/name verification and handle closure are
+        # performed, so cancellation lands either before it (rollback above)
+        # or after the successfully returned result.
+        self._commit_immutable_derivative_sync(outcome)
+        return outcome.stored
+
+    def _create_immutable_derivative_sync(
+        self,
+        batch_id: str,
+        source_file_id: str,
+        extension: str,
+        transform: Callable[[BinaryIO, BinaryIO], None],
+        max_file_size_bytes: int,
+        validator: FileValidator,
+        cancelled: threading.Event,
+    ) -> _DerivativeOutcome:
+        canonical_batch_id = self._canonical_uuid(batch_id)
+        canonical_source_id = self._canonical_uuid(source_file_id)
+        normalized_extension = extension.lower() if isinstance(extension, str) else ""
+        if normalized_extension not in SUPPORTED_EXTENSIONS:
+            raise FileIntakeFailure(FileIntakeErrorCode.UNSUPPORTED_TYPE)
+        target_id = self._canonical_uuid(
+            str(uuid4() if self._id_factory is None else self._id_factory())
+        )
+        if target_id == canonical_source_id:
+            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+
+        directory: _OpenedDirectory | None = None
+        source_descriptor: int | None = None
+        staged_descriptor: int | None = None
+        staged_identity: tuple[int, int] | None = None
+        part_name = f".{uuid4()}.part"
+        target_name = f"{target_id}{normalized_extension}"
+        source_name = f"{canonical_source_id}{normalized_extension}"
+        published = False
+        result: StoredFile | None = None
+        failure: BaseException | None = None
+        try:
+            directory = self._open_input_directory(canonical_batch_id, create=False)
+            if directory is None:
+                raise OSError("input directory unavailable")
+            source_descriptor = self._open_existing_file(directory, source_name)
+            source_info = os.fstat(source_descriptor)
+            source_identity = self._identity(source_info)
+            if (
+                self._is_reparse(source_info)
+                or not stat.S_ISREG(source_info.st_mode)
+                or source_info.st_nlink != 1
+            ):
+                raise OSError("unsafe source")
+            self._assert_name_identity(directory, source_name, source_identity)
+            source_digest = self._hash_descriptor(source_descriptor)
+
+            staged_descriptor = self._open_part(directory, part_name)
+            staged_identity = self._identity(os.fstat(staged_descriptor))
+            with self._duplicate_reader(source_descriptor) as reader, os.fdopen(
+                os.dup(staged_descriptor), "wb", closefd=True
+            ) as raw_writer:
+                writer = _BoundedWriter(raw_writer, max_file_size_bytes)
+                transform(reader, writer)  # type: ignore[arg-type]
+                writer.flush()
+            if cancelled.is_set():
+                raise asyncio.CancelledError
+            output_info = os.fstat(staged_descriptor)
+            if (
+                self._is_reparse(output_info)
+                or not stat.S_ISREG(output_info.st_mode)
+                or output_info.st_nlink != 1
+                or self._identity(output_info) != staged_identity
+                or output_info.st_size < 1
+                or output_info.st_size > max_file_size_bytes
+            ):
+                raise FileIntakeFailure(FileIntakeErrorCode.TOO_LARGE)
+            os.fsync(staged_descriptor)
+
+            mime = {
+                ".pdf": "application/pdf",
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+            }[normalized_extension]
+            metadata = validator.validate(
+                lambda: self._duplicate_reader(staged_descriptor),
+                display_name=target_name,
+                declared_mime=mime,
+            )
+            if cancelled.is_set():
+                raise asyncio.CancelledError
+            current_source = os.fstat(source_descriptor)
+            if (
+                self._is_reparse(current_source)
+                or not stat.S_ISREG(current_source.st_mode)
+                or current_source.st_nlink != 1
+                or self._identity(current_source) != source_identity
+                or current_source.st_size != source_info.st_size
+                or self._hash_descriptor(source_descriptor) != source_digest
+            ):
+                raise OSError("source changed")
+            self._assert_name_identity(directory, source_name, source_identity)
+            self._assert_staged_identity(
+                directory, part_name, staged_descriptor, staged_identity
+            )
+            before_publish = os.fstat(staged_descriptor)
+            if (
+                self._is_reparse(before_publish)
+                or not stat.S_ISREG(before_publish.st_mode)
+                or before_publish.st_nlink != 1
+                or self._identity(before_publish) != staged_identity
+                or before_publish.st_size != output_info.st_size
+            ):
+                raise OSError("unsafe staged output")
+            if cancelled.is_set():
+                raise asyncio.CancelledError
+            self._publish_no_replace(
+                directory,
+                part_name,
+                target_name,
+                descriptor=staged_descriptor,
+            )
+            published = True
+            if not self._directory_unchanged(directory):
+                raise OSError("input directory changed")
+            self._assert_published_identity(
+                directory, target_name, staged_descriptor, staged_identity
+            )
+            published_info = os.fstat(staged_descriptor)
+            if (
+                self._is_reparse(published_info)
+                or not stat.S_ISREG(published_info.st_mode)
+                or published_info.st_nlink != 1
+                or self._identity(published_info) != staged_identity
+                or published_info.st_size != output_info.st_size
+            ):
+                raise OSError("unsafe published output")
+            if cancelled.is_set():
+                raise asyncio.CancelledError
+            result = StoredFile(
+                file_id=target_id,
+                path=directory.path / target_name,
+                sha256=self._hash_descriptor(staged_descriptor),
+                size_bytes=output_info.st_size,
+                media_type=metadata.media_type,
+                extension=metadata.extension,
+                page_count=metadata.page_count,
+                width=metadata.width,
+                height=metadata.height,
+            )
+        except BaseException as exc:
+            if isinstance(exc, FileIntakeFailure) or not isinstance(exc, Exception):
+                failure = exc
+            else:
+                failure = FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+
+        cleanup_failed = False
+        if source_descriptor is not None:
+            try:
+                os.close(source_descriptor)
+            except OSError:
+                cleanup_failed = True
+        if cleanup_failed and failure is None:
+            failure = FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+        if failure is not None and staged_descriptor is not None:
+            scrubbed = False
+            for _ in range(2):
+                try:
+                    os.ftruncate(staged_descriptor, 0)
+                    os.fsync(staged_descriptor)
+                    scrubbed = True
+                    break
+                except OSError:
+                    continue
+            cleanup_failed = not scrubbed or cleanup_failed
+        if failure is not None and staged_descriptor is not None and staged_identity is not None:
+            cleanup_name = target_name if published else part_name
+            cleanup_failed = (
+                not self._cleanup_staged_name(
+                    directory,
+                    cleanup_name,
+                    staged_identity,
+                    descriptor=staged_descriptor,
+                )
+                or cleanup_failed
+            )
+
+        if failure is not None:
+            if staged_descriptor is not None:
+                try:
+                    os.close(staged_descriptor)
+                except OSError:
+                    cleanup_failed = True
+            self._close_directory(directory)
+            if isinstance(failure, FileIntakeFailure):
+                self._clear_exception_context(failure)
+            raise failure
+        if cleanup_failed or result is None or directory is None or staged_descriptor is None:
+            if staged_descriptor is not None:
+                try:
+                    os.close(staged_descriptor)
+                except OSError:
+                    pass
+            self._close_directory(directory)
+            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+        return _DerivativeOutcome(
+            result,
+            directory,
+            staged_descriptor,
+            staged_identity,
+            target_name,
+        )
+
+    def _scrub_immutable_derivative_sync(
+        self,
+        batch_id: str,
+        outcome: _DerivativeOutcome,
+    ) -> None:
+        del batch_id
+        failure = False
+        try:
+            info = os.fstat(outcome.descriptor)
+            if (
+                self._is_reparse(info)
+                or not stat.S_ISREG(info.st_mode)
+                or self._identity(info) != outcome.identity
+                or info.st_size != outcome.stored.size_bytes
+            ):
+                failure = True
+            scrubbed = False
+            for _ in range(2):
+                try:
+                    os.ftruncate(outcome.descriptor, 0)
+                    os.fsync(outcome.descriptor)
+                    scrubbed = True
+                    break
+                except OSError:
+                    continue
+            if not scrubbed or not self._cleanup_staged_name(
+                outcome.directory,
+                outcome.name,
+                outcome.identity,
+                descriptor=outcome.descriptor,
+            ):
+                failure = True
+        finally:
+            try:
+                os.close(outcome.descriptor)
+            except OSError:
+                failure = True
+            if not self._close_held_directory(outcome.directory):
+                failure = True
+        if failure:
+            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+
+    def _commit_immutable_derivative_sync(
+        self, outcome: _DerivativeOutcome
+    ) -> None:
+        valid = False
+        try:
+            info = os.fstat(outcome.descriptor)
+            valid = (
+                not self._is_reparse(info)
+                and stat.S_ISREG(info.st_mode)
+                and info.st_nlink == 1
+                and self._identity(info) == outcome.identity
+                and info.st_size == outcome.stored.size_bytes
+                and self._directory_unchanged(outcome.directory)
+            )
+            if valid:
+                self._assert_name_identity(
+                    outcome.directory, outcome.name, outcome.identity
+                )
+        except OSError:
+            valid = False
+        if not valid:
+            self._scrub_immutable_derivative_sync("", outcome)
+            raise FileIntakeFailure(FileIntakeErrorCode.UNSAFE_PATH)
+        # Identity/name/directory validation above is the commit point.  Close
+        # failures after it are resource diagnostics only: retrying an
+        # ambiguous close could target a reused descriptor, and converting the
+        # committed publication to an application failure would orphan an
+        # otherwise valid immutable result.  No content or path is retained or
+        # emitted here; a future content-free diagnostics port may count it.
+        try:
+            os.close(outcome.descriptor)
+        except OSError:
+            pass
+        self._close_held_directory(outcome.directory)
+
+    @staticmethod
+    def _close_held_directory(directory: _OpenedDirectory) -> bool:
+        try:
+            if directory.descriptor is not None:
+                os.close(directory.descriptor)
+            elif directory.windows_handle is not None:
+                FileStorage._windows_close_handle(directory.windows_handle)
+            return True
+        except OSError:
+            return False
 
     def batch_usage(self, batch_id: str) -> BatchUsage:
         directory: _OpenedDirectory | None = None
