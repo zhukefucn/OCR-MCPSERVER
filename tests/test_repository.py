@@ -23,6 +23,7 @@ def test_project_metadata_declares_python_dependencies_and_entrypoint() -> None:
     }
     assert runtime_names == {
         "fastapi",
+        "fastmcp",
         "uvicorn",
         "pydantic",
         "pydantic-settings",
@@ -61,7 +62,7 @@ def test_example_yaml_is_valid_and_contains_no_secret_placeholders() -> None:
 
     assert settings.mineru.backend == "vlm-http-client"
     assert settings.secondary_ocr.engine.value == "pp_structure_v3"
-    assert "api_key" not in example_text.lower()
+    assert settings.auth.api_keys == []
     assert "password" not in example_text.lower()
     assert "secret" not in example_text.lower()
 
