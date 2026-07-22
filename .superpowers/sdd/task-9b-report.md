@@ -1,130 +1,82 @@
-# Task 9B remediation controller re-review
+# Task 9B second-remediation controller review
 
 ## Target and verdict
 
-- Head: `f74ab0fecab3c1b60b75f8664d1bcf2f84fb03d1`
-- Remediation range: `595e54b..f74ab0f`
-- Scope: Task 9 lifecycle cleanup only
+- Head: `319d7d3b27e8e8d9d8616b924c8476f896250723`
+- Remediation range: `f74ab0f..319d7d3`
+- Scope: Task 9 lifecycle consistency only
+- Critical findings: **0**
+- Important findings: **2**
+- Minor findings: **0**
 - Spec verdict: **NOT READY**
 - Code-quality verdict: **NOT READY**
 - Overall: **NOT READY**
 
-The remediation closes canonical artifact placement and early metadata-phase resume, and it substantially improves partial-crash recovery by persisting tombstone names before isolation. It is still blocked by ownership races in handle scrubbing and by an artifact writer barrier that is lease-only rather than coordinated with cleanup's shared OS batch lock.
+All six findings from the previous review are closed in the targeted implementation and regression tests. Canonical batch artifact placement and metadata-phase early-delete resume also remain correct. The new durable lock-marker registry introduces one unrecoverable filesystem/DB partial-failure boundary and retains per-task metadata beyond the required 30-day purge, so the lifecycle is not yet ready.
 
 ## Prior-finding closure
 
-| Prior finding | Result | Evidence |
+| Finding | Result | Controller evidence |
 |---|---|---|
-| C1: name-swap-safe deletion | **Not closed** | Descendant `unlink`/`rmdir` was removed and POSIX traversal is descriptor-relative, but Windows child traversal can scrub a replacement after a parent swap. The scrubber also truncates multi-link files without proving that their bytes are confined to the batch. |
-| C2: batch-scoped artifact root | **Closed** | The bundler requires a canonical lowercase batch UUID, derives `<artifact base>/<batch UUID>`, and persists `<batch UUID>/<artifact-id>.zip`; the real publish/register/cleanup test passes. |
-| I1: metadata-phase early-delete resume | **Closed** | `delete_task` follows the repository's claimed current phase; injected first-purge failure resumes successfully on the second call. |
-| I2: durable write/delete barrier | **Not closed** | File intake holds the OS batch lock, but artifact packaging only holds a fixed 300-second DB lease with no renewal or OS lock. Cleanup treats an expired guard as quiescent even while its holder is still running. |
-| Minor: retired lock marker | **Not closed** | The marker is content-free (`0x01`) and the first swap is detected, but retry opens and truncates an unknown same-name replacement before ownership can be re-established. |
+| Windows parent replacement during scrub | **Closed** | The configured root and isolated tombstone are pinned; Windows tombstone/nested-directory handles deny delete sharing and final paths are checked before and after mutation. The two Windows regressions pass. |
+| Multi-link file modification | **Closed** | `_scrub_open_regular` requires `st_nlink == 1` before truncation and verifies it afterward. The hard-link integration regression preserves external bytes and leaves DB availability unchanged. |
+| Artifact rollback object binding | **Closed** | The bundle carries the publication identity; rollback opens once and verifies identity, size, link count, and full SHA-256 before scrubbing that descriptor. Same-name replacement is preserved. |
+| Expired artifact guard bypass | **Closed** | `ArtifactPackagingStep` holds `FileStorage.batch_lock` around guard acquisition, publish, register, rollback, guard release, and finalization. Cleanup remains blocked after the DB guard expires until packaging releases the OS lock. |
+| Post-register cancellation inconsistency | **Closed** | Registration is tracked as the commit point; exceptions after commit do not scrub the ZIP. The available row's size/hash remain consistent with disk. |
+| Lock-name replacement on retry | **Closed** | Existing marker identity must match `batch_lock_markers` before marker bytes are read or normalized. The two-attempt name-swap regression preserves the replacement unchanged. |
+
+Previously closed behavior also remains covered:
+
+- The bundler requires a canonical lowercase batch UUID, publishes under `<artifact base>/<batch UUID>`, and stores `<batch UUID>/<artifact-id>.zip`.
+- A second early-delete call resumes directly in metadata after an injected first metadata-purge failure.
+- Tombstone names remain persisted before isolation, and artifact availability advances only after both content roots and the retired marker complete successfully.
 
 ## Findings
 
-### Critical - tombstone scrubbing is not consistently bound to the owned object
+### Important - first marker-bind failure permanently wedges the batch
 
-On Windows, `_scrub_directory` verifies the tombstone parent, then separately resolves `child_path` with `os.lstat` and opens it by pathname (`src/ocr_mcp_server/services/retention.py:98-137,144-175`). A parent-directory swap between the parent check and child lookup makes both the lookup and open refer to the replacement child. Cleanup truncates that replacement and only notices the parent mismatch during final verification.
+`FileStorage.batch_lock` exclusively creates the marker file and writes `0x00` before calling `marker_registry.bind_lock_marker` (`src/ocr_mcp_server/services/file_storage.py:99-155`). `RetentionRepository.bind_lock_marker` refuses to create a registry row for an already-existing marker because the next attempt reports `created=False` (`src/ocr_mcp_server/infra/retention_repository.py:67-104`).
+
+If SQLite binding fails or the process crashes after filesystem creation but before the first registry commit, the filesystem marker survives without a registry row. Every retry then classifies that service-created marker as an unknown object and fails ownership validation. This is fail-safe with respect to replacement bytes, but it is not retryable and a crashed cleaner/writer cannot recover.
 
 Independent deterministic reproduction:
 
 ```text
-cleanup failed closed with: cleanup_ownership_invalid
-owned bytes: b'owned-original'
-replacement bytes: b''
-WINDOWS parent-swap race reproduced: attacker replacement was scrubbed
+first attempt: cleanup_claim_conflict
+orphan marker exists: True bytes: b'\x00'
+retry: cleanup_ownership_invalid
 ```
 
-The scrubber also accepts every regular file without checking link ownership. A hard link inside the batch to a regular file outside the batch is truncated through the open handle (`src/ocr_mcp_server/services/retention.py:131-175`):
+Required closure: persist a content-free creation intent/nonce before publishing the marker, then make retry able to reconcile only a marker carrying that exact intent. An unknown same-name marker must still remain untouched. Add fault injection immediately before and immediately after the first registry commit.
 
-```text
-link count before: 2
-external bytes after cleanup: b''
-HARDLINK confinement bug reproduced: cleanup scrubbed external bytes
-```
+### Important - marker registry rows bypass the 30-day metadata purge
 
-The DB content marker does not advance in the Windows swap case, so retry state is preserved, but "fail closed" is insufficient after replacement bytes have already been destroyed. Required closure is handle-relative Windows traversal rooted at the pinned parent handle, plus rejection of multi-link regular files unless ownership can be proven. Add regressions for the exact parent-swap boundary and hard-link confinement.
+`BatchLockMarkerRecord` is keyed by batch ID but has no foreign key or expiry, and `purge_metadata` never deletes it (`src/ocr_mcp_server/infra/task_models.py:167-171`; `src/ocr_mcp_server/infra/retention_repository.py:400-415`). Every processed task therefore leaves a permanent SQLite row after artifact/audit/task metadata is purged at 30 days.
 
-### Critical - artifact reconciliation can scrub a same-name replacement
+The stored device/inode identity is content-free, but it is still per-task lifecycle metadata and grows without a bounded purge, contrary to the configured 30-day content-free metadata policy. The on-disk retired marker can continue preventing UUID resurrection without retaining this DB row: once the registry row is purged, the existing name is unknown and is already rejected without mutation.
 
-`ArtifactBundler.scrub_published` derives ownership from the current `bundle.path`, stats the current name, opens that current object, and truncates it (`src/ocr_mcp_server/services/artifacts.py:1681-1724`). `ArtifactBundle` carries no publication identity or still-open handle that binds reconciliation to the object originally published. A swap between publish and reconciliation therefore destroys the replacement:
+Required closure: delete the marker registry row in the referentially ordered metadata purge, or give it an explicit bounded expiry consistent with the 30-day policy. Add a boundary test showing no `batch_lock_markers` row remains after ordinary and immediate early metadata purge while the one-byte retired marker remains content-free and non-adoptable.
 
-```text
-owned archive size: 4364
-replacement bytes: b''
-ARTIFACT reconciliation race reproduced: replacement ZIP was scrubbed
-```
+## Verification evidence
 
-Required closure: retain a publication identity/handle through registration and scrub only that exact object. If exact identity cannot be proven, leak and retry; never truncate the current same-name object merely because it is a regular file.
-
-### Critical - artifact writes do not share cleanup's durable OS barrier
-
-`ArtifactPackagingStep` acquires a hard-coded 300-second DB guard and then packages/registers without taking `FileStorage.batch_lock` or renewing the guard (`src/ocr_mcp_server/services/artifacts.py:1758-1821`). `require_content_write_quiescent` clears an expired token and permits cleanup (`src/ocr_mcp_server/infra/retention_repository.py:322-340`). Unlike file intake, a live artifact writer that exceeds the fixed lease is not blocked by the OS lock while cleanup isolates and scrubs the artifact directory.
-
-Independent repository reproduction retained the live guard object while cleanup accepted quiescence at its exact expiry:
-
-```text
-cleanup accepted quiescence while writer still holds guard: <live token>
-```
-
-This can let cleanup reach the retired marker/DB transition while a slow 1 GiB publication still holds the old directory and can continue writing. Required closure: artifact packaging must participate in the same batch OS lock for the full write/reconcile interval, or implement a renewable lease with a proven stop-writing protocol before expiry. Add deterministic overrun and crash-at-expiry tests; no real sleep is needed.
-
-### Important - post-registration failures create an available row for a scrubbed archive
-
-The packaging step catches every exception after `bundle` exists and scrubs it, including cancellation or progress failure after `repository.register` has committed (`src/ocr_mcp_server/services/artifacts.py:1808-1821`). The metadata row remains available with the original size/hash while the archive is zero bytes.
-
-Independent reproduction injected cancellation at the post-register checkpoint:
-
-```text
-pipeline raised: post-register cancellation
-row_available= True row_size= 4364 disk_size= 0
-POST-REGISTER SCRUB bug reproduced: available row points to scrubbed archive
-```
-
-Required closure: track whether registration committed. Scrub only before a successful DB commit; after commit, either return the committed result despite nonessential progress failure or transactionally make the row unavailable before scrubbing the exact published object.
-
-### Important - a retry mutates the same-name lock replacement
-
-`batch_lock` treats any non-retired regular file at the canonical lock name as an active service marker and writes/truncates it to one byte before yielding (`src/ocr_mcp_server/services/file_storage.py:92-141`). After the tested first-attempt name swap, a retry therefore opens the replacement and changes its bytes before it can prove continuity with the original lock.
-
-Independent reproduction after replacing a previously initialized lock name:
-
-```text
-before retry b'attacker-replacement'
-retry failed: path_unsafe bytes now: b'\x00'
-after retry b'\x00'
-```
-
-The retained `0x01` marker itself is content-free, but the name-swap recovery is not safe. Persist sufficient marker identity/state before mutation, reject unknown existing lock objects, and test the second cleanup attempt after the first swap failure.
-
-## Confirmed behavior
-
-- Content and metadata due boundaries remain exactly 24 hours and 30 days with configurable positive settings.
-- SQLite cleanup claims remain bounded, deterministic, exclusive, and reclaimable at the lease boundary.
-- Tombstone names are persisted before directory isolation; partial scrub retries use the same tombstone.
-- The ordinary and injected partial-failure paths update artifact availability only after both owned roots are reported scrubbed and the retired marker is written.
-- Metadata purge remains referentially ordered and transactional.
-- Canonical batch artifact placement and storage-key validation are integrated with the real bundler.
-- Early deletion resumes directly in metadata after a first purge failure.
-- File intake and cleanup serialize on the same OS batch lock in both tested orderings.
-- Stable errors and retained SQLite metadata remain content-free in the reviewed paths.
-- No Task 10 endpoint/auth/MCP work was introduced.
-
-## Verification
-
-Focused remediation suites:
+Focused lifecycle suite:
 
 ```text
 .\.venv\Scripts\python.exe -m pytest tests/test_retention.py tests/test_artifacts.py tests/test_file_intake.py tests/test_remote_fetch.py -p no:cacheprovider
-118 passed in 4.10s
+126 passed in 4.66s
+```
+
+Explicit closure set (six prior findings plus canonical placement and metadata resume):
+
+```text
+9 passed in 1.09s
 ```
 
 Fresh repository-wide gate:
 
 ```text
 .\.venv\Scripts\python.exe -m pytest -p no:cacheprovider
-655 passed, 5 skipped in 8.42s
+663 passed, 5 skipped in 8.31s
 
 .\.venv\Scripts\python.exe -m pip check
 No broken requirements found.
@@ -139,86 +91,62 @@ exit 0, no output
 Patch package validation before this report edit:
 
 ```text
-git apply --check --reverse .superpowers/sdd/review-595e54b..f74ab0f.diff
+git apply --check --reverse .superpowers/sdd/review-f74ab0f..319d7d3.diff
 exit 0
-package Git blob: a25cf29fc460fd705702124ff784bef2c21582e7
+package Git blob: 50e753bf03dbeb1a108f3a7679b13feccec1494c
 ```
-
-The broad test suite is green, but it does not cover the independently reproduced ownership and post-registration lifecycle failures.
 
 ## Disposition
 
-Do not advance Task 9B. Close the three Critical ownership/barrier findings and both Important consistency findings, add focused regressions, and repeat controller review.
+Do not advance Task 9B yet. Close the first-bind crash/retry protocol and include the marker registry in bounded metadata retention, then repeat the focused controller review. No Critical safety regression remains in the six previously reported paths.
 
-## Implementer architecture assessment before second remediation
+## Implementer response to the two remaining findings
 
-The six findings share one root cause: ownership was checked independently at adjacent layers, but no single invariant remained valid from writer admission through filesystem mutation and DB publication.
+The two findings were addressed under one constrained marker invariant: only the exact fresh one-byte marker `0x00` can recover a missing first registry binding, while the retired marker remains the distinct byte `0x01` and is never adoptable after its registry metadata is purged.
 
-The second remediation therefore uses one ownership/locking/binding invariant:
+### Important - pre-bind crash recovery
 
-1. Every batch writer and cleanup operation enters the same canonical `FileStorage` batch-lock domain before it can publish, register, isolate, scrub, or advance retention metadata.
-2. The durable retention row binds that lock name to the exact server-created marker identity. An existing same-name object whose identity is unknown or differs is never normalized, truncated, removed, or adopted during retry.
-3. Every directory chain used for scrubbing remains pinned for the complete child operation. On Windows, the pinned parent denies delete/rename sharing; children are opened while that parent is stable, and handle identity/final path plus parent identity are checked before and after mutation. If the chain cannot be proven stable, cleanup fails before touching the candidate.
-4. A regular file is scrub-eligible only when its open handle identifies the expected object and its link count is exactly one. Multi-link files are outside the owned-byte boundary and are rejected untouched.
-5. An artifact rollback is bound to the publication identity, expected size, and digest returned by the publish operation. Reconciliation opens once without following links, verifies all three properties on that descriptor, scrubs that same descriptor, then verifies that the name still binds to it. A same-name replacement is preserved.
-6. DB registration is the artifact commit point. Before commit, rollback may scrub the exact published object; after commit, cancellation or progress failure never scrubs an available artifact.
+RED: `test_fresh_marker_survives_pre_bind_crash_and_is_recovered` injected failure after the canonical marker had been created and durably initialized but before the first registry call could commit. The marker remained `b"\x00"`, the registry row remained absent, and retry failed with `cleanup_ownership_invalid` because it reached `marker is None` with `created=False`.
 
-This assessment was written before production changes or second-remediation GREEN results. Canonical batch artifact placement and state-driven metadata resume remain unchanged.
+GREEN: `FileStorage.batch_lock` now performs marker decisions only while holding the OS lock on the same open descriptor. It requires a canonical UUID-derived name, stable data-root/`.locks`/name binding, non-reparse regular type, link count one, stable identity, exact size, and exact full marker bytes before passing `recover_unbound=True`. `RetentionRepository.bind_lock_marker` accepts that authorization only when its `BEGIN IMMEDIATE` transaction still finds no row. An existing row always requires exact identity equality and is never updated or bypassed by recovery authorization.
 
-## Second remediation implementation and RED/GREEN evidence
+The recovery set covers both crash boundaries and rejection cases:
 
-The implementation now applies the invariant above at every destructive or publishing boundary.
+- pre-bind failure retries and registers the original marker identity;
+- post-commit failure retries through the already durable exact-identity row;
+- empty, retired `0x01`, oversized, and hard-linked unbound markers are rejected without mutation or registry insertion;
+- the prior name-swap retry now uses an exact fresh-byte `0x00` replacement and proves that an existing registry mismatch is still rejected without mutation.
 
-### C1 - Windows parent replacement
+During the required fresh baseline, the existing cross-process intake regression exposed the marker initialization window independently: one run returned `path_unsafe` instead of the capacity error. After moving validation behind the OS lock, stress reproduction identified both sides of the remaining race in the same run:
 
-RED: the deterministic Windows seam could not request an exclusive directory handle, and the existing pathname-based child traversal allowed a replacement parent to supply the object that was scrubbed. The reproduction left the owned bytes intact but reduced the replacement to `b''`.
+```text
+existing opener: OSError('invalid batch lock marker')
+creator: PermissionError(13, 'Permission denied')
+result: [('error', 'path_unsafe'), ('error', 'path_unsafe')]
+```
 
-GREEN: cleanup pins the configured root, reopens the isolated tombstone with delete/rename sharing denied, and verifies the final path and object identity of the directory and child handles before and after mutation. `test_windows_exclusive_parent_handle_blocks_directory_replacement` and `test_windows_parent_replacement_is_blocked_or_preserved_before_child_scrub` now prove that the replacement is either blocked or preserved untouched. The pre-existing child-rename regression was strengthened to require the moved original's bytes to remain unchanged when final-path binding is lost.
+The existing opener had locked the newly created but still-empty file while the creator attempted to write its initialization byte through that byte-range lock. Creation now acquires the OS lock before writing `0x00`. An existing opener that locks an empty marker releases, yields, and reacquires for a bounded initialization window; it never adopts or mutates the empty object. The cross-process regression then passed 20 consecutive runs, and the final focused/full gates also passed it.
 
-### C2 - hard-linked descendant confinement
+### Important - bounded marker metadata retention
 
-RED: `test_hardlinked_descendant_is_rejected_without_touching_external_bytes` reproduced a batch descendant with link count two and observed the external file truncated by cleanup.
+RED: the extended exact-30-day boundary test and immediate early-delete test each observed one remaining `BatchLockMarkerRecord` after every other per-task metadata row had been purged.
 
-GREEN: the scrubber now requires `st_nlink == 1` before mutation and again after descriptor scrubbing. The same integration test now reports cleanup failure, preserves the external bytes, and keeps the artifact metadata available for retry.
+GREEN: `purge_metadata` now deletes the marker registry row inside the existing transaction, after dependent audit/artifact/event/file rows and before retention/batch rows. Both ordinary exactly-due and immediate early deletion leave no marker registry row. The on-disk marker remains the content-free retired byte `0x01`; a direct later `batch_lock(..., allow_retired=True)` with no registry row rejects it as `cleanup_ownership_invalid` and preserves the byte unchanged. The injected metadata-purge failure still resumes successfully.
 
-### C3 - exact artifact rollback binding
+## Final remediation verification
 
-RED: `test_artifact_rollback_preserves_a_same_name_replacement` replaced the published ZIP before reconciliation; the prior rollback truncated the replacement and returned without an ownership error.
-
-GREEN: `ArtifactBundle` carries the publication `(st_dev, st_ino)` identity. Reconciliation opens the current name once without following links, then requires that identity, the registered byte count, a single link, the full SHA-256 digest, and stable descriptor/name binding before scrubbing that same descriptor. A same-name replacement is rejected and preserved.
-
-### C4 - shared cleanup/writer barrier
-
-RED: the new deterministic overrun test initially failed because `ArtifactPackagingStep` had no batch-lock dependency; packaging held only the expiring DB lease.
-
-GREEN: `ArtifactPackagingStep` now requires `FileStorage` and a marker registry and holds the same OS batch lock used by cleanup around DB-guard acquisition, publication, registration, rollback, and guard release. `test_expired_artifact_guard_cannot_bypass_the_shared_batch_lock` pauses publication until the DB lease has expired, starts cleanup, and proves cleanup remains blocked on the OS lock until packaging has stopped writing.
-
-### I1 - registration as the artifact commit point
-
-RED: `test_post_register_cancellation_never_scrubs_an_available_artifact` injected cancellation immediately after registration and observed an available row of 4,364 bytes pointing to a zero-byte archive.
-
-GREEN: the step records successful registration and only performs rollback before that commit point. The same test now observes the propagated cancellation while the available row's size and digest still match the archive on disk.
-
-### I2 - durable lock-marker ownership
-
-RED: `test_cleanup_retry_never_adopts_or_mutates_a_lock_name_replacement` reproduced a failed cleanup followed by replacement of the marker name; the prior retry succeeded and rewrote the replacement. `test_cleanup_rejects_an_unknown_preexisting_lock_without_mutation` also showed that a pre-existing unknown marker was adopted.
-
-GREEN: the new `batch_lock_markers` registry persists the exact server-created lock-object identity independently of the retention row, including after metadata purge. Lock acquisition creates a new marker with exclusive-create semantics or validates an existing marker against the registry while holding its OS lock. Unknown and mismatched marker objects are rejected before any write, truncate, or normalization. Both regressions now preserve the replacement bytes and fail closed.
-
-## Second remediation verification
-
-Focused lifecycle suites after all implementation changes:
+Focused lifecycle gate including all six prior closures, the two remaining findings, and cross-process intake:
 
 ```text
 .\.venv\Scripts\python.exe -m pytest tests/test_retention.py tests/test_artifacts.py tests/test_file_intake.py tests/test_remote_fetch.py -p no:cacheprovider
-126 passed in 4.53s
+132 passed in 6.30s
 ```
 
-Repository-wide gate after the final ownership check:
+Repository-wide gate:
 
 ```text
 .\.venv\Scripts\python.exe -m pytest -p no:cacheprovider
-663 passed, 5 skipped in 9.10s
+669 passed, 5 skipped in 10.49s
 
 .\.venv\Scripts\python.exe -m pip check
 No broken requirements found.
@@ -230,6 +158,6 @@ git diff --check
 exit 0 (line-ending notices only)
 ```
 
-## Second remediation disposition
+## Final remediation disposition
 
-All six re-review findings have implementation coverage and deterministic regression coverage. Task 9B is ready for the same controller reviewer to repeat the spec and code-quality review. No push, deployment, or Task 10 work is included.
+Both remaining Important findings now have strict RED/GREEN coverage, and all six previous closures remain green. Task 9B is ready for the same controller reviewer to repeat spec and code-quality review. No push, deployment, or Task 10 work is included.
