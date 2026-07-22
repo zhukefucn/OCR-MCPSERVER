@@ -119,6 +119,125 @@ async def test_wake_queue_gauge_uses_replacement_semantics_and_close_drains() ->
     assert observations.queue_depths == [1, 1, 0]
 
 
+@pytest.mark.asyncio
+async def test_cancel_during_initial_notification_still_closes_claim_observation(
+    orchestration_repository,
+) -> None:
+    repository, _ = orchestration_repository
+    await repository.create_batch("cancel-notifier", ["file-a"])
+    claim = await repository.claim_next(
+        "worker", now=ManualClock().now(), lease_seconds=30
+    )
+    assert claim is not None
+    entered = asyncio.Event()
+
+    class BlockingSink:
+        async def publish(self, notification):
+            entered.set()
+            await asyncio.Event().wait()
+
+    observations = RecordingObservability()
+    service = OrchestrationService(
+        repository,
+        object(),
+        OrchestrationSettings(),
+        notification_sink=BlockingSink(),
+        worker_identity="worker",
+        observability=observations,
+    )
+    execution = asyncio.create_task(service._execute_claim(claim))
+    await entered.wait()
+    execution.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+    persisted = await repository.get_file("file-a")
+    assert persisted.status is FileStatus.PROCESSING
+    assert observations.tasks == [(TaskOutcome.CANCELLED, pytest.approx(0.0))]
+    assert [(stage, outcome) for stage, outcome, _ in observations.stages] == [
+        (ProcessingStage.QUEUED, StageOutcome.CANCELLED)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancel_while_waiting_for_duplicate_active_claim_is_observed_once(
+    orchestration_repository,
+) -> None:
+    repository, _ = orchestration_repository
+    await repository.create_batch("cancel-duplicate", ["file-a"])
+    clock = ManualClock()
+    claim = await repository.claim_next("worker", now=clock.now(), lease_seconds=30)
+    assert claim is not None
+    observations = RecordingObservability()
+    service = OrchestrationService(
+        repository,
+        object(),
+        OrchestrationSettings(),
+        clock=clock,
+        worker_identity="worker",
+        observability=observations,
+    )
+    service._active_file_ids.add("file-a")
+    execution = asyncio.create_task(service._execute_claim(claim))
+    await asyncio.sleep(0)
+    execution.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+    assert (await repository.get_file("file-a")).status is FileStatus.PROCESSING
+    assert observations.tasks == [(TaskOutcome.CANCELLED, 0.0)]
+    assert len(observations.stages) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "retryable", "error", "expected"),
+    [
+        ("retry_or_fail", True, LeaseConflictError(), TaskOutcome.LEASE_CONFLICT),
+        ("retry_or_fail", True, PersistenceError(), TaskOutcome.UNEXPECTED_FAILURE),
+        ("retry_or_fail", True, RuntimeError("secret"), TaskOutcome.UNEXPECTED_FAILURE),
+        ("fail_file", False, LeaseConflictError(), TaskOutcome.LEASE_CONFLICT),
+        ("fail_file", False, PersistenceError(), TaskOutcome.UNEXPECTED_FAILURE),
+        ("fail_file", False, RuntimeError("secret"), TaskOutcome.UNEXPECTED_FAILURE),
+    ],
+)
+async def test_terminal_repository_faults_are_never_misclassified_as_cancelled(
+    orchestration_repository, method_name, retryable, error, expected
+) -> None:
+    repository, _ = orchestration_repository
+    await repository.create_batch(
+        f"fault-{method_name}-{type(error).__name__}", ["file-a"]
+    )
+    clock = ManualClock()
+    claim = await repository.claim_next("worker", now=clock.now(), lease_seconds=30)
+    assert claim is not None
+
+    class FaultingRepository:
+        def __getattr__(self, name):
+            if name == method_name:
+
+                async def fail(*args, **kwargs):
+                    raise error
+
+                return fail
+            return getattr(repository, name)
+
+    async def pipeline(file, progress, cancellation):
+        raise PipelineFailure(PipelineErrorCode.PROCESSING_FAILED, retryable=retryable)
+
+    observations = RecordingObservability()
+    service = OrchestrationService(
+        FaultingRepository(),
+        CallablePipeline(pipeline),
+        OrchestrationSettings(),
+        clock=clock,
+        worker_identity="worker",
+        observability=observations,
+    )
+    with pytest.raises(type(error)):
+        await service._execute_claim(claim)
+    assert observations.tasks == [(expected, 0.0)]
+    assert observations.tasks[0][0] is not TaskOutcome.CANCELLED
+
+
 @pytest_asyncio.fixture
 async def orchestration_repository(tmp_path: Path):
     engine = create_database_engine(
@@ -662,6 +781,7 @@ async def test_heartbeat_extends_lease_and_lease_loss_cancels_pipeline_without_t
             cancelled.set()
             raise
 
+    observations = RecordingObservability()
     service = OrchestrationService(
         repository,
         CallablePipeline(run_pipeline),
@@ -672,6 +792,7 @@ async def test_heartbeat_extends_lease_and_lease_loss_cancels_pipeline_without_t
         ),
         clock=clock,
         worker_identity="worker",
+        observability=observations,
     )
     await service.start()
     await entered.wait()
@@ -696,6 +817,49 @@ async def test_heartbeat_extends_lease_and_lease_loss_cancels_pipeline_without_t
     assert persisted.progress == 12
     await service.close()
     assert (await repository.get_file("file-a")).status is not FileStatus.CANCELLED
+    assert [outcome for outcome, _ in observations.tasks] == [TaskOutcome.LEASE_CONFLICT]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_persistence_failure_is_unexpected_not_cancellation(
+    orchestration_repository,
+) -> None:
+    repository, _ = orchestration_repository
+    await repository.create_batch("heartbeat-persistence", ["file-a"])
+    clock = ManualClock()
+    claim = await repository.claim_next("worker", now=clock.now(), lease_seconds=30)
+    assert claim is not None
+    entered = asyncio.Event()
+
+    class FaultingRepository:
+        def __getattr__(self, name):
+            if name == "heartbeat":
+
+                async def fail(*args, **kwargs):
+                    raise PersistenceError()
+
+                return fail
+            return getattr(repository, name)
+
+    async def pipeline(file, progress, cancellation):
+        entered.set()
+        await asyncio.Event().wait()
+
+    observations = RecordingObservability()
+    service = OrchestrationService(
+        FaultingRepository(),
+        CallablePipeline(pipeline),
+        OrchestrationSettings(heartbeat_seconds=2),
+        clock=clock,
+        worker_identity="worker",
+        observability=observations,
+    )
+    execution = asyncio.create_task(service._execute_claim(claim))
+    await entered.wait()
+    clock.advance(2)
+    await execution
+    assert (await repository.get_file("file-a")).status is FileStatus.PROCESSING
+    assert observations.tasks == [(TaskOutcome.UNEXPECTED_FAILURE, 2.0)]
 
 
 @pytest.mark.asyncio

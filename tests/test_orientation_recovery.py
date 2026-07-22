@@ -118,6 +118,7 @@ class Repo:
         self.claim_calls = 0
         self.complete_calls = 0
         self.fail_calls: list[tuple[RecoveryState, str]] = []
+        self.terminal_observed = False
 
     async def resolve(self, token, *, now):
         assert token == "or_" + "x" * 32
@@ -196,6 +197,13 @@ class Repo:
             version=self.current.version + 1,
         )
         return self.current
+
+    async def mark_terminal_observed(self, claim_id):
+        assert claim_id == "claim-123"
+        if self.terminal_observed:
+            return False
+        self.terminal_observed = True
+        return True
 
 
 class Storage:
@@ -353,6 +361,45 @@ async def test_recovery_observes_new_completion_once_but_not_completed_replay():
     await service.reparse(command)
     await service.reparse(command)
     assert observations.outcomes == [RecoveryOutcome.COMPLETED]
+
+
+@pytest.mark.asyncio
+async def test_missing_durable_marker_is_contained_without_memory_dedupe_claim():
+    repo = Repo()
+
+    class MissingMarkerRepository:
+        def __getattr__(self, name):
+            if name == "mark_terminal_observed":
+                raise AttributeError(name)
+            return getattr(repo, name)
+
+    observations = RecoveryObservability()
+    service, *_ = coordinator(
+        repo=MissingMarkerRepository(), observability=observations
+    )
+    result = await service.reparse(
+        OrientationRecoveryCommand(recovery_token="or_" + "x" * 32)
+    )
+    assert result.batch_id == RESULT_BATCH_ID
+    assert observations.outcomes == []
+    assert not hasattr(service, "_observed_claims")
+
+
+@pytest.mark.asyncio
+async def test_malformed_durable_marker_result_is_contained_without_observation():
+    class MalformedMarkerRepo(Repo):
+        async def mark_terminal_observed(self, claim_id):
+            return "not-a-boolean"
+
+    observations = RecoveryObservability()
+    service, *_ = coordinator(
+        repo=MalformedMarkerRepo(), observability=observations
+    )
+    result = await service.reparse(
+        OrientationRecoveryCommand(recovery_token="or_" + "x" * 32)
+    )
+    assert result.batch_id == RESULT_BATCH_ID
+    assert observations.outcomes == []
 
 
 @pytest.mark.asyncio

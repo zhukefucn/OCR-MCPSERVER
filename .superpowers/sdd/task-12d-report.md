@@ -97,3 +97,73 @@ deployment was performed.
 - Skips are the repository's existing platform/optional-dependency skips; no new
   skip or xfail was added.
 - No unresolved implementation concern or delivery-gate action remains.
+
+## Review remediation
+
+The first Task 12D review was NOT READY with four Important findings. All were
+handled in strict additional RED/GREEN cycles.
+
+### Claim lifecycle guard
+
+- Added deterministic cancellation during the initial notification publish and
+  while yielding behind a duplicate active file.
+- RED: both tests persisted the correct `processing` business state but recorded
+  zero task/stage terminal observations.
+- GREEN: the entire post-claim path now shares one `try/finally`; both tests record
+  exactly one `cancelled` task and one closed stage interval without a false
+  business terminal write.
+
+### Nested repository and heartbeat classification
+
+- Added six nested handler cases covering `retry_or_fail` and `fail_file` raising
+  lease conflict, persistence failure, and unexpected failure.
+- Added heartbeat lease-loss and persistence-failure outcome assertions.
+- RED: all eight cases were classified as `cancelled` because sibling handlers do
+  not catch exceptions raised inside another handler and heartbeat returned no
+  reason.
+- GREEN: nested repository writes classify before re-raising; heartbeat returns a
+  finite reason to execution. Lease conflicts are `lease_conflict`, persistence
+  and unknown dependency faults are `unexpected_failure`, and business state is
+  left for lease recovery.
+
+### Required durable recovery marker
+
+- Removed `getattr` and the process-memory `_observed_claims` fallback. The
+  coordinator now invokes the required protocol method directly and contains
+  missing/raising behavior without changing the recovery result.
+- Updated recovery fakes to implement the durable marker contract.
+- RED: a missing marker incorrectly emitted `completed` through memory fallback;
+  a malformed truthy return also incorrectly emitted `completed`.
+- GREEN: missing/broken/malformed marker paths emit nothing and do not fail the
+  business operation; only literal `True` reserves an outcome. A newly constructed
+  coordinator replaying the same durable terminal record does not emit again.
+
+### Expanded fault isolation
+
+- Expanded `tests/test_observability_faults.py` from two tests to nine bounded,
+  deterministic tests. Coverage now includes raising and synchronous-costly sinks
+  at claimed task/stage outcomes; Paddle active/dequeue/FIFO/cancel/saturation/
+  backend-failure/close paths; recovery terminal restart/replay; REST and MCP auth
+  response equivalence; exact three-tool/recovery-schema gates; canary exclusion;
+  and absence of production fault controls.
+- The expanded fault file passes `9 passed`; affected orchestration, Paddle,
+  recovery, repository, and fault suites pass `113 passed`.
+- Post-review required focused suite passes `230 passed in 6.74s`.
+
+### Post-review final verification
+
+- Expanded focused suite, including the durable orientation repository:
+  `257 passed in 9.04s` using isolated basetemp
+  `.pytest-tmp/task12d-review-expanded-isolate`.
+- Full suite: `981 passed, 20 skipped in 18.41s` (1001 total) using isolated
+  basetemp `.pytest-tmp/task12d-review-full-isolate`.
+- `.venv\Scripts\python.exe -m pip check` -> `No broken requirements found.`
+- `.venv\Scripts\python.exe -m compileall -q src tests` -> exit 0.
+- `git diff --check` -> exit 0 with informational Windows LF/CRLF notices only.
+- One combined PowerShell command that chained expanded, full, and ancillary checks
+  produced no output for more than 150 seconds and was terminated without being
+  treated as evidence. The expanded and full commands were immediately isolated
+  with separate basetemps; both completed in their normal windows with the exact
+  green results above. No test-process hang reproduced.
+
+No production fault control, push, sync, image build, or deployment was performed.

@@ -521,22 +521,17 @@ class OrchestrationService:
             self._observability, self._clock, claim.file.stage
         )
         cancellation = PipelineCancellation()
-        await self._notifier.emit(claim.file)
-        heartbeat: asyncio.Task[None] | None = None
+        heartbeat: asyncio.Task[TaskOutcome | None] | None = None
         pipeline_task: asyncio.Task[PipelineResult] | None = None
-        while claim.file.id in self._active_file_ids and not self._closing:
-            await asyncio.sleep(0)
-        if self._closing:
-            attempt_observer.finish(StageOutcome.CANCELLED)
-            duration = max(0.0, self._clock.monotonic() - attempt_started)
-            best_effort(
-                lambda: self._observability.observe_task(
-                    TaskOutcome.CANCELLED, duration
-                )
-            )
-            return
-        self._active_file_ids.add(claim.file.id)
+        active_registered = False
         try:
+            await self._notifier.emit(claim.file)
+            while claim.file.id in self._active_file_ids and not self._closing:
+                await asyncio.sleep(0)
+            if self._closing:
+                return
+            self._active_file_ids.add(claim.file.id)
+            active_registered = True
             reporter = _LeaseProgressReporter(
                 self._repository,
                 claim,
@@ -575,20 +570,29 @@ class OrchestrationService:
                 stage_outcome = StageOutcome.COMPLETED
                 await self._notifier.emit(snapshot)
             except PipelineFailure as failure:
-                if failure.retryable:
-                    snapshot = await self._repository.retry_or_fail(
-                        claim.file.id,
-                        claim.lease_token,
-                        error_code=failure.code,
-                        now=self._clock.now(),
-                    )
-                else:
-                    snapshot = await self._repository.fail_file(
-                        claim.file.id,
-                        claim.lease_token,
-                        error_code=failure.code,
-                        now=self._clock.now(),
-                    )
+                try:
+                    if failure.retryable:
+                        snapshot = await self._repository.retry_or_fail(
+                            claim.file.id,
+                            claim.lease_token,
+                            error_code=failure.code,
+                            now=self._clock.now(),
+                        )
+                    else:
+                        snapshot = await self._repository.fail_file(
+                            claim.file.id,
+                            claim.lease_token,
+                            error_code=failure.code,
+                            now=self._clock.now(),
+                        )
+                except LeaseConflictError:
+                    task_outcome = TaskOutcome.LEASE_CONFLICT
+                    stage_outcome = StageOutcome.FAILED
+                    raise
+                except Exception:
+                    task_outcome = TaskOutcome.UNEXPECTED_FAILURE
+                    stage_outcome = StageOutcome.FAILED
+                    raise
                 if snapshot.status is FileStatus.QUEUED:
                     task_outcome = TaskOutcome.RETRY
                     self.notify_work()
@@ -605,6 +609,14 @@ class OrchestrationService:
                 current = asyncio.current_task()
                 if current is not None and current.cancelling():
                     raise
+                if heartbeat is not None and heartbeat.done():
+                    try:
+                        heartbeat_outcome = heartbeat.result()
+                    except Exception:
+                        heartbeat_outcome = TaskOutcome.UNEXPECTED_FAILURE
+                    if heartbeat_outcome is not None:
+                        task_outcome = heartbeat_outcome
+                        stage_outcome = StageOutcome.FAILED
             except PersistenceError:
                 task_outcome = TaskOutcome.UNEXPECTED_FAILURE
                 stage_outcome = StageOutcome.FAILED
@@ -634,14 +646,15 @@ class OrchestrationService:
                 await asyncio.gather(heartbeat, return_exceptions=True)
             if pipeline_task is not None and not pipeline_task.done():
                 pipeline_task.cancel()
-            self._active_file_ids.discard(claim.file.id)
+            if active_registered:
+                self._active_file_ids.discard(claim.file.id)
 
     async def _heartbeat(
         self,
         claim: LeaseClaim,
         cancellation: PipelineCancellation,
         pipeline_task: asyncio.Task[PipelineResult],
-    ) -> None:
+    ) -> TaskOutcome | None:
         while not self._closing and not pipeline_task.done():
             await self._clock.sleep(self._settings.heartbeat_seconds)
             if self._closing or pipeline_task.done():
@@ -653,10 +666,14 @@ class OrchestrationService:
                     now=self._clock.now(),
                     lease_seconds=self._settings.lease_seconds,
                 )
+            except LeaseConflictError:
+                cancellation._cancel()
+                pipeline_task.cancel()
+                return TaskOutcome.LEASE_CONFLICT
             except Exception:
                 cancellation._cancel()
                 pipeline_task.cancel()
-                return
+                return TaskOutcome.UNEXPECTED_FAILURE
 
     async def _idle_poll_loop(self) -> None:
         while not self._closing:

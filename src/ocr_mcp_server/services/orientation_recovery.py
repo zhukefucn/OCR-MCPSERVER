@@ -421,7 +421,6 @@ class OrientationRecoveryCoordinator:
         self._observability = (
             observability if observability is not None else NullObservability()
         )
-        self._observed_claims: set[str] = set()
 
     async def reparse(
         self,
@@ -669,19 +668,12 @@ class OrientationRecoveryCoordinator:
     async def _record_terminal(
         self, claim: RecoveryClaim, outcome: RecoveryOutcome
     ) -> None:
-        marker = getattr(self._repository, "mark_terminal_observed", None)
-        if marker is not None:
-            try:
-                reserved = await marker(claim.claim_id)
-            except Exception:
-                return
-            if not reserved:
-                return
-        elif claim.claim_id in self._observed_claims:
+        try:
+            reserved = await self._repository.mark_terminal_observed(claim.claim_id)
+        except Exception:
             return
-        else:
-            self._observed_claims.add(claim.claim_id)
-        self._observe_recovery(outcome)
+        if reserved is True:
+            self._observe_recovery(outcome)
 
     async def _replay(
         self, snapshot: RecoverySnapshot, progress: ProgressCallback | None
