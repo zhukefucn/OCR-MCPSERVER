@@ -272,6 +272,7 @@ def test_mineru_compose_is_internal_fixed_and_least_privilege() -> None:
     assert vlm["deploy"]["resources"]["reservations"]["devices"] == [
         {"driver": "nvidia", "count": 1, "capabilities": ["gpu"]}
     ]
+    assert vlm["healthcheck"]["test"][1] == "python3"
     for service in (api, vlm):
         assert service.get("privileged") is not True
         assert service.get("network_mode") != "host"
