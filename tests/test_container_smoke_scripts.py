@@ -512,7 +512,7 @@ def test_offline_model_manifest_rejects_symlinked_metadata(tmp_path: Path) -> No
 def test_cli_suppresses_dependency_output_and_prints_only_summary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    capfd: pytest.CaptureFixture[str],
 ) -> None:
     smoke = _load_smoke_module()
     fixture = tmp_path / "fixture.ppm"
@@ -521,6 +521,8 @@ def test_cli_suppresses_dependency_output_and_prints_only_summary(
     def noisy_smoke(**kwargs: object) -> dict[str, str | int]:
         print("recognized customer content")
         print("/private/customer.png", file=__import__("sys").stderr)
+        __import__("os").write(1, b"fd-customer-content\n")
+        __import__("os").write(2, b"fd-/private/customer.png\n")
         return {
             "paddle_version": "3.3.0",
             "paddleocr_version": "3.5.0",
@@ -532,7 +534,7 @@ def test_cli_suppresses_dependency_output_and_prints_only_summary(
 
     assert smoke.main(["--device", "cpu", "--fixture", str(fixture)]) == 0
 
-    captured = capsys.readouterr()
+    captured = capfd.readouterr()
     assert json.loads(captured.out) == {
         "paddle_version": "3.3.0",
         "paddleocr_version": "3.5.0",
@@ -540,6 +542,74 @@ def test_cli_suppresses_dependency_output_and_prints_only_summary(
         "result_count": 1,
     }
     assert captured.err == ""
+
+
+def test_cli_failure_suppresses_fd_output_and_prints_only_finite_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    smoke = _load_smoke_module()
+    fixture = tmp_path / "fixture.png"
+    fixture.write_bytes(b"placeholder")
+
+    def noisy_failure(**kwargs: object) -> None:
+        __import__("os").write(1, b"sensitive-stdout-canary\n")
+        __import__("os").write(2, b"sensitive-stderr-canary\n")
+        raise smoke.SmokeFailure("model_unavailable")
+
+    monkeypatch.setattr(smoke, "run_smoke", noisy_failure)
+
+    assert smoke.main(["--device", "cpu", "--fixture", str(fixture)]) == 1
+
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert captured.err == "pp_structure_smoke_failed\n"
+
+
+def test_fd_suppression_is_nested_exception_safe_and_closes_owned_fds(
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    smoke = _load_smoke_module()
+    opened: list[int] = []
+    closed: list[int] = []
+    real_dup = __import__("os").dup
+    real_open = __import__("os").open
+    real_close = __import__("os").close
+
+    def tracking_dup(fd: int) -> int:
+        owned = real_dup(fd)
+        opened.append(owned)
+        return owned
+
+    def tracking_open(path: str, flags: int, mode: int = 0o777) -> int:
+        owned = real_open(path, flags, mode)
+        opened.append(owned)
+        return owned
+
+    def tracking_close(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(smoke.os, "dup", tracking_dup)
+        patch.setattr(smoke.os, "open", tracking_open)
+        patch.setattr(smoke.os, "close", tracking_close)
+
+        with pytest.raises(RuntimeError, match="expected"):
+            with smoke.suppress_process_output():
+                __import__("os").write(1, b"outer-sensitive\n")
+                with smoke.suppress_process_output():
+                    __import__("os").write(2, b"inner-sensitive\n")
+                raise RuntimeError("expected")
+
+    __import__("os").write(1, b"restored-stdout\n")
+    __import__("os").write(2, b"restored-stderr\n")
+    captured = capfd.readouterr()
+    assert captured.out == "restored-stdout\n"
+    assert captured.err == "restored-stderr\n"
+    assert sorted(opened) == sorted(closed)
 
 
 def test_repository_owns_a_synthetic_ppstructure_fixture() -> None:

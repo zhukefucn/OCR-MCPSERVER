@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from hashlib import sha256
 from importlib.metadata import PackageNotFoundError, version
 import inspect
@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import yaml
 
@@ -59,6 +59,32 @@ _FIXED_FEATURES = {
 
 class SmokeFailure(RuntimeError):
     """A content-free smoke failure identified only by a finite code."""
+
+
+@contextmanager
+def suppress_process_output() -> Iterator[None]:
+    """Temporarily route process-level stdout/stderr file descriptors to null."""
+
+    saved_stdout: int | None = None
+    saved_stderr: int | None = None
+    null_fd: int | None = None
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        saved_stdout = os.dup(1)
+        saved_stderr = os.dup(2)
+        null_fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(null_fd, 1)
+        os.dup2(null_fd, 2)
+        yield
+    finally:
+        if saved_stdout is not None:
+            os.dup2(saved_stdout, 1)
+        if saved_stderr is not None:
+            os.dup2(saved_stderr, 2)
+        for owned_fd in (null_fd, saved_stderr, saved_stdout):
+            if owned_fd is not None:
+                os.close(owned_fd)
 
 
 def _installed_version(distribution: str) -> str:
@@ -592,15 +618,16 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     try:
-        with open(os.devnull, "w", encoding="utf-8") as output_sink:
-            with redirect_stdout(output_sink), redirect_stderr(output_sink):
-                summary = run_smoke(
-                    device=args.device,
-                    fixture=args.fixture,
-                    model_config=configured_model,
-                    model_manifest=configured_manifest,
-                    model_root=DEFAULT_MODEL_ROOT,
-                )
+        with suppress_process_output():
+            with open(os.devnull, "w", encoding="utf-8") as output_sink:
+                with redirect_stdout(output_sink), redirect_stderr(output_sink):
+                    summary = run_smoke(
+                        device=args.device,
+                        fixture=args.fixture,
+                        model_config=configured_model,
+                        model_manifest=configured_manifest,
+                        model_root=DEFAULT_MODEL_ROOT,
+                    )
     except Exception:
         print("pp_structure_smoke_failed", file=sys.stderr)
         return 1
