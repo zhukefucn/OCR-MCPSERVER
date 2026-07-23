@@ -57,6 +57,7 @@ _SUBMISSION_FIELDS = {
     "start_page_id": "0",
     "end_page_id": "99999",
 }
+_UPSTREAM_DOCUMENT_STEM = "document"
 
 
 class MinerUAdapter:
@@ -325,7 +326,7 @@ class MinerUAdapter:
             extracted = await self._extract_archive_in_worker(
                 archive_path,
                 extracted_root,
-                expected_stem=Path(request.upload_name).stem,
+                expected_stem=_UPSTREAM_DOCUMENT_STEM,
             )
             document_name = extracted.document_name
             parse_directory = extracted.parse_directory
@@ -337,7 +338,7 @@ class MinerUAdapter:
             except FileExistsError as exc:
                 raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE, cause=exc) from None
             parse_root = published_root / parse_directory
-            expected_stem = Path(request.upload_name).stem
+            expected_stem = _UPSTREAM_DOCUMENT_STEM
             markdown = parse_root / f"{expected_stem}.md"
             middle = parse_root / f"{expected_stem}_middle.json"
             legacy = parse_root / f"{expected_stem}_content_list.json"

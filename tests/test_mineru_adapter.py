@@ -107,11 +107,11 @@ def _zip_bytes(
     entries: dict[str, bytes | str] | None = None,
 ) -> bytes:
     selected = entries or {
-        "safe/vlm/safe.md": "# redacted result",
-        "safe/vlm/safe_middle.json": "{}",
-        "safe/vlm/safe_content_list.json": "[]",
-        "safe/vlm/safe_content_list_v2.json": "[]",
-        "safe/vlm/images/page-1.png": b"image-bytes",
+        "document/vlm/document.md": "# redacted result",
+        "document/vlm/document_middle.json": "{}",
+        "document/vlm/document_content_list.json": "[]",
+        "document/vlm/document_content_list_v2.json": "[]",
+        "document/vlm/images/page-1.png": b"image-bytes",
     }
     output = BytesIO()
     with ZipFile(output, "w") as archive:
@@ -132,11 +132,11 @@ def _zip_entry_bytes(
 
 def _base_entries() -> list[tuple[str | ZipInfo, bytes | str]]:
     return [
-        ("safe/vlm/safe.md", "# result"),
-        ("safe/vlm/safe_middle.json", "{}"),
-        ("safe/vlm/safe_content_list.json", "[]"),
-        ("safe/vlm/safe_content_list_v2.json", "[]"),
-        ("safe/vlm/images/page.png", b"image"),
+        ("document/vlm/document.md", "# result"),
+        ("document/vlm/document_middle.json", "{}"),
+        ("document/vlm/document_content_list.json", "[]"),
+        ("document/vlm/document_content_list_v2.json", "[]"),
+        ("document/vlm/images/page.png", b"image"),
     ]
 
 
@@ -272,16 +272,19 @@ async def test_valid_task_flow_forces_protocol_and_preserves_local_context(
     assert isinstance(result, MinerUDocumentResult)
     assert result.file_task_id == "local-task-42"
     assert result.upstream_task_id == "upstream-1"
-    assert result.result_root == tmp_path / "published" / "safe"
-    assert result.markdown_path == result.result_root / "vlm" / "safe.md"
-    assert result.middle_json_path == result.result_root / "vlm" / "safe_middle.json"
+    assert result.result_root == tmp_path / "published" / "document"
+    assert result.markdown_path == result.result_root / "vlm" / "document.md"
+    assert (
+        result.middle_json_path
+        == result.result_root / "vlm" / "document_middle.json"
+    )
     assert (
         result.content_list_v2_path
-        == result.result_root / "vlm" / "safe_content_list_v2.json"
+        == result.result_root / "vlm" / "document_content_list_v2.json"
     )
     assert (
         result.legacy_content_list_path
-        == result.result_root / "vlm" / "safe_content_list.json"
+        == result.result_root / "vlm" / "document_content_list.json"
     )
     assert result.images_directory == result.result_root / "vlm" / "images"
     assert result.content_list_v2_path.read_text(encoding="utf-8") == "[]"
@@ -304,6 +307,67 @@ async def test_valid_task_flow_forces_protocol_and_preserves_local_context(
     fields, uploaded = _multipart_parts(submission_request)
     assert fields == FORM_VALUES
     assert uploaded == ("safe.pdf", b"source document bytes")
+
+
+@pytest.mark.asyncio
+async def test_fixed_api_canonical_document_archive_preserves_local_context(
+    tmp_path: Path,
+) -> None:
+    from ocr_mcp_server.infra.mineru_adapter import MinerUAdapter
+
+    local_upload_name = "2be357da-9074-4e21-a03c-f7d35d65cf10.pdf"
+    archive = _zip_bytes(
+        {
+            "document/vlm/document.md": "# result",
+            "document/vlm/document_middle.json": "{}",
+            "document/vlm/document_content_list.json": "[]",
+            "document/vlm/document_content_list_v2.json": "[]",
+            "document/vlm/images/page-1.png": b"image-bytes",
+        }
+    )
+    submitted_name: str | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal submitted_name
+        if request.method == "POST":
+            _, uploaded = _multipart_parts(request)
+            submitted_name = uploaded[0]
+            return httpx.Response(202, json=_submission_payload())
+        if request.url.path.endswith("/result"):
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "application/zip"},
+                content=archive,
+            )
+        return httpx.Response(200, json={"status": "completed"})
+
+    clock = FakeClock()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await MinerUAdapter(
+            client=client,
+            settings=_settings(),
+            sleep=clock.sleep,
+            clock=clock,
+        ).parse(_request(tmp_path, name=local_upload_name))
+
+    assert submitted_name == local_upload_name
+    assert result.file_task_id == "local-task-42"
+    assert result.upstream_task_id == "upstream-1"
+    assert result.result_root == tmp_path / "published" / "document"
+    assert result.markdown_path == result.result_root / "vlm" / "document.md"
+    assert (
+        result.middle_json_path
+        == result.result_root / "vlm" / "document_middle.json"
+    )
+    assert (
+        result.content_list_v2_path
+        == result.result_root / "vlm" / "document_content_list_v2.json"
+    )
+    assert (
+        result.legacy_content_list_path
+        == result.result_root / "vlm" / "document_content_list.json"
+    )
+    assert result.images_directory == result.result_root / "vlm" / "images"
 
 
 @pytest.mark.asyncio
@@ -845,7 +909,7 @@ async def test_zip_rejects_traversal_backslash_drive_and_unc_paths(
 
     assert exc_info.value.code == "mineru_archive_unsafe"
     assert not (tmp_path / "outside.txt").exists()
-    assert not (tmp_path / "published" / "safe").exists()
+    assert not (tmp_path / "published" / "document").exists()
 
 
 @pytest.mark.asyncio
@@ -853,7 +917,7 @@ async def test_zip_rejects_traversal_backslash_drive_and_unc_paths(
 async def test_zip_rejects_symlinks_and_other_special_file_types(
     tmp_path: Path, file_type: int
 ) -> None:
-    special = ZipInfo("safe/vlm/special")
+    special = ZipInfo("document/vlm/special")
     special.create_system = 3
     special.external_attr = (file_type | 0o777) << 16
     archive = _zip_entry_bytes(_base_entries() + [(special, b"target")])
@@ -862,7 +926,7 @@ async def test_zip_rejects_symlinks_and_other_special_file_types(
         await _parse_with_handler(tmp_path, _archive_handler(archive))
 
     assert exc_info.value.code == "mineru_archive_unsafe"
-    assert not (tmp_path / "published" / "safe").exists()
+    assert not (tmp_path / "published" / "document").exists()
 
 
 @pytest.mark.asyncio
@@ -870,8 +934,8 @@ async def test_zip_rejects_duplicate_normalized_destinations(tmp_path: Path) -> 
     archive = _zip_entry_bytes(
         _base_entries()
         + [
-            ("safe/vlm/duplicate.txt", b"first"),
-            ("safe/vlm/DUPLICATE.TXT", b"second"),
+            ("document/vlm/duplicate.txt", b"first"),
+            ("document/vlm/DUPLICATE.TXT", b"second"),
         ]
     )
 
@@ -901,8 +965,8 @@ async def test_zip_rejects_declared_or_actual_uncompressed_expansion(
 ) -> None:
     archive = _zip_entry_bytes(
         [
-            ("safe/vlm/safe_content_list_v2.json", "[]"),
-            ("safe/vlm/large.bin", b"x" * 100),
+            ("document/vlm/document_content_list_v2.json", "[]"),
+            ("document/vlm/large.bin", b"x" * 100),
         ]
     )
 
@@ -914,20 +978,20 @@ async def test_zip_rejects_declared_or_actual_uncompressed_expansion(
         )
 
     assert exc_info.value.code == "mineru_archive_unsafe"
-    assert not (tmp_path / "published" / "safe").exists()
+    assert not (tmp_path / "published" / "document").exists()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "entries",
     [
-        [("safe/vlm/safe.md", "# no manifest")],
+        [("document/vlm/document.md", "# no manifest")],
         [
-            ("safe/vlm/safe_content_list_v2.json", "[]"),
-            ("safe/other/other_content_list_v2.json", "[]"),
+            ("document/vlm/document_content_list_v2.json", "[]"),
+            ("document/other/other_content_list_v2.json", "[]"),
         ],
-        [("safe/vlm/safe_content_list_v2.json", "not-json")],
-        [("safe/vlm/safe_content_list_v2.json", "{}")],
+        [("document/vlm/document_content_list_v2.json", "not-json")],
+        [("document/vlm/document_content_list_v2.json", "{}")],
     ],
 )
 async def test_zip_rejects_missing_multiple_or_invalid_v2_manifest(
@@ -946,14 +1010,14 @@ async def test_zip_rejects_missing_multiple_or_invalid_v2_manifest(
     "entries",
     [
         [("other/vlm/other_content_list_v2.json", "[]")],
-        [("safe/vlm/wrong_content_list_v2.json", "[]")],
+        [("document/vlm/wrong_content_list_v2.json", "[]")],
         [
-            ("safe/vlm/safe_content_list_v2.json", "[]"),
-            ("safe/other/extra.txt", "mismatched parse directory"),
+            ("document/vlm/document_content_list_v2.json", "[]"),
+            ("document/other/extra.txt", "mismatched parse directory"),
         ],
         [
-            ("safe/vlm/safe_content_list_v2.json", "[]"),
-            ("safe/vlm/nested/images/page.png", b"escaped image layout"),
+            ("document/vlm/document_content_list_v2.json", "[]"),
+            ("document/vlm/nested/images/page.png", b"escaped image layout"),
         ],
     ],
 )
@@ -970,7 +1034,7 @@ async def test_zip_rejects_mismatched_document_and_image_layouts(
 
 @pytest.mark.asyncio
 async def test_existing_published_result_is_never_overwritten(tmp_path: Path) -> None:
-    existing = tmp_path / "published" / "safe"
+    existing = tmp_path / "published" / "document"
     existing.mkdir(parents=True)
     marker = existing / "keep.txt"
     marker.write_text("keep", encoding="utf-8")
@@ -1010,7 +1074,7 @@ async def test_destination_created_at_publication_boundary_is_never_replaced(
 
     assert boundary_reached
     assert exc_info.value.code == "mineru_archive_unsafe"
-    destination = tmp_path / "published" / "safe"
+    destination = tmp_path / "published" / "document"
     assert destination.is_dir()
     assert list(destination.iterdir()) == []
     assert not list((tmp_path / "published").glob(".mineru-staging-*"))
@@ -1123,9 +1187,9 @@ async def test_valid_archive_allows_directory_records_after_file_records(
     archive = _zip_entry_bytes(
         _base_entries()
         + [
-            ("safe/vlm/images/", b""),
-            ("safe/vlm/", b""),
-            ("safe/", b""),
+            ("document/vlm/images/", b""),
+            ("document/vlm/", b""),
+            ("document/", b""),
         ]
     )
 
@@ -1145,11 +1209,11 @@ async def test_archive_rejects_unrelated_empty_directory_layout(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_document_and_parse_names_may_literally_be_images(tmp_path: Path) -> None:
+async def test_parse_directory_may_literally_be_images(tmp_path: Path) -> None:
     archive = _zip_entry_bytes(
         [
-            ("images/images/images_content_list_v2.json", "[]"),
-            ("images/images/images.md", "# valid"),
+            ("document/images/document_content_list_v2.json", "[]"),
+            ("document/images/document.md", "# valid"),
         ]
     )
     request = _request(tmp_path, name="images.pdf")
@@ -1166,5 +1230,5 @@ async def test_document_and_parse_names_may_literally_be_images(tmp_path: Path) 
             clock=clock,
         ).parse(request)
 
-    assert result.result_root.name == "images"
+    assert result.result_root.name == "document"
     assert result.content_list_v2_path.is_file()
