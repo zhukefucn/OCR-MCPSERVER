@@ -19,6 +19,7 @@ dist/
 
 # Local runtime data and task artifacts
 data/
+models/
 .superpowers/
 
 # Local configuration and credentials

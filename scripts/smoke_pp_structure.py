@@ -45,6 +45,10 @@ REQUIRED_MODEL_NODES = (
     "SubPipelines.TableRecognition.SubModules.TableOrientationClassify",
     "SubPipelines.FormulaRecognition.SubModules.FormulaRecognition",
 )
+TEXTLINE_DISABLED_PIPELINES = (
+    "SubPipelines.GeneralOCR",
+    "SubPipelines.TableRecognition.SubPipelines.GeneralOCR",
+)
 _FIXED_FEATURES = {
     "use_doc_orientation_classify": True,
     "use_doc_unwarping": False,
@@ -263,6 +267,11 @@ def prepare_offline_config(
         raise SmokeFailure("model_manifest")
 
     config = _load_mapping(model_config, "model_config")
+    if any(
+        _model_node(config, pipeline_path).get("use_textline_orientation") is not False
+        for pipeline_path in TEXTLINE_DISABLED_PIPELINES
+    ):
+        raise SmokeFailure("model_config")
     verified_model_dirs: set[Path] = set()
     for node_path in REQUIRED_MODEL_NODES:
         model_dir = _resolve_inside(root, raw_models[node_path], kind="directory")
@@ -567,11 +576,14 @@ def run_smoke(
             prediction_fixture = validate_image_fixture(rendered_fixture)
         else:
             prediction_fixture = validate_image_fixture(fixture)
-        pipeline = paddleocr_module.PPStructureV3(
-            device=device,
-            paddlex_config=str(verified_config),
+        constructor_options = {
+            "device": device,
+            "paddlex_config": str(verified_config),
             **_FIXED_FEATURES,
-        )
+        }
+        if device == "cpu":
+            constructor_options["enable_mkldnn"] = False
+        pipeline = paddleocr_module.PPStructureV3(**constructor_options)
         results = collect_single_result(
             pipeline.predict(
                 str(prediction_fixture),

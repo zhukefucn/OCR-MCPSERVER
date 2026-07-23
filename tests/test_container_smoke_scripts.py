@@ -50,12 +50,16 @@ def _offline_model_bundle(tmp_path: Path) -> tuple[Path, Path, Path]:
                 "SubModules": {"DocOrientationClassify": {"model_dir": None}}
             },
             "GeneralOCR": {
+                "use_textline_orientation": False,
                 "SubModules": {
                     "TextDetection": {"model_dir": None},
                     "TextRecognition": {"model_dir": None},
                 }
             },
             "TableRecognition": {
+                "SubPipelines": {
+                    "GeneralOCR": {"use_textline_orientation": False}
+                },
                 "SubModules": {
                     name: {"model_dir": None}
                     for name in (
@@ -188,7 +192,11 @@ def test_cpu_smoke_checks_versions_features_and_real_prediction(
     }
     constructor = dict(calls["constructor"])
     prepared_config_path = Path(str(constructor.pop("paddlex_config")))
-    assert constructor == {"device": "cpu", **fixed_features}
+    assert constructor == {
+        "device": "cpu",
+        "enable_mkldnn": False,
+        **fixed_features,
+    }
     assert prepared_config_path == model_config
     assert prepared_config_path.exists()
     prepared_config = calls["prepared_config"]
@@ -218,6 +226,45 @@ def test_cpu_smoke_checks_versions_features_and_real_prediction(
         "device",
         "result_count",
     }
+
+
+@pytest.mark.parametrize(
+    "pipeline_path",
+    (
+        ("SubPipelines", "GeneralOCR"),
+        ("SubPipelines", "TableRecognition", "SubPipelines", "GeneralOCR"),
+    ),
+)
+def test_offline_config_requires_textline_orientation_disabled(
+    tmp_path: Path, pipeline_path: tuple[str, ...]
+) -> None:
+    smoke = _load_smoke_module()
+    model_root, config_path, manifest_path = _offline_model_bundle(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    pipeline = config
+    for component in pipeline_path:
+        pipeline = pipeline[component]
+    pipeline["use_textline_orientation"] = True
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][0]["sha256"] = sha256(config_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(smoke.SmokeFailure, match="model_config"):
+        smoke.prepare_offline_config(
+            model_root=model_root,
+            model_config=config_path,
+            model_manifest=manifest_path,
+        )
+
+
+def test_offline_manifest_excludes_disabled_textline_models() -> None:
+    smoke = _load_smoke_module()
+
+    assert all(
+        "TextLineOrientation" not in node_path
+        for node_path in smoke.REQUIRED_MODEL_NODES
+    )
 
 
 def test_cpu_smoke_rejects_cuda_build_before_prediction(tmp_path: Path) -> None:

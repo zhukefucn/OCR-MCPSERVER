@@ -151,6 +151,25 @@ def test_backend_lazy_imports_and_uses_fixed_constructor_and_predict_options(
     }
 
 
+def test_cpu_backend_disables_mkldnn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+
+    class FakePipeline:
+        def __init__(self, **kwargs):
+            calls["constructor"] = kwargs
+
+    fake = ModuleType("paddleocr")
+    fake.PPStructureV3 = FakePipeline  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "paddleocr", fake)
+    from ocr_mcp_server.infra.pp_structure_v3 import PPStructureV3Backend
+
+    PPStructureV3Backend(SecondaryOCRSettings(device="cpu"))
+
+    assert calls["constructor"]["enable_mkldnn"] is False  # type: ignore[index]
+
+
 def test_mapping_result_prefers_json_property_over_raw_mapping() -> None:
     from ocr_mcp_server.infra.pp_structure_v3 import normalize_pp_structure_v3_result
 

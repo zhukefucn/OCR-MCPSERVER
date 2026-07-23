@@ -89,5 +89,12 @@ def test_required_repository_skeleton_and_documentation_exist() -> None:
     assert "仓库骨架" in readme
 
     gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
-    for ignored in (".venv/", "__pycache__/", ".pytest_cache/", "data/", ".superpowers/"):
+    for ignored in (
+        ".venv/",
+        "__pycache__/",
+        ".pytest_cache/",
+        "data/",
+        "models/",
+        ".superpowers/",
+    ):
         assert ignored in gitignore

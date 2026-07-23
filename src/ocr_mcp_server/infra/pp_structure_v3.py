@@ -60,6 +60,8 @@ class PPStructureV3Backend:
                 "formula_recognition_model_name": settings.formula_model_name,
                 **_FIXED_FEATURES,
             }
+            if settings.device == "cpu":
+                constructor_options["enable_mkldnn"] = False
             self._pipeline = PPStructureV3(**constructor_options)
         except BaseException as exc:
             initialization_failure = SecondaryOcrFailure(
