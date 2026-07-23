@@ -62,6 +62,87 @@ def _dockerfile_instructions(dockerfile: str) -> list[str]:
     return instructions
 
 
+def _dockerfile_stage(dockerfile: str, stage_name: str) -> str:
+    stage_headers = list(
+        re.finditer(
+            r"^FROM\s+\S+(?:\s+AS\s+(\S+))?\s*$",
+            dockerfile,
+            re.MULTILINE | re.IGNORECASE,
+        )
+    )
+    for index, header in enumerate(stage_headers):
+        if header.group(1) == stage_name:
+            end = (
+                stage_headers[index + 1].start()
+                if index + 1 < len(stage_headers)
+                else len(dockerfile)
+            )
+            return dockerfile[header.start() : end]
+    raise AssertionError(f"missing Dockerfile stage: {stage_name}")
+
+
+def test_ppstructure_targets_share_one_paddle_free_gateway_base() -> None:
+    dockerfile = _read_text("docker/ocr-gateway-ppstructure.Dockerfile")
+    base = _dockerfile_stage(dockerfile, "ppstructure-base")
+    cpu = _dockerfile_stage(dockerfile, "ppstructure-cpu")
+    gpu = _dockerfile_stage(dockerfile, "ppstructure-gpu")
+
+    assert re.search(
+        r"^FROM python:3\.11-slim-bookworm AS ppstructure-base\s*$",
+        base,
+        re.MULTILINE,
+    )
+    assert re.search(
+        r"^FROM ppstructure-base AS ppstructure-cpu\s*$",
+        cpu,
+        re.MULTILINE,
+    )
+    assert re.search(
+        r"^FROM ppstructure-base AS ppstructure-gpu\s*$",
+        gpu,
+        re.MULTILINE,
+    )
+    assert base.count("python -m pip install .") == 1
+    assert "paddlepaddle" not in base.lower()
+    assert cpu.count("paddlepaddle==3.3.0") == 1
+    assert "paddlepaddle-gpu" not in cpu
+    assert gpu.count("paddlepaddle-gpu==3.3.0") == 1
+    assert "paddlepaddle==3.3.0" not in gpu
+
+
+def test_every_ppstructure_pip_install_uses_ephemeral_buildkit_cache_and_bounds() -> None:
+    dockerfile = _read_text("docker/ocr-gateway-ppstructure.Dockerfile")
+    instructions = _dockerfile_instructions(dockerfile)
+    pip_runs = [
+        instruction
+        for instruction in instructions
+        if instruction.startswith("RUN") and "python -m pip install" in instruction
+    ]
+
+    assert not dockerfile.startswith("# syntax=")
+    assert len(pip_runs) == 3
+    assert sum(
+        instruction.count("python -m pip install")
+        for instruction in pip_runs
+    ) == dockerfile.count("python -m pip install")
+    assert all(
+        instruction.startswith(
+            "RUN --mount=type=cache,target=/root/.cache/pip "
+        )
+        for instruction in pip_runs
+    )
+    assert "PIP_DEFAULT_TIMEOUT=120" in dockerfile
+    assert "PIP_RETRIES=10" in dockerfile
+    assert "PIP_NO_CACHE_DIR" not in dockerfile
+    assert "--no-cache-dir" not in dockerfile
+    assert dockerfile.count("/root/.cache/pip") == len(pip_runs)
+    assert not any(
+        "/root/.cache/pip" in instruction and not instruction.startswith("RUN")
+        for instruction in instructions
+    )
+    assert not re.search(r"^VOLUME\b.*pip", dockerfile, re.MULTILINE | re.IGNORECASE)
+
+
 def test_compose_keeps_the_minimal_gateway_and_adds_ppstructure_profiles() -> None:
     compose = _compose_config()
 
@@ -166,7 +247,7 @@ def test_ppstructure_cpu_and_gpu_profiles_are_mutually_scoped() -> None:
 def test_ppstructure_cpu_requirements_are_exact_and_cpu_only() -> None:
     requirements = _read_text("docker/requirements/pp-structure-v3.txt")
     dockerfile = _read_text("docker/ocr-gateway-ppstructure.Dockerfile")
-    cpu_stage = dockerfile[: dockerfile.lower().index("as ppstructure-gpu")]
+    cpu_stage = _dockerfile_stage(dockerfile, "ppstructure-cpu")
     combined = f"{requirements}\n{cpu_stage}".lower()
 
     assert re.search(r"^paddleocr\[doc-parser\]==3\.5\.0\s*$", requirements, re.MULTILINE)
@@ -193,11 +274,11 @@ def test_ppstructure_cpu_requirements_are_exact_and_cpu_only() -> None:
 def test_ppstructure_gpu_target_is_exact_blackwell_cuda129_runtime() -> None:
     dockerfile = _read_text("docker/ocr-gateway-ppstructure.Dockerfile")
     normalized = dockerfile.lower()
-    gpu_stage = normalized[normalized.index("as ppstructure-gpu") :]
+    gpu_stage = _dockerfile_stage(dockerfile, "ppstructure-gpu").lower()
 
     assert re.search(
-        r"^from python:3\.11-slim-bookworm as ppstructure-gpu\s*$",
-        normalized,
+        r"^from ppstructure-base as ppstructure-gpu\s*$",
+        gpu_stage,
         re.MULTILINE,
     )
     assert "paddlepaddle-gpu==3.3.0" in gpu_stage
@@ -226,7 +307,7 @@ def test_ppstructure_gpu_target_is_exact_blackwell_cuda129_runtime() -> None:
         "https://pypi.org/simple",
     ]
     assert re.findall(r"^user\s+(.+?)\s*$", gpu_stage, re.MULTILINE)[-1] == "10001:10001"
-    assert '["ocr-mcp-server"]' in gpu_stage
+    assert '["ocr-mcp-server"]' in normalized
 
 
 def test_readme_documents_blackwell_gpu_build_start_and_real_smoke() -> None:
@@ -253,7 +334,7 @@ def test_ppstructure_cpu_dockerfile_is_a_bounded_non_root_gateway_image() -> Non
     normalized = dockerfile.lower()
 
     assert re.search(
-        r"^from python:3\.11-slim-bookworm as ppstructure-cpu\s*$",
+        r"^from ppstructure-base as ppstructure-cpu\s*$",
         normalized,
         re.MULTILINE,
     )
@@ -261,7 +342,7 @@ def test_ppstructure_cpu_dockerfile_is_a_bounded_non_root_gateway_image() -> Non
     assert "COPY src ./src" in dockerfile
     assert "COPY scripts/smoke_pp_structure.py ./scripts/smoke_pp_structure.py" in dockerfile
     assert "COPY scripts/fixtures/pp_structure_smoke.json ./scripts/fixtures/pp_structure_smoke.json" in dockerfile
-    assert "python -m pip install --no-cache-dir ." in dockerfile
+    assert "python -m pip install ." in dockerfile
     assert ".[dev]" not in dockerfile
     assert re.search(r"(?:--gid|-g)\s+10001\b", normalized)
     assert re.search(r"(?:--uid|-u)\s+10001\b", normalized)
@@ -289,7 +370,7 @@ def test_ppstructure_cpu_profile_has_no_public_paddle_endpoint() -> None:
 
 def test_ppstructure_cpu_installs_only_required_bookworm_runtime_libraries() -> None:
     dockerfile = _read_text("docker/ocr-gateway-ppstructure.Dockerfile")
-    normalized = dockerfile[: dockerfile.lower().index("as ppstructure-gpu")].lower()
+    normalized = _dockerfile_stage(dockerfile, "ppstructure-base").lower()
     runtime_install = re.search(
         r"run apt-get update\s+\\\s+&& apt-get install -y --no-install-recommends\s+\\\s+"
         r"libgl1 libglib2\.0-0 libgomp1\s+\\\s+"
