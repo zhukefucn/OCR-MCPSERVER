@@ -125,8 +125,9 @@ async def test_cancel_during_initial_notification_still_closes_claim_observation
 ) -> None:
     repository, _ = orchestration_repository
     await repository.create_batch("cancel-notifier", ["file-a"])
+    clock = ManualClock()
     claim = await repository.claim_next(
-        "worker", now=ManualClock().now(), lease_seconds=30
+        "worker", now=clock.now(), lease_seconds=30
     )
     assert claim is not None
     entered = asyncio.Event()
@@ -142,6 +143,7 @@ async def test_cancel_during_initial_notification_still_closes_claim_observation
         object(),
         OrchestrationSettings(),
         notification_sink=BlockingSink(),
+        clock=clock,
         worker_identity="worker",
         observability=observations,
     )
@@ -234,11 +236,14 @@ async def test_terminal_repository_faults_are_never_misclassified_as_cancelled(
         worker_identity="worker",
         observability=observations,
     )
-    with pytest.raises(type(error)):
-        await service._execute_claim(claim)
-    assert service.drain_observations()
-    assert observations.tasks == [(expected, 0.0)]
-    assert observations.tasks[0][0] is not TaskOutcome.CANCELLED
+    try:
+        with pytest.raises(type(error)):
+            await service._execute_claim(claim)
+        assert service.drain_observations()
+        assert observations.tasks == [(expected, 0.0)]
+        assert observations.tasks[0][0] is not TaskOutcome.CANCELLED
+    finally:
+        await service.close()
 
 
 @pytest_asyncio.fixture

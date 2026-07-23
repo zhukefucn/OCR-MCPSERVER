@@ -31,6 +31,7 @@ from ocr_mcp_server.services.observability import (
     HttpObservation,
     NullObservability,
     ObservationDispatcher,
+    TaskOutcome,
 )
 from ocr_mcp_server.settings import AppSettings
 
@@ -155,6 +156,7 @@ async def test_blocked_sink_does_not_make_metrics_scrapes_block_the_event_loop()
             super().observe_http(observation)
 
     app = create_app(AppSettings(auth={"api_keys": []}), observability=BlockingSink())
+    app.state.observability_dispatcher.activate()
     transport = httpx.ASGITransport(app=app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -215,6 +217,8 @@ def test_app_lifespan_closes_only_dispatcher_owned_by_injected_readiness() -> No
         )
     ) as client:
         assert client.get("/health/live").status_code == 200
+    external.observe_task(TaskOutcome.COMPLETED, 0.1)
+    assert external.drain(0.2)
     assert external.alive_workers == 1
     external.close()
     assert external.wait_closed(0.2)
@@ -225,6 +229,9 @@ def test_unstarted_unclosed_app_is_collectible_and_terminates_owned_dispatcher()
     app = create_app(
         AppSettings(auth={"api_keys": []}), observability=RecordingSink()
     )
+    app.state.observability_dispatcher.activate()
+    app.state.observability.observe_task(TaskOutcome.COMPLETED, 0.1)
+    assert app.state.observability_dispatcher.drain(0.2)
     app_reference = weakref.ref(app)
     workers = set(threading.enumerate()) - prior_threads
     assert len(workers) == 1
@@ -239,6 +246,71 @@ def test_unstarted_unclosed_app_is_collectible_and_terminates_owned_dispatcher()
 
     assert app_reference() is None
     assert workers.isdisjoint(set(threading.enumerate()))
+
+
+def test_constructing_apps_without_lifespan_does_not_start_dispatch_workers() -> None:
+    prior_workers = {
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith("ocr-observation-")
+    }
+    apps = [
+        create_app(AppSettings(auth={"api_keys": []}), observability=RecordingSink())
+        for _ in range(8)
+    ]
+    try:
+        current_workers = {
+            thread
+            for thread in threading.enumerate()
+            if thread.name.startswith("ocr-observation-")
+        }
+        assert current_workers == prior_workers
+        assert all(app.state.observability_dispatcher.alive_workers == 0 for app in apps)
+    finally:
+        apps.clear()
+        gc.collect()
+
+
+def test_request_without_lifespan_does_not_start_app_owned_dispatch_worker() -> None:
+    prior_workers = {
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith("ocr-observation-")
+    }
+    app = create_app(
+        AppSettings(auth={"api_keys": []}), observability=RecordingSink()
+    )
+    client = TestClient(app)
+    try:
+        assert client.get("/health/live").status_code == 200
+    finally:
+        client.close()
+    assert app.state.observability_dispatcher.alive_workers == 0
+    assert {
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith("ocr-observation-")
+    } == prior_workers
+
+
+def test_repeated_testclient_lifespans_leave_no_app_dispatch_workers() -> None:
+    prior_workers = {
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith("ocr-observation-")
+    }
+    for _ in range(6):
+        with TestClient(
+            create_app(
+                AppSettings(auth={"api_keys": []}), observability=RecordingSink()
+            )
+        ) as client:
+            assert client.get("/health/live").status_code == 200
+    assert {
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith("ocr-observation-")
+    } == prior_workers
 
 
 def test_metrics_render_failure_is_content_free_503(monkeypatch: pytest.MonkeyPatch) -> None:

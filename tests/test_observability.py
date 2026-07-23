@@ -63,6 +63,23 @@ def test_dispatcher_is_bounded_nonblocking_and_close_never_waits_for_blocked_sin
     assert dispatcher.alive_workers == 0
 
 
+def test_dispatcher_starts_its_single_fifo_worker_only_on_first_submission():
+    prior_threads = set(threading.enumerate())
+    sink = NullObservability()
+    dispatcher = ObservationDispatcher(sink)
+    assert set(threading.enumerate()) == prior_threads
+    assert dispatcher.worker_count == 1
+    assert dispatcher.alive_workers == 0
+
+    dispatcher.observe_task(TaskOutcome.COMPLETED, 0.1)
+    assert dispatcher.drain(0.2)
+    workers = set(threading.enumerate()) - prior_threads
+    assert len(workers) == 1
+    assert dispatcher.alive_workers == 1
+    dispatcher.close()
+    assert dispatcher.wait_closed(0.2)
+
+
 @pytest.mark.parametrize("worker_count", [0, 2, 4, True, 1.0])
 def test_dispatcher_requires_exactly_one_integer_worker(worker_count):
     with pytest.raises(ValueError, match="^invalid observation$"):
@@ -95,7 +112,10 @@ def test_dispatcher_preserves_gauge_submission_order_when_first_write_is_delayed
 
 def test_unclosed_idle_dispatcher_is_collectible_and_terminates_its_worker():
     prior_threads = set(threading.enumerate())
-    dispatcher = ObservationDispatcher(NullObservability())
+    sink = NullObservability()
+    dispatcher = ObservationDispatcher(sink)
+    dispatcher.observe_task(TaskOutcome.COMPLETED, 0.1)
+    assert dispatcher.drain(0.2)
     dispatcher_reference = weakref.ref(dispatcher)
     workers = set(threading.enumerate()) - prior_threads
     assert len(workers) == 1
@@ -127,9 +147,10 @@ def test_collecting_owner_discards_queued_payload_and_stops_after_sink_returns()
     prior_threads = set(threading.enumerate())
     sink = Sink()
     dispatcher = ObservationDispatcher(sink, capacity=2)
-    workers = set(threading.enumerate()) - prior_threads
     dispatcher.set_orchestration_queue_depth(1)
     assert entered.wait(0.2)
+    workers = set(threading.enumerate()) - prior_threads
+    assert len(workers) == 1
     dispatcher.set_orchestration_queue_depth(2)
     dispatcher_reference = weakref.ref(dispatcher)
     del dispatcher

@@ -200,7 +200,9 @@ def best_effort(observation: Callable[[], None]) -> None:
 class _ObservationDispatchState:
     """Worker-owned state that deliberately has no dispatcher back-reference."""
 
-    def __init__(self, sink: ObservabilitySink, capacity: int) -> None:
+    def __init__(
+        self, sink: ObservabilitySink, capacity: int, *, active: bool
+    ) -> None:
         try:
             self.sink_reference = weakref.ref(sink)
             self.sink_strong = None
@@ -212,6 +214,8 @@ class _ObservationDispatchState:
         )
         self.lock = threading.Lock()
         self.closed = False
+        self.active = active
+        self.started = False
         self.dropped = 0
         self.stop_token = object()
 
@@ -223,6 +227,7 @@ def _stop_dispatch_state(state: _ObservationDispatchState) -> None:
         if state.closed:
             return
         state.closed = True
+        started = state.started
     while True:
         try:
             state.queue.get_nowait()
@@ -230,10 +235,11 @@ def _stop_dispatch_state(state: _ObservationDispatchState) -> None:
             break
         else:
             state.queue.task_done()
-    try:
-        state.queue.put_nowait(state.stop_token)
-    except Full:
-        return
+    if started:
+        try:
+            state.queue.put_nowait(state.stop_token)
+        except Full:
+            return
 
 
 def _run_dispatch_state(state: _ObservationDispatchState) -> None:
@@ -275,6 +281,7 @@ class ObservationDispatcher(NullObservability):
         *,
         capacity: int = 256,
         worker_count: int = 1,
+        autostart: bool = True,
     ) -> None:
         if (
             sink is self
@@ -284,9 +291,12 @@ class ObservationDispatcher(NullObservability):
             or isinstance(worker_count, bool)
             or not isinstance(worker_count, int)
             or worker_count != 1
+            or not isinstance(autostart, bool)
         ):
             raise _invalid()
-        self._state = _ObservationDispatchState(sink, capacity)
+        self._state = _ObservationDispatchState(
+            sink, capacity, active=autostart
+        )
         self._threads = (
             threading.Thread(
                 target=_run_dispatch_state,
@@ -296,8 +306,6 @@ class ObservationDispatcher(NullObservability):
             ),
         )
         self._finalizer = weakref.finalize(self, _stop_dispatch_state, self._state)
-        for thread in self._threads:
-            thread.start()
 
     @property
     def pending(self) -> int:
@@ -349,6 +357,16 @@ class ObservationDispatcher(NullObservability):
         super().set_dependency_ready(dependency, ready)
         self._submit("set_dependency_ready", dependency, ready)
 
+    def activate(self) -> None:
+        """Allow queued observations to start the single FIFO worker."""
+
+        with self._state.lock:
+            if self._state.closed or self._state.active:
+                return
+            self._state.active = True
+            if self._state.queue.qsize() and not self._state.started:
+                self._start_locked()
+
     def _submit(self, method: str, *args: object) -> None:
         with self._state.lock:
             if self._state.closed:
@@ -358,6 +376,25 @@ class ObservationDispatcher(NullObservability):
                 self._state.queue.put_nowait((method, args))
             except Full:
                 self._state.dropped += 1
+                return
+            if self._state.active and not self._state.started:
+                self._start_locked()
+
+    def _start_locked(self) -> None:
+        try:
+            self._threads[0].start()
+        except Exception:
+            self._state.closed = True
+            while True:
+                try:
+                    self._state.queue.get_nowait()
+                except Empty:
+                    break
+                else:
+                    self._state.dropped += 1
+                    self._state.queue.task_done()
+            return
+        self._state.started = True
 
     def drain(self, timeout: float = 1.0) -> bool:
         if (
@@ -385,6 +422,8 @@ class ObservationDispatcher(NullObservability):
         self.drain(timeout)
         self._finalizer()
         for thread in self._threads:
+            if thread.ident is None:
+                continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -399,6 +438,8 @@ class ObservationDispatcher(NullObservability):
             raise _invalid()
         deadline = time.monotonic() + float(timeout)
         for thread in self._threads:
+            if thread.ident is None:
+                continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -408,13 +449,15 @@ class ObservationDispatcher(NullObservability):
 
 def nonblocking_observability(
     sink: ObservabilitySink | None,
+    *,
+    autostart: bool = True,
 ) -> tuple[ObservabilitySink, ObservationDispatcher | None]:
     """Return a safe call-site sink and an owned dispatcher, if one was created."""
 
     resolved: ObservabilitySink = sink if sink is not None else NullObservability()
     if isinstance(resolved, ObservationDispatcher) or type(resolved) is NullObservability:
         return resolved, None
-    dispatcher = ObservationDispatcher(resolved)
+    dispatcher = ObservationDispatcher(resolved, autostart=autostart)
     return dispatcher, dispatcher
 
 

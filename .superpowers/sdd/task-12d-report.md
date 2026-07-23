@@ -246,6 +246,58 @@ issues. They were addressed as one coordinated TDD wave.
 No push, sync, image build, deployment, production fault control, heavy dependency,
 or new telemetry backend was added.
 
+## Ubuntu/Linux ordering and ownership gate
+
+The Ubuntu full-suite gate exposed one timing-sensitive assertion and a retained
+worker ordering problem that Windows execution order had not made visible.
+
+### Deterministic cancellation duration
+
+- Linux RED: `test_cancel_during_initial_notification_still_closes_claim_observation`
+  used the real system clock but asserted an exact zero cancellation duration; the
+  observed finite duration was approximately 87 microseconds.
+- GREEN: the claim and `OrchestrationService` now share one `ManualClock` in that
+  test. Production duration measurement remains unchanged and is not suppressed.
+
+### Lazy app-owned dispatcher activation
+
+- RED: every dispatcher started its worker in the constructor. Eight apps created
+  without lifespan produced eight persistent workers, and a TestClient request
+  made without entering lifespan also started and retained an app worker.
+- GREEN: a dispatcher now creates no thread until it is both active and receives
+  its first observation. Generic service-owned dispatchers remain active by
+  default. App-owned wrappers are created inactive and activated only at lifespan
+  startup; construction and no-lifespan requests therefore create zero workers.
+- Activation preserves the exact one-worker FIFO queue. Repeated TestClient
+  lifespans start at most one worker per app and leave no app observation workers
+  after shutdown. Active owner GC, bounded queue discard, and explicit close use
+  the existing identity-safe finalizer path.
+
+### Order-dependent test retention diagnosis
+
+- A per-test worker-count diagnostic found the six retained threads exactly: the
+  parametrized terminal repository-fault orchestration cases each retained their
+  `pytest.raises` traceback/frame and an unclosed service dispatcher. All 161 broad
+  tests completed in about seven seconds, but interpreter shutdown then waited
+  with six observation workers still idle.
+- Each parametrized case now closes its service in `finally`, including assertion
+  failure paths. The same combined order exits normally with
+  `161 passed in 7.16s`.
+
+### Final local evidence
+
+- Linux-gate focused Task 12 set: `282 passed in 11.52s` using basetemp
+  `.pytest-tmp/linux-gate-focused-final`.
+- Complete isolated Windows suite: `1005 passed, 20 skipped in 20.68s` using
+  basetemp `.pytest-tmp/linux-gate-full-final`.
+- `pip check` reports no broken requirements, `compileall` exits 0, and
+  `git diff --check` exits 0 with informational Windows LF/CRLF notices only.
+- WSL was unavailable in the local environment; the committed fix is ready for
+  the authoritative Ubuntu full-suite rerun.
+
+No push, sync, image build, deployment, production fault control, heavy dependency,
+or new telemetry backend was added.
+
 ## Final dispatcher ordering, ownership, and scrape remediation
 
 The last dispatcher review identified three lifecycle/concurrency gaps. They were

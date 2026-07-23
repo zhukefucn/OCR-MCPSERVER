@@ -71,13 +71,15 @@ def create_app(
         else PrometheusObservability(resolved_registry)
     )
     resolved_observability, owned_dispatcher = nonblocking_observability(
-        raw_observability
+        raw_observability, autostart=False
     )
     mcp_server = create_mcp_server(gateway)
     mcp_app = mcp_server.http_app(path="/mcp")
 
     @asynccontextmanager
     async def lifespan(application):
+        if owned_dispatcher is not None:
+            owned_dispatcher.activate()
         try:
             async with mcp_app.lifespan(application):
                 yield
