@@ -82,6 +82,14 @@ vLLM, or PaddleOCR-VL runtime. Place the verified PP-StructureV3 model bundle in
 directory at `/models` read-only. Record and verify the bundle manifest and its
 SHA-256 before startup. The container does not download models during startup.
 
+The bundle must also contain `model-manifest.json`. Its `models` object maps the
+eleven enabled PaddleX YAML node paths to relative model directories, while its
+`files` array lists the pipeline YAML and every required model file as a relative
+path plus lowercase SHA-256. The smoke check rejects missing, unlisted, modified,
+absolute, or `/models`-escaping paths and injects the verified directories into
+the exact `pp-structure-v3.yaml` used by production. Disabled chart, seal,
+unwarping, text-line-orientation, and region models are not required.
+
 The controller-owned Ubuntu delivery gate uses:
 
 ```bash
@@ -90,13 +98,15 @@ docker compose --profile ppstructure-cpu up -d ocr-gateway-ppstructure-cpu
 curl -fsS http://127.0.0.1:8000/health/live
 docker compose --profile ppstructure-cpu exec ocr-gateway-ppstructure-cpu \
   python /app/scripts/smoke_pp_structure.py --device cpu \
-  --fixture /app/scripts/fixtures/pp_structure_smoke.ppm
+  --fixture /app/scripts/fixtures/pp_structure_smoke.json
 ```
 
 The smoke command checks exact package versions, confirms a CPU-only Paddle
 build, validates the supplied model configuration, runs one real prediction,
 and prints only version, device, and result-count fields. Remote build and
 startup validation remain a separate release step after local review.
+Run the image smoke once with outbound networking denied and an empty model
+cache before release; any attempted model download must fail the candidate.
 
 ## 远程 Ubuntu 容器验证
 

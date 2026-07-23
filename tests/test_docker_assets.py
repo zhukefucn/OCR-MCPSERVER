@@ -126,6 +126,17 @@ def test_ppstructure_cpu_requirements_are_exact_and_cpu_only() -> None:
     assert "paddlepaddle==3.3.0" in dockerfile
     assert "https://www.paddlepaddle.org.cn/packages/stable/cpu/" in dockerfile
     assert "https://pypi.org/simple" in dockerfile
+    assert re.search(r"^ARG\s+(?:PIP|PADDLE).*INDEX", dockerfile, re.MULTILINE) is None
+    index_urls = re.findall(r"--index-url\s+(\S+)", dockerfile)
+    assert index_urls == [
+        "https://www.paddlepaddle.org.cn/packages/stable/cpu/",
+        "https://pypi.org/simple",
+    ]
+    for index_url in index_urls:
+        parsed_index = urlsplit(index_url)
+        assert parsed_index.scheme == "https"
+        assert parsed_index.username is None
+        assert parsed_index.password is None
     assert ">=" not in requirements
     assert "paddlepaddle-gpu" not in combined
     for forbidden in ("paddleocr-vl", "paddleocr_vl", "vllm", "cuda", "torch"):
@@ -144,7 +155,7 @@ def test_ppstructure_cpu_dockerfile_is_a_bounded_non_root_gateway_image() -> Non
     assert "COPY pyproject.toml README.md ./" in dockerfile
     assert "COPY src ./src" in dockerfile
     assert "COPY scripts/smoke_pp_structure.py ./scripts/smoke_pp_structure.py" in dockerfile
-    assert "COPY scripts/fixtures/pp_structure_smoke.ppm ./scripts/fixtures/pp_structure_smoke.ppm" in dockerfile
+    assert "COPY scripts/fixtures/pp_structure_smoke.json ./scripts/fixtures/pp_structure_smoke.json" in dockerfile
     assert "python -m pip install --no-cache-dir ." in dockerfile
     assert ".[dev]" not in dockerfile
     assert re.search(r"(?:--gid|-g)\s+10001\b", normalized)
@@ -441,6 +452,24 @@ def test_dockerignore_keeps_nested_secrets_excluded_after_source_exceptions() ->
         "src/ocr_mcp_server/app.py",
     ):
         assert not _dockerignore_excludes(required_build_input, patterns)
+
+
+def test_dockerignore_excludes_model_weights_after_script_exceptions() -> None:
+    patterns = _dockerignore_patterns()
+    last_script_exception = patterns.index("!scripts/**")
+
+    assert patterns.index("models") > last_script_exception
+    assert patterns.index("models/**") > last_script_exception
+    for model_path in (
+        "models/pp-structure-v3/inference.pdiparams",
+        "models/pp-structure-v3/model-manifest.json",
+    ):
+        assert _dockerignore_excludes(model_path, patterns)
+    for required_script in (
+        "scripts/smoke_pp_structure.py",
+        "scripts/fixtures/pp_structure_smoke.json",
+    ):
+        assert not _dockerignore_excludes(required_script, patterns)
 
 
 def test_readme_documents_remote_ubuntu_container_verification() -> None:

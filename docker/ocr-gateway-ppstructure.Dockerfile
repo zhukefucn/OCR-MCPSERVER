@@ -1,8 +1,5 @@
 FROM python:3.11-slim-bookworm AS ppstructure-cpu
 
-ARG PIP_INDEX_URL=https://pypi.org/simple
-ARG PADDLE_CPU_INDEX_URL=https://www.paddlepaddle.org.cn/packages/stable/cpu/
-
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -22,14 +19,14 @@ RUN python -m pip install --no-cache-dir .
 COPY docker/requirements/pp-structure-v3.txt ./docker/requirements/pp-structure-v3.txt
 
 RUN python -m pip install --no-cache-dir \
-        --index-url ${PADDLE_CPU_INDEX_URL} \
+        --index-url https://www.paddlepaddle.org.cn/packages/stable/cpu/ \
         paddlepaddle==3.3.0 \
     && python -m pip install --no-cache-dir \
-        --index-url ${PIP_INDEX_URL} \
+        --index-url https://pypi.org/simple \
         -r docker/requirements/pp-structure-v3.txt
 
 COPY scripts/smoke_pp_structure.py ./scripts/smoke_pp_structure.py
-COPY scripts/fixtures/pp_structure_smoke.ppm ./scripts/fixtures/pp_structure_smoke.ppm
+COPY scripts/fixtures/pp_structure_smoke.json ./scripts/fixtures/pp_structure_smoke.json
 
 RUN groupadd --gid 10001 ocr \
     && useradd --uid 10001 --gid 10001 --create-home \

@@ -5,6 +5,8 @@
 !src/**
 !scripts
 !scripts/**
+models
+models/**
 
 .git
 .github
