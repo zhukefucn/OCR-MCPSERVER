@@ -349,6 +349,14 @@ def test_secondary_ocr_settings_load_from_yaml_and_environment(
     assert settings.formula_model_name == "PP-FormulaNet_plus-M"
 
 
+def test_secondary_ocr_settings_accept_explicit_first_gpu() -> None:
+    settings = AppSettings(
+        secondary_ocr={"device": "gpu:0"}
+    ).secondary_ocr
+
+    assert settings.device == "gpu:0"
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

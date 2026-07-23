@@ -228,6 +228,131 @@ def test_cpu_smoke_checks_versions_features_and_real_prediction(
     }
 
 
+def test_gpu_smoke_checks_single_visible_gpu_and_real_prediction(
+    tmp_path: Path,
+) -> None:
+    smoke = _load_smoke_module()
+    fixture = REPOSITORY_ROOT / "scripts" / "fixtures" / "pp_structure_smoke.json"
+    model_root, model_config, manifest_path = _offline_model_bundle(tmp_path)
+    calls: dict[str, object] = {}
+
+    class FakePipeline:
+        def __init__(self, **kwargs: object) -> None:
+            calls["constructor"] = kwargs
+
+        def predict(self, input: str, **kwargs: object):
+            calls["predict"] = kwargs
+            return iter(
+                [
+                    {
+                        "res": {
+                            "layout_det_res": {
+                                "boxes": [{"label": "formula", "score": 0.99}]
+                            },
+                            "table_res_list": [],
+                            "formula_res_list": [{"rec_formula": "x"}],
+                        }
+                    }
+                ]
+            )
+
+        def close(self) -> None:
+            calls["closed"] = True
+
+    paddle = SimpleNamespace(
+        __version__="3.3.0",
+        is_compiled_with_cuda=lambda: True,
+        device=SimpleNamespace(
+            cuda=SimpleNamespace(
+                device_count=lambda: calls.setdefault("device_count", 1)
+            )
+        ),
+        utils=SimpleNamespace(run_check=lambda: calls.setdefault("run_check", True)),
+    )
+    paddleocr = SimpleNamespace(__version__="3.5.0", PPStructureV3=FakePipeline)
+
+    summary = smoke.run_smoke(
+        device="gpu:0",
+        fixture=fixture,
+        model_config=model_config,
+        model_manifest=manifest_path,
+        model_root=model_root,
+        paddle_module=paddle,
+        paddleocr_module=paddleocr,
+        package_version=lambda name: {
+            "paddlepaddle-gpu": "3.3.0",
+            "paddleocr": "3.5.0",
+        }[name],
+    )
+
+    constructor = calls["constructor"]
+    assert constructor["device"] == "gpu:0"
+    assert "enable_mkldnn" not in constructor
+    assert calls["device_count"] == 1
+    assert calls["run_check"] is True
+    assert calls["closed"] is True
+    assert summary == {
+        "paddle_version": "3.3.0",
+        "paddleocr_version": "3.5.0",
+        "device": "gpu:0",
+        "result_count": 1,
+    }
+
+
+@pytest.mark.parametrize("visible_count", [0, 2])
+def test_gpu_smoke_rejects_not_exactly_one_visible_gpu(
+    tmp_path: Path, visible_count: int
+) -> None:
+    smoke = _load_smoke_module()
+    fixture = REPOSITORY_ROOT / "scripts" / "fixtures" / "pp_structure_smoke.json"
+    paddle = SimpleNamespace(
+        __version__="3.3.0",
+        is_compiled_with_cuda=lambda: True,
+        device=SimpleNamespace(
+            cuda=SimpleNamespace(device_count=lambda: visible_count)
+        ),
+        utils=SimpleNamespace(run_check=pytest.fail),
+    )
+    paddleocr = SimpleNamespace(__version__="3.5.0", PPStructureV3=pytest.fail)
+
+    with pytest.raises(smoke.SmokeFailure, match="device_mode"):
+        smoke.run_smoke(
+            device="gpu:0",
+            fixture=fixture,
+            paddle_module=paddle,
+            paddleocr_module=paddleocr,
+            package_version=lambda name: {
+                "paddlepaddle-gpu": "3.3.0",
+                "paddleocr": "3.5.0",
+            }[name],
+        )
+
+
+def test_gpu_smoke_rejects_installed_cpu_distribution(tmp_path: Path) -> None:
+    smoke = _load_smoke_module()
+    fixture = REPOSITORY_ROOT / "scripts" / "fixtures" / "pp_structure_smoke.json"
+    paddle = SimpleNamespace(
+        __version__="3.3.0",
+        is_compiled_with_cuda=lambda: True,
+        device=SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 1)),
+        utils=SimpleNamespace(run_check=pytest.fail),
+    )
+    paddleocr = SimpleNamespace(__version__="3.5.0", PPStructureV3=pytest.fail)
+
+    with pytest.raises(smoke.SmokeFailure, match="device_mode"):
+        smoke.run_smoke(
+            device="gpu:0",
+            fixture=fixture,
+            paddle_module=paddle,
+            paddleocr_module=paddleocr,
+            package_version=lambda name: {
+                "paddlepaddle-gpu": "3.3.0",
+                "paddlepaddle": "3.3.0",
+                "paddleocr": "3.5.0",
+            }[name],
+        )
+
+
 @pytest.mark.parametrize(
     "pipeline_path",
     (

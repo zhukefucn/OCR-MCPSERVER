@@ -62,12 +62,13 @@ def _dockerfile_instructions(dockerfile: str) -> list[str]:
     return instructions
 
 
-def test_compose_keeps_the_minimal_gateway_and_adds_the_cpu_profile() -> None:
+def test_compose_keeps_the_minimal_gateway_and_adds_ppstructure_profiles() -> None:
     compose = _compose_config()
 
     assert set(compose["services"]) == {
         "ocr-gateway",
         "ocr-gateway-ppstructure-cpu",
+        "ocr-gateway-ppstructure-gpu",
     }
     assert set(compose["volumes"]) == {"ocr-data"}
 
@@ -106,28 +107,74 @@ def test_compose_keeps_the_minimal_gateway_and_adds_the_cpu_profile() -> None:
     assert cpu_gateway["init"] is True
     assert cpu_gateway["restart"] == "unless-stopped"
 
+    gpu_gateway = compose["services"]["ocr-gateway-ppstructure-gpu"]
+    assert gpu_gateway["profiles"] == ["ppstructure-gpu"]
+    assert gpu_gateway["build"] == {
+        "context": ".",
+        "dockerfile": "docker/ocr-gateway-ppstructure.Dockerfile",
+        "target": "ppstructure-gpu",
+    }
+    assert gpu_gateway["environment"] == {
+        "OCR_SECONDARY_OCR__DEVICE": "gpu:0",
+        "OCR_SECONDARY_OCR__PADDLEX_CONFIG": "/models/pp-structure-v3.yaml",
+    }
+    assert gpu_gateway["volumes"] == cpu_gateway["volumes"]
+    assert gpu_gateway["ports"] == ["${OCR_GATEWAY_PORT:-8000}:8000"]
+    assert gpu_gateway["init"] is True
+    assert gpu_gateway["restart"] == "unless-stopped"
 
-def test_compose_does_not_grant_unneeded_host_or_gpu_access() -> None:
-    for gateway in _compose_config()["services"].values():
+
+def test_compose_grants_only_the_gpu_profile_one_nvidia_device() -> None:
+    services = _compose_config()["services"]
+    gpu_gateway = services["ocr-gateway-ppstructure-gpu"]
+    assert gpu_gateway["deploy"] == {
+        "resources": {
+            "reservations": {
+                "devices": [
+                    {
+                        "driver": "nvidia",
+                        "count": 1,
+                        "capabilities": ["gpu"],
+                    }
+                ]
+            }
+        }
+    }
+    assert "gpus" not in gpu_gateway
+    assert "devices" not in gpu_gateway
+
+    for name, gateway in services.items():
         assert gateway.get("privileged") is not True
         assert gateway.get("network_mode") != "host"
-        assert "gpus" not in gateway
-        assert "devices" not in gateway
-        assert "deploy" not in gateway
         assert "/var/run/docker.sock" not in str(gateway)
+        if name != "ocr-gateway-ppstructure-gpu":
+            assert "gpus" not in gateway
+            assert "devices" not in gateway
+            assert "deploy" not in gateway
+
+
+def test_ppstructure_cpu_and_gpu_profiles_are_mutually_scoped() -> None:
+    services = _compose_config()["services"]
+    cpu_profiles = services["ocr-gateway-ppstructure-cpu"]["profiles"]
+    gpu_profiles = services["ocr-gateway-ppstructure-gpu"]["profiles"]
+
+    assert cpu_profiles == ["ppstructure-cpu"]
+    assert gpu_profiles == ["ppstructure-gpu"]
+    assert set(cpu_profiles).isdisjoint(gpu_profiles)
 
 
 def test_ppstructure_cpu_requirements_are_exact_and_cpu_only() -> None:
     requirements = _read_text("docker/requirements/pp-structure-v3.txt")
     dockerfile = _read_text("docker/ocr-gateway-ppstructure.Dockerfile")
-    combined = f"{requirements}\n{dockerfile}".lower()
+    cpu_stage = dockerfile[: dockerfile.lower().index("as ppstructure-gpu")]
+    combined = f"{requirements}\n{cpu_stage}".lower()
 
     assert re.search(r"^paddleocr\[doc-parser\]==3\.5\.0\s*$", requirements, re.MULTILINE)
-    assert "paddlepaddle==3.3.0" in dockerfile
-    assert "https://www.paddlepaddle.org.cn/packages/stable/cpu/" in dockerfile
-    assert "https://pypi.org/simple" in dockerfile
-    assert re.search(r"^ARG\s+(?:PIP|PADDLE).*INDEX", dockerfile, re.MULTILINE) is None
-    index_urls = re.findall(r"--index-url\s+(\S+)", dockerfile)
+    assert "paddlepaddle==3.3.0" in cpu_stage
+    assert "https://www.paddlepaddle.org.cn/packages/stable/cpu/" in cpu_stage
+    assert "https://pypi.org/simple" in cpu_stage
+    assert re.search(r"^ARG\s+(?:PIP|PADDLE).*INDEX", cpu_stage, re.MULTILINE) is None
+    index_urls = re.findall(r"--index-url\s+(\S+)", cpu_stage)
     assert index_urls == [
         "https://www.paddlepaddle.org.cn/packages/stable/cpu/",
         "https://pypi.org/simple",
@@ -141,6 +188,64 @@ def test_ppstructure_cpu_requirements_are_exact_and_cpu_only() -> None:
     assert "paddlepaddle-gpu" not in combined
     for forbidden in ("paddleocr-vl", "paddleocr_vl", "vllm", "cuda", "torch"):
         assert forbidden not in combined
+
+
+def test_ppstructure_gpu_target_is_exact_blackwell_cuda129_runtime() -> None:
+    dockerfile = _read_text("docker/ocr-gateway-ppstructure.Dockerfile")
+    normalized = dockerfile.lower()
+    gpu_stage = normalized[normalized.index("as ppstructure-gpu") :]
+
+    assert re.search(
+        r"^from python:3\.11-slim-bookworm as ppstructure-gpu\s*$",
+        normalized,
+        re.MULTILINE,
+    )
+    assert "paddlepaddle-gpu==3.3.0" in gpu_stage
+    assert "https://www.paddlepaddle.org.cn/packages/stable/cu129/" in gpu_stage
+    assert "https://pypi.org/simple" in gpu_stage
+    assert "paddleocr[doc-parser]==3.5.0" in _read_text(
+        "docker/requirements/pp-structure-v3.txt"
+    )
+    assert "paddlepaddle==3.3.0" not in gpu_stage
+    for forbidden in (
+        "cu118",
+        "cu11",
+        "cu126",
+        "cuda:11",
+        "cuda:12.6",
+        ":latest",
+        "paddleocr-vl",
+        "paddleocr_vl",
+        "vllm",
+    ):
+        assert forbidden not in gpu_stage
+
+    index_urls = re.findall(r"--index-url\s+(\S+)", gpu_stage)
+    assert index_urls == [
+        "https://www.paddlepaddle.org.cn/packages/stable/cu129/",
+        "https://pypi.org/simple",
+    ]
+    assert re.findall(r"^user\s+(.+?)\s*$", gpu_stage, re.MULTILINE)[-1] == "10001:10001"
+    assert '["ocr-mcp-server"]' in gpu_stage
+
+
+def test_readme_documents_blackwell_gpu_build_start_and_real_smoke() -> None:
+    readme = _read_text("README.md")
+
+    assert "## PP-StructureV3 GPU image" in readme
+    assert "CUDA 12.9" in readme
+    assert "paddlepaddle-gpu==3.3.0" in readme
+    assert "ppstructure-gpu" in readme
+    assert (
+        "docker compose --profile ppstructure-gpu build "
+        "ocr-gateway-ppstructure-gpu"
+    ) in readme
+    assert (
+        "docker compose --profile ppstructure-gpu up -d "
+        "ocr-gateway-ppstructure-gpu"
+    ) in readme
+    assert "--device gpu:0" in readme
+    assert "enable_mkldnn" in readme
 
 
 def test_ppstructure_cpu_dockerfile_is_a_bounded_non_root_gateway_image() -> None:
@@ -184,7 +289,7 @@ def test_ppstructure_cpu_profile_has_no_public_paddle_endpoint() -> None:
 
 def test_ppstructure_cpu_installs_only_required_bookworm_runtime_libraries() -> None:
     dockerfile = _read_text("docker/ocr-gateway-ppstructure.Dockerfile")
-    normalized = dockerfile.lower()
+    normalized = dockerfile[: dockerfile.lower().index("as ppstructure-gpu")].lower()
     runtime_install = re.search(
         r"run apt-get update\s+\\\s+&& apt-get install -y --no-install-recommends\s+\\\s+"
         r"libgl1 libglib2\.0-0 libgomp1\s+\\\s+"

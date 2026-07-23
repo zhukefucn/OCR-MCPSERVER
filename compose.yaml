@@ -34,5 +34,33 @@ services:
     init: true
     restart: unless-stopped
 
+  ocr-gateway-ppstructure-gpu:
+    profiles:
+      - ppstructure-gpu
+    build:
+      context: .
+      dockerfile: docker/ocr-gateway-ppstructure.Dockerfile
+      target: ppstructure-gpu
+    image: ocr-mcp-server:ppstructure-gpu-dev
+    ports:
+      - "${OCR_GATEWAY_PORT:-8000}:8000"
+    environment:
+      OCR_SECONDARY_OCR__DEVICE: gpu:0
+      OCR_SECONDARY_OCR__PADDLEX_CONFIG: /models/pp-structure-v3.yaml
+    volumes:
+      - ocr-data:/data
+      - ./config/example.yaml:/app/config/example.yaml:ro
+      - ./models/pp-structure-v3:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu
+    init: true
+    restart: unless-stopped
+
 volumes:
   ocr-data:

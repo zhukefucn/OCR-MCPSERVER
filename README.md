@@ -108,6 +108,31 @@ startup validation remain a separate release step after local review.
 Run the image smoke once with outbound networking denied and an empty model
 cache before release; any attempted model download must fail the candidate.
 
+## PP-StructureV3 GPU image
+
+The mutually scoped `ppstructure-gpu` profile uses the same verified read-only
+model bundle and gateway runtime as the CPU profile, but installs exactly
+`paddlepaddle-gpu==3.3.0` from PaddlePaddle's CUDA 12.9 index. It reserves one
+NVIDIA GPU and configures PP-StructureV3 for `gpu:0`; do not activate the CPU
+and GPU profiles together.
+
+The controller-owned Ubuntu delivery gate uses:
+
+```bash
+docker compose --profile ppstructure-gpu build ocr-gateway-ppstructure-gpu
+docker compose --profile ppstructure-gpu up -d ocr-gateway-ppstructure-gpu
+curl -fsS http://127.0.0.1:8000/health/live
+docker compose --profile ppstructure-gpu exec ocr-gateway-ppstructure-gpu \
+  python /app/scripts/smoke_pp_structure.py --device gpu:0 \
+  --fixture /app/scripts/fixtures/pp_structure_smoke.json
+```
+
+The GPU smoke requires a CUDA-enabled Paddle build, exactly one visible GPU,
+`paddle.utils.run_check()`, and one real structured prediction. The GPU
+constructor intentionally omits the CPU-only `enable_mkldnn` option. Perform
+the real image build and smoke on the approved RTX 5090 Ubuntu host before
+assigning an immutable tag.
+
 ## 远程 Ubuntu 容器验证
 
 当前容器镜像仅包含 FastAPI 网关，不包含 MinerU 或 Paddle 推理依赖。本机只运行测试，不执行 Docker 镜像构建；尚未在远程 Ubuntu 完成构建和启动验证。

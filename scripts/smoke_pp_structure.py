@@ -557,8 +557,18 @@ def run_smoke(
             "paddlepaddle-gpu", package_version
         ):
             raise SmokeFailure("device_mode")
-    elif not compiled_with_cuda:
-        raise SmokeFailure("device_mode")
+    else:
+        try:
+            visible_gpu_count = paddle_module.device.cuda.device_count()
+        except Exception as exc:
+            raise SmokeFailure("device_mode") from exc
+        if (
+            not compiled_with_cuda
+            or type(visible_gpu_count) is not int
+            or visible_gpu_count != 1
+            or _is_distribution_installed("paddlepaddle", package_version)
+        ):
+            raise SmokeFailure("device_mode")
 
     paddle_module.utils.run_check()
     pipeline = None

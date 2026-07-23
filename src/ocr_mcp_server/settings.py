@@ -188,7 +188,7 @@ class MinerUSettings(_SettingsSection):
 
 class SecondaryOCRSettings(_SettingsSection):
     engine: SecondaryOCREngine = SecondaryOCREngine.PP_STRUCTURE_V3
-    device: Literal["cpu", "gpu"] = "cpu"
+    device: Literal["cpu", "gpu", "gpu:0"] = "cpu"
     queue_capacity: int = Field(default=8, ge=1, le=1024)
     classification_threshold: float = Field(default=0.8, gt=0, le=1)
     paddlex_config: Path | None = None

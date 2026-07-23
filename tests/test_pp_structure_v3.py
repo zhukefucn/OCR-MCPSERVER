@@ -83,8 +83,9 @@ def test_module_import_does_not_import_paddle(monkeypatch: pytest.MonkeyPatch) -
     assert "paddleocr" not in sys.modules
 
 
-def test_backend_lazy_imports_and_uses_fixed_constructor_and_predict_options(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("device", ["gpu", "gpu:0"])
+def test_backend_lazy_imports_and_uses_fixed_gpu_constructor_and_predict_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, device: str
 ) -> None:
     calls: dict[str, object] = {}
 
@@ -110,7 +111,7 @@ def test_backend_lazy_imports_and_uses_fixed_constructor_and_predict_options(
     from ocr_mcp_server.infra.pp_structure_v3 import PPStructureV3Backend
 
     settings = SecondaryOCRSettings(
-        device="gpu",
+        device=device,
         paddlex_config=Path("/trusted/pipeline.yaml"),
         formula_model_name="Trusted-Formula",
     )
@@ -119,7 +120,7 @@ def test_backend_lazy_imports_and_uses_fixed_constructor_and_predict_options(
     backend.close()
 
     assert calls["constructor"] == {
-        "device": "gpu",
+        "device": device,
         "paddlex_config": "/trusted/pipeline.yaml",
         "formula_recognition_model_name": "Trusted-Formula",
         "use_doc_orientation_classify": True,
