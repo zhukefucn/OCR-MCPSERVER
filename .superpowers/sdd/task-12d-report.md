@@ -424,5 +424,35 @@ loop. A permanently blocking handler therefore blocked `/health/live`.
 - `pip check` reports no broken requirements, `compileall` exits 0, and
   `git diff --check` exits 0 with informational Windows LF/CRLF notices only.
 
+## FastMCP lifespan nesting correction
+
+The app-owned metric and safe-log dispatchers now live entirely inside the
+FastMCP lifespan. FastMCP enters first; only then are the two dispatchers
+activated. During shutdown, readiness observability, metrics, and safe logging
+are closed independently and best-effort before FastMCP exits. A FastMCP enter
+failure therefore starts no app-owned worker, one ordinary cleanup failure
+cannot skip the remaining resources, and externally supplied dispatchers remain
+untouched by the app.
+
+### Regression and stress evidence
+
+- RED: four focused lifecycle tests exposed activation before FastMCP enter,
+  activation despite an enter failure, and cleanup short-circuiting after a
+  readiness exception; external ownership already remained correct.
+- GREEN: the exact observed lifecycle is `mcp-enter`, metric activation, log
+  activation, application yield, readiness close, metric close, log close,
+  `mcp-exit`. The enter-failure case records only `mcp-enter`, cleanup exceptions
+  are contained per resource, and external dispatcher activation/close hooks are
+  never called.
+- One hundred consecutive `TestClient` contexts with both app-owned dispatchers
+  completed successfully in 4.8 seconds and left no `ocr-observation-*` or
+  `ocr-safe-log-*` worker threads.
+- Updated Task 12 focused set: `292 passed in 11.49s` using basetemp
+  `.pytest-tmp/lifespan-focused`.
+- Updated complete isolated suite: `1015 passed, 20 skipped in 22.23s` using
+  basetemp `.pytest-tmp/lifespan-full`.
+- `pip check` reports no broken requirements, `compileall` exits 0, and
+  `git diff --check` exits 0 with informational Windows LF/CRLF notices only.
+
 No push, sync, image build, deployment, production fault control, heavy dependency,
 or new telemetry backend was added.

@@ -37,6 +37,7 @@ from .services.observability import (
     DependencyName,
     ObservationDispatcher,
     ObservabilitySink,
+    best_effort,
     nonblocking_observability,
 )
 from .settings import AppSettings, load_settings
@@ -88,20 +89,20 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(application):
-        if owned_dispatcher is not None:
-            owned_dispatcher.activate()
-        if owned_log_dispatcher is not None:
-            owned_log_dispatcher.activate()
-        try:
-            async with mcp_app.lifespan(application):
-                yield
-        finally:
-            if isinstance(resolved_readiness, ReadinessService):
-                resolved_readiness.close_observability()
+        async with mcp_app.lifespan(application):
             if owned_dispatcher is not None:
-                owned_dispatcher.close()
+                best_effort(owned_dispatcher.activate)
             if owned_log_dispatcher is not None:
-                owned_log_dispatcher.close()
+                best_effort(owned_log_dispatcher.activate)
+            try:
+                yield
+            finally:
+                if isinstance(resolved_readiness, ReadinessService):
+                    best_effort(resolved_readiness.close_observability)
+                if owned_dispatcher is not None:
+                    best_effort(owned_dispatcher.close)
+                if owned_log_dispatcher is not None:
+                    best_effort(owned_log_dispatcher.close)
 
     app = _ObservedFastAPI(
         title="OCR MCP Server",

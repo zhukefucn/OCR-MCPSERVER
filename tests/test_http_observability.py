@@ -7,6 +7,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -409,6 +410,187 @@ def test_repeated_lifespans_leave_no_app_log_workers_and_external_is_not_closed(
     assert external.alive_workers == 1
     external.close()
     assert external.wait_closed(0.2)
+
+
+@pytest.mark.asyncio
+async def test_app_resources_are_nested_inside_mcp_lifespan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeMcpApp:
+        routes = []
+
+        @asynccontextmanager
+        async def lifespan(self, application):
+            del application
+            events.append("mcp-enter")
+            try:
+                yield
+            finally:
+                events.append("mcp-exit")
+
+    class FakeServer:
+        def http_app(self, *, path: str):
+            assert path == "/mcp"
+            return FakeMcpApp()
+
+    class FakeReadiness:
+        def close_observability(self) -> None:
+            events.append("readiness-close")
+
+    monkeypatch.setattr("ocr_mcp_server.app.create_mcp_server", lambda gateway: FakeServer())
+    monkeypatch.setattr("ocr_mcp_server.app.ReadinessService", FakeReadiness)
+    app = create_app(
+        AppSettings(auth={"api_keys": []}),
+        observability=RecordingSink(),
+        event_logger=RecordingLogger(),
+        readiness=FakeReadiness(),
+    )
+    metric_dispatcher = app.state.observability_dispatcher
+    log_dispatcher = app.state.event_log_dispatcher
+    monkeypatch.setattr(metric_dispatcher, "activate", lambda: events.append("metric-activate"))
+    monkeypatch.setattr(metric_dispatcher, "close", lambda: events.append("metric-close"))
+    monkeypatch.setattr(log_dispatcher, "activate", lambda: events.append("log-activate"))
+    monkeypatch.setattr(log_dispatcher, "close", lambda: events.append("log-close"))
+
+    async with app.router.lifespan_context(app):
+        events.append("yield")
+
+    assert events == [
+        "mcp-enter",
+        "metric-activate",
+        "log-activate",
+        "yield",
+        "readiness-close",
+        "metric-close",
+        "log-close",
+        "mcp-exit",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mcp_enter_failure_does_not_activate_app_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeMcpApp:
+        routes = []
+
+        @asynccontextmanager
+        async def lifespan(self, application):
+            del application
+            events.append("mcp-enter")
+            raise RuntimeError("safe enter failure")
+            yield
+
+    class FakeServer:
+        def http_app(self, *, path: str):
+            del path
+            return FakeMcpApp()
+
+    monkeypatch.setattr("ocr_mcp_server.app.create_mcp_server", lambda gateway: FakeServer())
+    app = create_app(
+        AppSettings(auth={"api_keys": []}),
+        observability=RecordingSink(),
+        event_logger=RecordingLogger(),
+    )
+    monkeypatch.setattr(
+        app.state.observability_dispatcher,
+        "activate",
+        lambda: events.append("metric-activate"),
+    )
+    monkeypatch.setattr(
+        app.state.event_log_dispatcher,
+        "activate",
+        lambda: events.append("log-activate"),
+    )
+
+    with pytest.raises(RuntimeError, match="safe enter failure"):
+        async with app.router.lifespan_context(app):
+            pass
+    assert events == ["mcp-enter"]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failures_do_not_skip_other_owned_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeMcpApp:
+        routes = []
+
+        @asynccontextmanager
+        async def lifespan(self, application):
+            del application
+            events.append("mcp-enter")
+            try:
+                yield
+            finally:
+                events.append("mcp-exit")
+
+    class FakeServer:
+        def http_app(self, *, path: str):
+            del path
+            return FakeMcpApp()
+
+    class FakeReadiness:
+        def close_observability(self) -> None:
+            events.append("readiness-close")
+            raise RuntimeError("readiness close")
+
+    def failing_metric_close() -> None:
+        events.append("metric-close")
+        raise RuntimeError("metric close")
+
+    monkeypatch.setattr("ocr_mcp_server.app.create_mcp_server", lambda gateway: FakeServer())
+    monkeypatch.setattr("ocr_mcp_server.app.ReadinessService", FakeReadiness)
+    app = create_app(
+        AppSettings(auth={"api_keys": []}),
+        observability=RecordingSink(),
+        event_logger=RecordingLogger(),
+        readiness=FakeReadiness(),
+    )
+    monkeypatch.setattr(app.state.observability_dispatcher, "close", failing_metric_close)
+    monkeypatch.setattr(
+        app.state.event_log_dispatcher,
+        "close",
+        lambda: events.append("log-close"),
+    )
+
+    async with app.router.lifespan_context(app):
+        events.append("yield")
+    assert events[-4:] == [
+        "readiness-close",
+        "metric-close",
+        "log-close",
+        "mcp-exit",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_app_never_activates_or_closes_external_dispatchers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    external_metrics = ObservationDispatcher(NullObservability())
+    external_logs = SafeEventLogDispatcher(RecordingLogger())
+    monkeypatch.setattr(external_metrics, "activate", lambda: events.append("metric-activate"))
+    monkeypatch.setattr(external_metrics, "close", lambda: events.append("metric-close"))
+    monkeypatch.setattr(external_logs, "activate", lambda: events.append("log-activate"))
+    monkeypatch.setattr(external_logs, "close", lambda: events.append("log-close"))
+
+    app = create_app(
+        AppSettings(auth={"api_keys": []}),
+        observability=external_metrics,
+        event_logger=external_logs,
+    )
+    async with app.router.lifespan_context(app):
+        pass
+    assert events == []
 
 
 def test_metrics_render_failure_is_content_free_503(monkeypatch: pytest.MonkeyPatch) -> None:
