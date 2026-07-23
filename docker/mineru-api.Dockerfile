@@ -7,6 +7,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        fontconfig \
+        fonts-noto-cjk \
+        fonts-noto-core \
+        libgl1 \
+    && fc-cache -fv \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --index-url https://pypi.org/simple mineru==3.2.0
 

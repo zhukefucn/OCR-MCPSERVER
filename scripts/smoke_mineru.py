@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from importlib import import_module
 from importlib.metadata import version
 from io import BytesIO
 import json
+import os
+import subprocess
 import sys
 import time
-from typing import Callable
+from typing import Callable, Protocol
 from urllib.parse import quote, urlsplit
 from zipfile import BadZipFile, ZipFile
 
@@ -26,6 +29,79 @@ TASK_TIMEOUT_SECONDS = 900
 
 class SmokeFailure(RuntimeError):
     pass
+
+
+class CommandResult(Protocol):
+    returncode: int
+    stdout: str
+
+
+def resolve_cjk_font(
+    *,
+    command_runner: Callable[..., CommandResult] = subprocess.run,
+) -> str:
+    result = command_runner(
+        [
+            "fc-match",
+            "-f",
+            "%{family}\t%{file}\n",
+            "Noto Sans CJK SC",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    line = result.stdout.splitlines()[0] if result.stdout else ""
+    family, separator, font_path = line.partition("\t")
+    normalized_family = family.casefold()
+    if (
+        result.returncode != 0
+        or not separator
+        or "noto" not in normalized_family
+        or "cjk" not in normalized_family
+        or not os.path.isabs(font_path)
+    ):
+        raise SmokeFailure("cjk_font")
+    return font_path
+
+
+def check_runtime_dependencies(
+    *,
+    import_module: Callable[[str], object] = import_module,
+    font_match: Callable[[], str] = resolve_cjk_font,
+) -> dict[str, str]:
+    try:
+        cv2 = import_module("cv2")
+        image_module = import_module("PIL.Image")
+        image_draw_module = import_module("PIL.ImageDraw")
+        image_font_module = import_module("PIL.ImageFont")
+        if not getattr(cv2, "__version__", None):
+            raise SmokeFailure("opencv")
+        font = image_font_module.truetype(font_match(), 24)
+        image = image_module.new("L", (48, 48), 0)
+        image_draw_module.Draw(image).text(
+            (4, 4),
+            "\u4e2d",
+            fill=255,
+            font=font,
+        )
+        if image.getbbox() is None:
+            raise SmokeFailure("cjk_render")
+        output = BytesIO()
+        image.save(output, format="PNG")
+        if not output.getvalue():
+            raise SmokeFailure("cjk_render")
+    except SmokeFailure:
+        raise
+    except Exception as exc:
+        raise SmokeFailure("runtime_dependencies") from exc
+    return {
+        "opencv": "available",
+        "pillow": "available",
+        "cjk_font": "available",
+    }
 
 
 def synthetic_pdf() -> bytes:
@@ -233,10 +309,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--api-url", default="http://mineru-api:8000")
     parser.add_argument("--vlm-url", default="http://mineru-vlm:30000")
+    parser.add_argument("--runtime-only", action="store_true")
     args = parser.parse_args(argv)
     try:
-        summary = asyncio.run(
-            run_smoke(api_base_url=args.api_url, vlm_base_url=args.vlm_url)
+        runtime_summary = check_runtime_dependencies()
+        summary = (
+            runtime_summary
+            if args.runtime_only
+            else asyncio.run(
+                run_smoke(api_base_url=args.api_url, vlm_base_url=args.vlm_url)
+            )
         )
     except Exception:
         print("mineru_smoke_failed", file=sys.stderr)

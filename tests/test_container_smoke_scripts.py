@@ -49,6 +49,110 @@ def test_mineru_smoke_synthetic_pdf_is_parseable() -> None:
     assert declared_length == len(stream)
 
 
+def test_mineru_runtime_smoke_imports_cv2_and_renders_cjk_in_memory() -> None:
+    smoke = _load_mineru_smoke_module()
+    calls: dict[str, object] = {}
+
+    class FakeImage:
+        def getbbox(self):
+            return (1, 1, 8, 8)
+
+        def save(self, output: BytesIO, format: str) -> None:
+            calls["format"] = format
+            output.write(b"synthetic-png")
+
+    class ImageModule:
+        @staticmethod
+        def new(mode: str, size: tuple[int, int], color: int) -> FakeImage:
+            calls["image"] = (mode, size, color)
+            return FakeImage()
+
+    class ImageDrawModule:
+        @staticmethod
+        def Draw(image: FakeImage):
+            class Drawer:
+                @staticmethod
+                def text(
+                    position: tuple[int, int],
+                    text: str,
+                    *,
+                    fill: int,
+                    font: object,
+                ) -> None:
+                    calls["draw"] = (position, text, fill, font)
+
+            return Drawer()
+
+    class ImageFontModule:
+        @staticmethod
+        def truetype(path: str, size: int) -> object:
+            calls["font"] = (path, size)
+            return "font"
+
+    modules = {
+        "cv2": SimpleNamespace(__version__="4.11.0"),
+        "PIL.Image": ImageModule,
+        "PIL.ImageDraw": ImageDrawModule,
+        "PIL.ImageFont": ImageFontModule,
+    }
+    summary = smoke.check_runtime_dependencies(
+        import_module=lambda name: modules[name],
+        font_match=lambda: "/fonts/controller-selected.ttc",
+    )
+
+    assert calls["draw"] == ((4, 4), "\u4e2d", 255, "font")
+    assert calls["format"] == "PNG"
+    assert summary == {
+        "opencv": "available",
+        "pillow": "available",
+        "cjk_font": "available",
+    }
+
+
+def test_mineru_runtime_smoke_uses_fontconfig_noto_cjk_match() -> None:
+    smoke = _load_mineru_smoke_module()
+    calls: dict[str, object] = {}
+
+    def runner(command: list[str], **kwargs: object) -> SimpleNamespace:
+        calls["command"] = command
+        calls["kwargs"] = kwargs
+        return SimpleNamespace(
+            returncode=0,
+            stdout="Noto Sans CJK SC\t/fonts/controller-selected.ttc\n",
+        )
+
+    assert smoke.resolve_cjk_font(command_runner=runner) == (
+        "/fonts/controller-selected.ttc"
+    )
+    assert calls["command"][0] == "fc-match"
+    assert "Noto Sans CJK" in calls["command"][-1]
+    assert calls["kwargs"]["timeout"] <= 5
+
+
+def test_mineru_runtime_only_cli_prints_content_free_summary(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    smoke = _load_mineru_smoke_module()
+    monkeypatch.setattr(
+        smoke,
+        "check_runtime_dependencies",
+        lambda: {
+            "opencv": "available",
+            "pillow": "available",
+            "cjk_font": "available",
+        },
+    )
+
+    assert smoke.main(["--runtime-only"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {
+        "opencv": "available",
+        "pillow": "available",
+        "cjk_font": "available",
+    }
+    assert captured.err == ""
+
+
 @pytest.mark.asyncio
 async def test_mineru_smoke_checks_versions_cuda_services_and_zip_markdown() -> None:
     smoke = _load_mineru_smoke_module()

@@ -225,36 +225,41 @@ async def submit_task(request: Request) -> Response:
         raise HTTPException(status_code=413, detail="request_too_large")
 
     form = await request.form(max_files=1, max_fields=64, max_part_size=64 * 1024)
-    items = list(form.multi_items())
     try:
-        validate_fixed_fields(items)
-    except PolicyViolation as exc:
-        raise HTTPException(status_code=400, detail="fixed_policy_violation") from exc
+        items = list(form.multi_items())
+        try:
+            validate_fixed_fields(items)
+        except PolicyViolation as exc:
+            raise HTTPException(
+                status_code=400, detail="fixed_policy_violation"
+            ) from exc
 
-    data: list[tuple[str, str]] = []
-    files: list[tuple[str, tuple[str, object, str]]] = []
-    total_file_bytes = 0
-    for key, value in items:
-        if isinstance(value, UploadFile):
-            value.file.seek(0, 2)
-            size = value.file.tell()
-            value.file.seek(0)
-            if size > 30 * 1024 * 1024:
-                raise HTTPException(status_code=413, detail="file_too_large")
-            total_file_bytes += size
-            try:
-                files.append(prepare_upload(key, value))
-            except PolicyViolation as exc:
-                raise HTTPException(
-                    status_code=400, detail="unsupported_upload"
-                ) from exc
-        else:
-            data.append((key, str(value)))
-    if total_file_bytes > MAX_REQUEST_BYTES:
-        raise HTTPException(status_code=413, detail="request_too_large")
-    if len(files) != 1:
-        raise HTTPException(status_code=400, detail="one_file_required")
-    return await _request_upstream("POST", "/tasks", data=data, files=files)
+        data: list[tuple[str, str]] = []
+        files: list[tuple[str, tuple[str, object, str]]] = []
+        total_file_bytes = 0
+        for key, value in items:
+            if isinstance(value, UploadFile):
+                value.file.seek(0, 2)
+                size = value.file.tell()
+                value.file.seek(0)
+                if size > 30 * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail="file_too_large")
+                total_file_bytes += size
+                try:
+                    files.append(prepare_upload(key, value))
+                except PolicyViolation as exc:
+                    raise HTTPException(
+                        status_code=400, detail="unsupported_upload"
+                    ) from exc
+            else:
+                data.append((key, str(value)))
+        if total_file_bytes > MAX_REQUEST_BYTES:
+            raise HTTPException(status_code=413, detail="request_too_large")
+        if len(files) != 1:
+            raise HTTPException(status_code=400, detail="one_file_required")
+        return await _request_upstream("POST", "/tasks", data=data, files=files)
+    finally:
+        await form.close()
 
 
 @app.get("/tasks/{task_id}")

@@ -7,8 +7,8 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi import HTTPException
-from starlette.datastructures import Headers, UploadFile
-from starlette.responses import StreamingResponse
+from starlette.datastructures import FormData, Headers, UploadFile
+from starlette.responses import Response, StreamingResponse
 
 
 ROOT = Path(__file__).parents[1]
@@ -255,3 +255,65 @@ async def test_upstream_wait_fails_immediately_when_child_exits() -> None:
 
     with pytest.raises(RuntimeError, match="mineru_upstream_exited"):
         await proxy._wait_for_upstream(ExitedProcess())
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ("success", "upstream_error", "policy_rejection", "size_rejection"),
+)
+@pytest.mark.asyncio
+async def test_submit_task_closes_form_upload_on_every_exit(
+    outcome: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proxy = _load_proxy()
+
+    class LogicalFile(BytesIO):
+        def __init__(self, logical_size: int) -> None:
+            super().__init__(b"synthetic")
+            self.logical_size = logical_size
+            self.logical_position = 0
+
+        def seek(self, offset: int, whence: int = 0) -> int:
+            if whence == 2:
+                self.logical_position = self.logical_size + offset
+            elif whence == 0:
+                self.logical_position = offset
+            else:
+                self.logical_position += offset
+            return self.logical_position
+
+        def tell(self) -> int:
+            return self.logical_position
+
+    logical_size = 30 * 1024**2 + 1 if outcome == "size_rejection" else 9
+    upload = UploadFile(LogicalFile(logical_size), filename="statement.pdf")
+    backend = "pipeline" if outcome == "policy_rejection" else "vlm-http-client"
+    form = FormData(
+        [
+            ("backend", backend),
+            ("server_url", "http://mineru-vlm:30000"),
+            ("files", upload),
+        ]
+    )
+
+    class FakeRequest:
+        headers = {"content-length": "1024"}
+
+        @staticmethod
+        async def form(**kwargs: object) -> FormData:
+            return form
+
+    async def upstream(*args: object, **kwargs: object) -> Response:
+        if outcome == "upstream_error":
+            raise HTTPException(status_code=502, detail="upstream_unavailable")
+        return Response(status_code=202)
+
+    monkeypatch.setattr(proxy, "_request_upstream", upstream)
+    if outcome == "success":
+        response = await proxy.submit_task(FakeRequest())
+        assert response.status_code == 202
+    else:
+        with pytest.raises(HTTPException):
+            await proxy.submit_task(FakeRequest())
+
+    assert upload.file.closed is True

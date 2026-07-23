@@ -155,15 +155,21 @@ On the approved Ubuntu GPU host, the controller-owned validation sequence is:
 docker compose --profile mineru build mineru-vlm mineru-api
 docker compose --profile mineru up -d mineru-vlm mineru-api
 docker compose --profile mineru ps
+docker compose --profile mineru exec mineru-api \
+  python /app/scripts/smoke_mineru.py --runtime-only
+docker compose --profile mineru exec mineru-vlm \
+  python /app/scripts/smoke_mineru.py --runtime-only
 docker compose --profile mineru exec mineru-vlm \
   python /app/scripts/smoke_mineru.py
 ```
 
-The smoke verifies exact package versions, one CUDA 12.0-capable visible GPU,
-both health surfaces, a loaded VLM model, and one synthetic PDF task whose ZIP
-contains bounded non-empty Markdown. It emits only version, capability, and
-result-count fields. Run this immediately after the remote build; assign
-immutable Git-SHA image tags only after it succeeds.
+The runtime-only checks import OpenCV, resolve Noto CJK through `fc-match`, and
+render one synthetic CJK glyph with Pillow entirely in memory. The full smoke
+then verifies exact package versions, one CUDA 12.0-capable visible GPU, both
+health surfaces, a loaded VLM model, and one synthetic PDF task whose ZIP
+contains bounded non-empty Markdown. Both commands emit only finite
+availability/version/capability/result-count fields. Run them immediately after
+the remote build; assign immutable Git-SHA image tags only after they succeed.
 
 ## 远程 Ubuntu 容器验证
 

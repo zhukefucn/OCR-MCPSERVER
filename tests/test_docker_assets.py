@@ -227,6 +227,26 @@ def test_mineru_images_are_pinned_fixed_and_offline() -> None:
     assert "models-download" not in combined
 
 
+def test_mineru_images_install_and_index_complete_cjk_runtime() -> None:
+    for dockerfile in (
+        "docker/mineru-api.Dockerfile",
+        "docker/mineru-vlm.Dockerfile",
+    ):
+        source = _read_text(dockerfile).lower()
+        for package in (
+            "fonts-noto-core",
+            "fonts-noto-cjk",
+            "fontconfig",
+            "libgl1",
+        ):
+            assert package in source
+        assert "apt-get install" in source
+        assert "--no-install-recommends" in source
+        assert "fc-cache -fv" in source
+        assert "rm -rf /var/lib/apt/lists/*" in source
+        assert "smoke_mineru.py" in source
+
+
 def test_mineru_compose_is_internal_fixed_and_least_privilege() -> None:
     compose = _compose_config()
     api = compose["services"]["mineru-api"]
