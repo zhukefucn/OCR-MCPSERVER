@@ -36,6 +36,53 @@ def _load_mineru_smoke_module() -> ModuleType:
     return module
 
 
+def _load_deployment_verifier() -> ModuleType:
+    path = REPOSITORY_ROOT / "scripts" / "verify_deployment.py"
+    spec = importlib.util.spec_from_file_location("verify_deployment", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_deployment_verifier_rejects_wrong_compose_and_unbounded_zip() -> None:
+    verifier = _load_deployment_verifier()
+    valid = {
+        "services": {
+            "ocr-production": {
+                "depends_on": {"mineru-api": {}},
+                "ports": [{"published": "8000", "target": 8000}],
+            },
+            "mineru-api": {"depends_on": {"mineru-vlm": {}}},
+            "mineru-vlm": {},
+        }
+    }
+    verifier.validate_compose(valid)
+    with pytest.raises(verifier.VerificationFailure):
+        verifier.validate_compose({"services": {}})
+
+    payload = BytesIO()
+    with ZipFile(payload, "w") as archive:
+        archive.writestr("result.md", "bounded")
+    assert verifier.validate_result_zip(payload.getvalue()) == 1
+    with pytest.raises(verifier.VerificationFailure):
+        verifier.validate_result_zip(payload.getvalue(), max_bytes=4)
+
+
+def test_deployment_verifier_output_is_finite_and_secret_free() -> None:
+    verifier = _load_deployment_verifier()
+    event = verifier.safe_event("rest", True, count=3)
+    assert event == '{"count":3,"ok":true,"stage":"rest"}'
+    with pytest.raises(verifier.VerificationFailure):
+        verifier.safe_event("rest", False, detail="document text")
+    assert verifier.json_rows('[{"ID":"a"},{"ID":"b"}]') == [
+        {"ID": "a"}, {"ID": "b"}
+    ]
+    assert verifier.json_rows('{"ID":"a"}\n{"ID":"b"}') == [
+        {"ID": "a"}, {"ID": "b"}
+    ]
+
+
 def test_mineru_smoke_synthetic_pdf_is_parseable() -> None:
     from pypdf import PdfReader
 

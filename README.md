@@ -180,6 +180,11 @@ contains bounded non-empty Markdown. Both commands emit only finite
 availability/version/capability/result-count fields. Run them immediately after
 the remote build; assign immutable Git-SHA image tags only after they succeed.
 
+The final integrated gate is in `docs/deployment/task-13-runbook.md`. Run
+`scripts/verify_deployment.py` in `static`, `runtime`, and `e2e` phases, passing
+the API key only through `OCR_VERIFY_API_KEY`. It emits bounded content-free
+JSON and never creates image tags.
+
 ## 远程 Ubuntu 容器验证
 
 本机只运行测试和静态门禁，不执行 GPU Docker 镜像构建。Paddle 与
