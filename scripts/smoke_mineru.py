@@ -17,6 +17,7 @@ from urllib.parse import quote, urlsplit
 from zipfile import BadZipFile, ZipFile
 
 import httpx
+from packaging.version import InvalidVersion, Version
 
 
 EXPECTED_MINERU_VERSION = "3.2.0"
@@ -29,6 +30,15 @@ TASK_TIMEOUT_SECONDS = 900
 
 class SmokeFailure(RuntimeError):
     pass
+
+
+def matches_pinned_version(actual: str, expected: str) -> bool:
+    """Accept an exact release with an image-specific local build suffix."""
+    try:
+        parsed = Version(actual)
+        return Version(parsed.public) == Version(expected)
+    except InvalidVersion:
+        return False
 
 
 class CommandResult(Protocol):
@@ -215,7 +225,7 @@ async def run_smoke(
 ) -> dict[str, str | int]:
     if package_version("mineru") != EXPECTED_MINERU_VERSION:
         raise SmokeFailure("mineru_version")
-    if package_version("vllm") != EXPECTED_VLLM_VERSION:
+    if not matches_pinned_version(package_version("vllm"), EXPECTED_VLLM_VERSION):
         raise SmokeFailure("vllm_version")
     capability = cuda_capability()
     if capability != (12, 0):

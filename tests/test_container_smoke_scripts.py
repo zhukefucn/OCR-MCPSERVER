@@ -192,7 +192,10 @@ async def test_mineru_smoke_checks_versions_cuda_services_and_zip_markdown() -> 
     summary = await smoke.run_smoke(
         api_base_url="http://mineru-api:8000",
         vlm_base_url="http://mineru-vlm:30000",
-        package_version=lambda name: {"mineru": "3.2.0", "vllm": "0.11.2"}[name],
+        package_version=lambda name: {
+            "mineru": "3.2.0",
+            "vllm": "0.11.2+cu129",
+        }[name],
         cuda_capability=lambda: (12, 0),
         transport=httpx.MockTransport(handler),
     )
