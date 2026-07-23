@@ -116,10 +116,23 @@ class MinerUAdapter:
             )
         )
 
+    def _vlm_server_url(self) -> str:
+        configured = self._settings.vlm_server_url
+        serialized = str(configured)
+        if (
+            configured.path == "/"
+            and configured.query is None
+            and configured.fragment is None
+        ):
+            if not serialized.endswith("/"):
+                raise ValueError("origin URL serialization must end with a root path")
+            return serialized[:-1]
+        return serialized
+
     async def _submit(self, request: MinerUParseRequest) -> MinerUSubmission:
         source = request.source_path.read_bytes()
         fields = dict(_SUBMISSION_FIELDS)
-        fields["server_url"] = str(self._settings.vlm_server_url)
+        fields["server_url"] = self._vlm_server_url()
         response: httpx.Response | None = None
         for attempt in range(self._settings.retry_attempts + 1):
             try:

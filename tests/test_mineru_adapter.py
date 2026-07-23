@@ -28,7 +28,7 @@ from ocr_mcp_server.settings import MinerUSettings
 
 FORM_VALUES = {
     "backend": "vlm-http-client",
-    "server_url": "https://vlm.internal:30000/",
+    "server_url": "https://vlm.internal:30000",
     "lang_list": "ch",
     "parse_method": "auto",
     "formula_enable": "true",
@@ -304,6 +304,47 @@ async def test_valid_task_flow_forces_protocol_and_preserves_local_context(
     fields, uploaded = _multipart_parts(submission_request)
     assert fields == FORM_VALUES
     assert uploaded == ("safe.pdf", b"source document bytes")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured_url", "submitted_url"),
+    [
+        ("http://vlm.internal:30000", "http://vlm.internal:30000"),
+        (
+            "http://vlm.internal:30000/inference/",
+            "http://vlm.internal:30000/inference/",
+        ),
+    ],
+)
+async def test_submission_normalizes_origin_and_preserves_non_root_vlm_path(
+    tmp_path: Path, configured_url: str, submitted_url: str
+) -> None:
+    submission_request: httpx.Request | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal submission_request
+        if request.method == "POST":
+            submission_request = request
+            return httpx.Response(202, json=_submission_payload())
+        if request.url.path.endswith("/result"):
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "application/zip"},
+                content=_zip_bytes(),
+            )
+        return httpx.Response(200, json={"status": "completed"})
+
+    settings = MinerUSettings(
+        api_url="https://api.example.test/api",
+        vlm_server_url=configured_url,
+    )
+    await _parse_with_handler(tmp_path, handler, settings=settings)
+
+    assert submission_request is not None
+    assert submission_request.url == "https://api.example.test/api/tasks"
+    fields, _ = _multipart_parts(submission_request)
+    assert fields["server_url"] == submitted_url
 
 
 @pytest.mark.asyncio
