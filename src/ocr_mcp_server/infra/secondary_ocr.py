@@ -97,6 +97,11 @@ class SingleOwnerSecondaryOcrWorker:
         with self._lock:
             return self._thread is not None and self._thread.is_alive()
 
+    @property
+    def accepting_work(self) -> bool:
+        with self._lock:
+            return self._lifecycle is SecondaryOcrWorkerLifecycle.RUNNING
+
     async def start(self) -> None:
         with self._lock:
             if self._lifecycle is SecondaryOcrWorkerLifecycle.RUNNING:

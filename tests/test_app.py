@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import gc
+import threading
+
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -116,6 +121,69 @@ def test_liveness_never_calls_readiness() -> None:
         response = client.get("/health/live")
     assert response.json() == {"status": "ok"}
     assert readiness.calls == 0
+
+
+def test_injected_runtime_owns_gateway_readiness_and_lifespan() -> None:
+    events: list[str] = []
+    gateway = object()
+    readiness = Readiness(_snapshot())
+
+    class Runtime:
+        def __init__(self) -> None:
+            self.document_gateway = gateway
+            self.readiness = readiness
+
+        async def start(self) -> None:
+            events.append("start")
+
+        async def close(self) -> None:
+            events.append("close")
+
+    app = create_app(AppSettings(), runtime=Runtime())
+    with TestClient(app) as client:
+        assert client.get("/health/ready").status_code == 200
+        assert app.state.gateway is gateway
+    assert events == ["start", "close"]
+
+
+@pytest.mark.asyncio
+async def test_one_hundred_runtime_lifespans_leave_no_dispatch_threads() -> None:
+    def owned_threads():
+        return {
+            thread
+            for thread in threading.enumerate()
+            if thread.name.startswith(("ocr-", "secondary-ocr-"))
+        }
+
+    baseline = owned_threads()
+    calls = 0
+
+    class Runtime:
+        document_gateway = None
+        readiness = Readiness(_snapshot())
+
+        async def start(self) -> None:
+            nonlocal calls
+            calls += 1
+
+        async def close(self) -> None:
+            nonlocal calls
+            calls += 1
+
+    for _ in range(100):
+        app = create_app(AppSettings(), runtime=Runtime())
+        async with app.router.lifespan_context(app):
+            pass
+    del app
+    for _ in range(100):
+        gc.collect()
+        current = owned_threads()
+        if current <= baseline:
+            break
+        await asyncio.sleep(0.005)
+
+    assert calls == 200
+    assert owned_threads() <= baseline
 
 
 def test_readiness_api_renormalizes_mutated_injected_snapshot_content_free() -> None:

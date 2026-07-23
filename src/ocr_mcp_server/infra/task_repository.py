@@ -215,6 +215,13 @@ class TaskRepository:
         except SQLAlchemyError as exc:
             raise PersistenceError(cause=exc) from None
 
+    async def get_by_idempotency_key(
+        self, idempotency_key: str
+    ) -> CreateBatchResult | None:
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise InputValidationError()
+        return await self._get_by_key(idempotency_key)
+
     async def get_file(self, file_id: str) -> FileTaskSnapshot | None:
         try:
             async with self._sessions() as session:

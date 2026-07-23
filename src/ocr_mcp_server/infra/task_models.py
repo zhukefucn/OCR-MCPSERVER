@@ -21,6 +21,32 @@ class Base(DeclarativeBase):
     pass
 
 
+class UploadRecord(Base):
+    __tablename__ = "uploads"
+
+    file_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    storage_batch_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(128), unique=True
+    )
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    media_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    extension: Mapped[str] = mapped_column(String(8), nullable=False)
+    page_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    width: Mapped[int | None] = mapped_column(Integer)
+    height: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    adopted_source_file_id: Mapped[str | None] = mapped_column(String(36))
+    result_version: Mapped[int | None] = mapped_column(Integer)
+
+
 class BatchRecord(Base):
     __tablename__ = "batches"
     __table_args__ = (CheckConstraint("length(idempotency_key) > 0"),)

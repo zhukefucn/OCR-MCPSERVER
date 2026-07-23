@@ -62,6 +62,7 @@ def create_app(
     settings: AppSettings | None = None,
     *,
     gateway: object | None = None,
+    runtime: object | None = None,
     registry: CollectorRegistry | None = None,
     observability: ObservabilitySink | None = None,
     readiness: ReadinessService | None = None,
@@ -84,7 +85,19 @@ def create_app(
     resolved_logger, owned_log_dispatcher = nonblocking_safe_event_logger(
         raw_event_logger, autostart=False
     )
-    mcp_server = create_mcp_server(gateway)
+    resolved_gateway = (
+        getattr(runtime, "document_gateway") if runtime is not None else gateway
+    )
+    resolved_readiness = (
+        getattr(runtime, "readiness")
+        if runtime is not None
+        else (
+            readiness
+            if readiness is not None
+            else _UnavailableReadiness(resolved_observability)
+        )
+    )
+    mcp_server = create_mcp_server(resolved_gateway)
     mcp_app = mcp_server.http_app(path="/mcp")
 
     @asynccontextmanager
@@ -95,8 +108,12 @@ def create_app(
             if owned_log_dispatcher is not None:
                 best_effort(owned_log_dispatcher.activate)
             try:
+                if runtime is not None:
+                    await runtime.start()
                 yield
             finally:
+                if runtime is not None:
+                    await runtime.close()
                 if isinstance(resolved_readiness, ReadinessService):
                     best_effort(resolved_readiness.close_observability)
                 if owned_dispatcher is not None:
@@ -110,15 +127,10 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.settings = resolved_settings
-    app.state.gateway = gateway
+    app.state.gateway = resolved_gateway
     app.state.mcp_server = mcp_server
     app.include_router(router)
 
-    resolved_readiness = (
-        readiness
-        if readiness is not None
-        else _UnavailableReadiness(resolved_observability)
-    )
     app.state.observability_registry = resolved_registry
     app.state.observability = resolved_observability
     app.state.observability_target = raw_observability

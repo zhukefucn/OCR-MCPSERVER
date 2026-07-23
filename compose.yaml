@@ -62,9 +62,51 @@ services:
     init: true
     restart: unless-stopped
 
+  ocr-production:
+    profiles:
+      - production
+    build:
+      context: .
+      dockerfile: docker/ocr-gateway-ppstructure.Dockerfile
+      target: ppstructure-gpu
+    image: ocr-mcp-server:production-dev
+    ports:
+      - "${OCR_GATEWAY_PORT:-8000}:8000"
+    environment:
+      OCR_SERVER__HOST: 0.0.0.0
+      OCR_SERVER__PORT: "8000"
+      OCR_DATA_ROOT: /data
+      OCR_DATABASE__URL: sqlite+aiosqlite:////data/ocr.sqlite3
+      OCR_MINERU__API_URL: http://mineru-api:8000
+      OCR_MINERU__VLM_SERVER_URL: http://mineru-vlm:30000
+      OCR_SECONDARY_OCR__DEVICE: gpu:0
+      OCR_SECONDARY_OCR__PADDLEX_CONFIG: /models/pp-structure-v3.yaml
+      OCR_AUTH__API_KEYS: "${OCR_AUTH__API_KEYS:?OCR_AUTH__API_KEYS is required}"
+    volumes:
+      - ocr-data:/data
+      - ./config/example.yaml:/app/config/example.yaml:ro
+      - ./models/pp-structure-v3:/models:ro
+    networks:
+      - ocr-internal
+      - ocr-egress
+    depends_on:
+      mineru-api:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu
+    init: true
+    restart: unless-stopped
+
   mineru-api:
     profiles:
       - mineru
+      - production
     build:
       context: .
       dockerfile: docker/mineru-api.Dockerfile
@@ -78,12 +120,23 @@ services:
     depends_on:
       mineru-vlm:
         condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 10
     init: true
     restart: unless-stopped
 
   mineru-vlm:
     profiles:
       - mineru
+      - production
     build:
       context: .
       dockerfile: docker/mineru-vlm.Dockerfile
@@ -120,3 +173,4 @@ volumes:
 networks:
   ocr-internal:
     internal: true
+  ocr-egress: {}

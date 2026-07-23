@@ -150,6 +150,7 @@ def test_compose_keeps_the_minimal_gateway_and_adds_ppstructure_profiles() -> No
         "ocr-gateway",
         "ocr-gateway-ppstructure-cpu",
         "ocr-gateway-ppstructure-gpu",
+        "ocr-production",
         "mineru-api",
         "mineru-vlm",
     }
@@ -254,8 +255,8 @@ def test_mineru_compose_is_internal_fixed_and_least_privilege() -> None:
     api = compose["services"]["mineru-api"]
     vlm = compose["services"]["mineru-vlm"]
 
-    assert api["profiles"] == ["mineru"]
-    assert vlm["profiles"] == ["mineru"]
+    assert api["profiles"] == ["mineru", "production"]
+    assert vlm["profiles"] == ["mineru", "production"]
     assert "ports" not in api
     assert "ports" not in vlm
     assert api["networks"] == ["ocr-internal"]
@@ -266,6 +267,7 @@ def test_mineru_compose_is_internal_fixed_and_least_privilege() -> None:
         "MINERU_FIXED_VLM_URL": "http://mineru-vlm:30000",
         "MINERU_UPSTREAM_URL": "http://127.0.0.1:8001",
     }
+    assert api["healthcheck"]["test"][1] == "python"
     assert "/models/mineru-vlm:ro" in vlm["volumes"][0]
     assert vlm["shm_size"] == "4gb"
     assert vlm.get("ipc") != "host"
@@ -278,6 +280,45 @@ def test_mineru_compose_is_internal_fixed_and_least_privilege() -> None:
         assert service.get("network_mode") != "host"
         assert "/var/run/docker.sock" not in str(service)
     assert "--allow-public-http-client" not in str(api)
+
+
+def test_production_profile_exposes_only_the_gpu_gateway() -> None:
+    compose = _compose_config()
+    production = compose["services"]["ocr-production"]
+
+    assert production["profiles"] == ["production"]
+    assert production["build"] == {
+        "context": ".",
+        "dockerfile": "docker/ocr-gateway-ppstructure.Dockerfile",
+        "target": "ppstructure-gpu",
+    }
+    assert production["ports"] == ["${OCR_GATEWAY_PORT:-8000}:8000"]
+    assert production["networks"] == ["ocr-internal", "ocr-egress"]
+    assert compose["networks"]["ocr-egress"] == {}
+    assert production["depends_on"] == {
+        "mineru-api": {"condition": "service_healthy"}
+    }
+    assert production["environment"] == {
+        "OCR_SERVER__HOST": "0.0.0.0",
+        "OCR_SERVER__PORT": "8000",
+        "OCR_DATA_ROOT": "/data",
+        "OCR_DATABASE__URL": "sqlite+aiosqlite:////data/ocr.sqlite3",
+        "OCR_MINERU__API_URL": "http://mineru-api:8000",
+        "OCR_MINERU__VLM_SERVER_URL": "http://mineru-vlm:30000",
+        "OCR_SECONDARY_OCR__DEVICE": "gpu:0",
+        "OCR_SECONDARY_OCR__PADDLEX_CONFIG": "/models/pp-structure-v3.yaml",
+        "OCR_AUTH__API_KEYS": "${OCR_AUTH__API_KEYS:?OCR_AUTH__API_KEYS is required}",
+    }
+    assert production["deploy"]["resources"]["reservations"]["devices"] == [
+        {"driver": "nvidia", "count": 1, "capabilities": ["gpu"]}
+    ]
+    assert "production" in compose["services"]["mineru-api"]["profiles"]
+    assert "production" in compose["services"]["mineru-vlm"]["profiles"]
+    for name, service in compose["services"].items():
+        if name not in {"ocr-production", "mineru-api", "mineru-vlm"}:
+            assert "production" not in service.get("profiles", [])
+        if name != "ocr-production":
+            assert service.get("ports") is None or name.startswith("ocr-gateway")
 
 
 def test_compose_grants_only_the_gpu_profile_one_nvidia_device() -> None:
@@ -303,7 +344,11 @@ def test_compose_grants_only_the_gpu_profile_one_nvidia_device() -> None:
         assert gateway.get("privileged") is not True
         assert gateway.get("network_mode") != "host"
         assert "/var/run/docker.sock" not in str(gateway)
-        if name not in {"ocr-gateway-ppstructure-gpu", "mineru-vlm"}:
+        if name not in {
+            "ocr-gateway-ppstructure-gpu",
+            "ocr-production",
+            "mineru-vlm",
+        }:
             assert "gpus" not in gateway
             assert "devices" not in gateway
             assert "deploy" not in gateway
