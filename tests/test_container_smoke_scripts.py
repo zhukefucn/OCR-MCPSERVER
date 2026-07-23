@@ -289,10 +289,11 @@ def test_deployment_verifier_binds_exact_services_images_and_health() -> None:
     verifier.validate_image_rows(image_rows, expected)
     with pytest.raises(verifier.VerificationFailure):
         verifier.validate_image_rows(image_rows[:-1], expected)
+    replicas = ["2", "10", "3"]
     compose_v239_image_rows = [
         {
             "ID": f"sha256:{index:064x}",
-            "ContainerName": f"ocr-mcp-server-{service}-1",
+            "ContainerName": f"bank-ocr-platform-{service}-{replicas[index - 1]}",
             "Repository": image.rsplit(":", 1)[0],
             "Tag": image.rsplit(":", 1)[1],
             "Platform": "linux/amd64",
@@ -312,6 +313,40 @@ def test_deployment_verifier_binds_exact_services_images_and_health() -> None:
     malformed_rows[1]["ContainerName"] = "mineru-api-1"
     with pytest.raises(verifier.VerificationFailure, match="image_ids"):
         verifier.validate_image_rows(malformed_rows, expected)
+    duplicate_service_rows = [
+        *compose_v239_image_rows,
+        {
+            **compose_v239_image_rows[1],
+            "ID": "sha256:" + "f" * 64,
+            "ContainerName": "bank-ocr-platform-mineru-api-10",
+        },
+    ]
+    with pytest.raises(verifier.VerificationFailure, match="image_ids"):
+        verifier.validate_image_rows(duplicate_service_rows, expected)
+    for invalid_replica in ("0", "01", "-1"):
+        invalid_replica_rows = [dict(row) for row in compose_v239_image_rows]
+        invalid_replica_rows[0]["ContainerName"] = (
+            f"bank-ocr-platform-ocr-production-{invalid_replica}"
+        )
+        with pytest.raises(verifier.VerificationFailure, match="image_ids"):
+            verifier.validate_image_rows(invalid_replica_rows, expected)
+    for invalid_project in ("", "-", "Bad!", "bank.ocr"):
+        invalid_project_rows = [dict(row) for row in compose_v239_image_rows]
+        invalid_project_rows[0]["ContainerName"] = (
+            f"{invalid_project}-ocr-production-2"
+        )
+        with pytest.raises(verifier.VerificationFailure, match="image_ids"):
+            verifier.validate_image_rows(invalid_project_rows, expected)
+    mixed_project_rows = [dict(row) for row in compose_v239_image_rows]
+    mixed_project_rows[2]["ContainerName"] = "other-project-mineru-vlm-3"
+    with pytest.raises(verifier.VerificationFailure, match="image_ids"):
+        verifier.validate_image_rows(mixed_project_rows, expected)
+    mixed_format_rows = [
+        image_rows[0],
+        *compose_v239_image_rows[1:],
+    ]
+    with pytest.raises(verifier.VerificationFailure, match="image_ids"):
+        verifier.validate_image_rows(mixed_format_rows, expected)
 
     ps_rows = [
         {"Service": "ocr-production", "Image": expected["ocr-production"],

@@ -545,33 +545,52 @@ def _row_image(row: dict[str, Any]) -> str:
     return ""
 
 
-def _image_row_service(
+def _image_row_identity(
     row: dict[str, Any], expected_services: set[str]
-) -> str | None:
-    service = row.get("Service")
-    if isinstance(service, str):
-        return service
+) -> tuple[str, str | None, str] | None:
+    if "Service" in row:
+        service = row["Service"]
+        return ("explicit", None, service) if isinstance(service, str) else None
     container_name = row.get("ContainerName")
     if not isinstance(container_name, str):
         return None
-    matches = [
-        candidate
-        for candidate in expected_services
-        if container_name.endswith(f"-{candidate}-1")
-        and len(container_name) > len(candidate) + 3
-    ]
-    return matches[0] if len(matches) == 1 else None
+    matches: list[tuple[str, str]] = []
+    for candidate in expected_services:
+        match = re.fullmatch(
+            rf"(?P<project>[a-z0-9][a-z0-9_-]*)-{re.escape(candidate)}-"
+            r"[1-9][0-9]*",
+            container_name,
+        )
+        if match is not None:
+            matches.append((match.group("project"), candidate))
+    if len(matches) != 1:
+        return None
+    project, service = matches[0]
+    return ("derived", project, service)
 
 
 def validate_image_rows(
     rows: list[dict[str, Any]], expected_images: dict[str, str]
 ) -> dict[str, str]:
     expected_services = set(expected_images)
-    by_service = {
-        _image_row_service(row, expected_services): row
+    identities = [
+        _image_row_identity(row, expected_services)
         for row in rows
-    }
-    if len(by_service) != len(rows) or set(by_service) != set(expected_images):
+    ]
+    if any(identity is None for identity in identities):
+        raise VerificationFailure("image_ids", EXIT_CONFIG)
+    parsed = [identity for identity in identities if identity is not None]
+    modes = {mode for mode, _, _ in parsed}
+    projects = {project for mode, project, _ in parsed if mode == "derived"}
+    if len(modes) != 1 or ("derived" in modes and len(projects) != 1):
+        raise VerificationFailure("image_ids", EXIT_CONFIG)
+    by_service: dict[str, dict[str, Any]] = {}
+    for identity, row in zip(parsed, rows, strict=True):
+        service = identity[2]
+        if service not in expected_services or service in by_service:
+            raise VerificationFailure("image_ids", EXIT_CONFIG)
+        by_service[service] = row
+    if set(by_service) != expected_services:
         raise VerificationFailure("image_ids", EXIT_CONFIG)
     ids: dict[str, str] = {}
     for service, image in expected_images.items():
