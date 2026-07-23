@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import re
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -332,6 +333,9 @@ class MinerUAdapter:
             parse_directory = extracted.parse_directory
 
             source_root = extracted_root / document_name
+            self._ensure_private_images_directory(
+                source_root / parse_directory / "images"
+            )
             published_root = request.output_directory / document_name
             try:
                 publish_directory_no_replace(source_root, published_root)
@@ -365,6 +369,23 @@ class MinerUAdapter:
             ) from None
         finally:
             shutil.rmtree(work_root, ignore_errors=True)
+
+    @staticmethod
+    def _ensure_private_images_directory(images_directory: Path) -> None:
+        try:
+            status = images_directory.lstat()
+        except FileNotFoundError:
+            try:
+                images_directory.mkdir()
+                status = images_directory.lstat()
+            except OSError as exc:
+                raise MinerUFailure(
+                    MinerUErrorCode.UNSAFE_ARCHIVE, cause=exc
+                ) from None
+        except OSError as exc:
+            raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE, cause=exc) from None
+        if not stat.S_ISDIR(status.st_mode):
+            raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
 
     async def _download_archive(
         self, result_url: str, archive_path: Path, deadline: float

@@ -371,6 +371,45 @@ async def test_fixed_api_canonical_document_archive_preserves_local_context(
 
 
 @pytest.mark.asyncio
+async def test_canonical_document_without_images_publishes_empty_images_directory(
+    tmp_path: Path,
+) -> None:
+    archive = _zip_entry_bytes(
+        [
+            ("document/vlm/document.md", "# result"),
+            ("document/vlm/document_middle.json", "{}"),
+            ("document/vlm/document_content_list.json", "[]"),
+            ("document/vlm/document_content_list_v2.json", "[]"),
+        ]
+    )
+
+    result = await _parse_with_handler(tmp_path, _archive_handler(archive))
+
+    assert result.images_directory == result.result_root / "vlm" / "images"
+    assert result.images_directory.is_dir()
+    assert list(result.images_directory.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_archive_rejects_regular_file_at_images_directory_path(
+    tmp_path: Path,
+) -> None:
+    archive = _zip_entry_bytes(
+        [
+            ("document/vlm/document_content_list_v2.json", "[]"),
+            ("document/vlm/document.md", "# result"),
+            ("document/vlm/images", b"not-a-directory"),
+        ]
+    )
+
+    with pytest.raises(MinerUFailure) as exc_info:
+        await _parse_with_handler(tmp_path, _archive_handler(archive))
+
+    assert exc_info.value.code == "mineru_archive_unsafe"
+    assert not (tmp_path / "published" / "document").exists()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("configured_url", "submitted_url"),
     [
