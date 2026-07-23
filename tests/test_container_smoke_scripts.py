@@ -7,6 +7,7 @@ from hashlib import sha256
 from io import BytesIO
 import json
 from pathlib import Path
+import sys
 from types import ModuleType, SimpleNamespace
 from zipfile import ZipFile
 
@@ -45,28 +46,34 @@ def _load_deployment_verifier() -> ModuleType:
     return module
 
 
-def test_deployment_verifier_rejects_wrong_compose_and_unbounded_zip() -> None:
+def test_deployment_verifier_rejects_wrong_compose_and_unbounded_zip(
+    tmp_path: Path,
+) -> None:
     verifier = _load_deployment_verifier()
     valid = {
         "services": {
             "ocr-production": {
                 "depends_on": {"mineru-api": {}},
                 "ports": [{"published": "8000", "target": 8000}],
+                "image": "ocr-mcp-server:production-dev",
             },
-            "mineru-api": {"depends_on": {"mineru-vlm": {}}},
-            "mineru-vlm": {},
+            "mineru-api": {
+                "depends_on": {"mineru-vlm": {}},
+                "image": "ocr-mcp-server:mineru-api-dev",
+            },
+            "mineru-vlm": {"image": "ocr-mcp-server:mineru-vlm-dev"},
         }
     }
     verifier.validate_compose(valid)
     with pytest.raises(verifier.VerificationFailure):
         verifier.validate_compose({"services": {}})
 
-    payload = BytesIO()
+    payload = tmp_path / "result.zip"
     with ZipFile(payload, "w") as archive:
         archive.writestr("result.md", "bounded")
-    assert verifier.validate_result_zip(payload.getvalue()) == 1
+    assert verifier.validate_result_zip(payload) == 1
     with pytest.raises(verifier.VerificationFailure):
-        verifier.validate_result_zip(payload.getvalue(), max_bytes=4)
+        verifier.validate_result_zip(payload, max_bytes=4)
 
 
 def test_deployment_verifier_output_is_finite_and_secret_free() -> None:
@@ -81,6 +88,153 @@ def test_deployment_verifier_output_is_finite_and_secret_free() -> None:
     assert verifier.json_rows('{"ID":"a"}\n{"ID":"b"}') == [
         {"ID": "a"}, {"ID": "b"}
     ]
+
+
+def test_deployment_verifier_run_id_binds_candidate_and_is_stable() -> None:
+    verifier = _load_deployment_verifier()
+    git_sha = "a" * 40
+    image_id = "sha256:" + "b" * 64
+    run_id = verifier.make_run_id(git_sha, image_id)
+
+    assert run_id == f"{git_sha}-sha256-{'b' * 64}"
+    assert verifier.idempotency_keys(run_id) == (
+        f"u-{run_id}",
+        f"t-{run_id}",
+    )
+    assert verifier.make_run_id(git_sha, image_id) == run_id
+    assert verifier.make_run_id("c" * 40, image_id) != run_id
+    with pytest.raises(verifier.VerificationFailure):
+        verifier.make_run_id("not-a-sha", image_id)
+
+
+def test_deployment_verifier_terminates_unbounded_subprocess() -> None:
+    verifier = _load_deployment_verifier()
+    with pytest.raises(verifier.VerificationFailure, match="command_output"):
+        verifier._run(
+            [
+                sys.executable,
+                "-c",
+                "import os\nwhile True: os.write(1, b'x' * 65536)",
+            ],
+            timeout=5,
+            max_output=1024,
+        )
+
+
+def test_deployment_verifier_uses_bounded_manifest_and_zip_files(tmp_path: Path) -> None:
+    verifier = _load_deployment_verifier()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{"models":[]}', encoding="utf-8")
+    raw = verifier.read_regular_file_bounded(manifest, max_bytes=64)
+    assert raw == b'{"models":[]}'
+
+    too_large = tmp_path / "large.json"
+    with too_large.open("wb") as stream:
+        stream.truncate(65)
+    with pytest.raises(verifier.VerificationFailure):
+        verifier.read_regular_file_bounded(too_large, max_bytes=64)
+
+    artifact = tmp_path / "result.zip"
+    with ZipFile(artifact, "w") as archive:
+        archive.writestr("result.md", "bounded")
+    assert verifier.validate_result_zip(artifact, max_bytes=1024) == 1
+
+
+def test_deployment_verifier_stream_parsers_are_bounded_and_match_mcp_id() -> None:
+    verifier = _load_deployment_verifier()
+    assert verifier.json_from_chunks([b'{"ok":', b"true}"], max_bytes=32) == {
+        "ok": True
+    }
+    with pytest.raises(verifier.VerificationFailure):
+        verifier.json_from_chunks([b"x" * 33], max_bytes=32)
+
+    notification = b'data: {"jsonrpc":"2.0","method":"notifications/progress"}\n\n'
+    answer = b'data: {"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n\n'
+    assert verifier.mcp_json_from_chunks(
+        [notification, answer], request_id=2, max_bytes=256
+    )["id"] == 2
+
+    def answer_then_unbounded() -> object:
+        yield notification
+        yield answer
+        raise AssertionError("scanner consumed beyond the matching response")
+
+    assert verifier.mcp_json_from_chunks(
+        answer_then_unbounded(), request_id=2, max_bytes=256
+    )["id"] == 2
+    with pytest.raises(verifier.VerificationFailure):
+        verifier.mcp_json_from_chunks([notification], request_id=2, max_bytes=256)
+
+
+def test_deployment_verifier_binds_exact_services_images_and_health() -> None:
+    verifier = _load_deployment_verifier()
+    expected = {
+        "ocr-production": "ocr-mcp-server:production-dev",
+        "mineru-api": "ocr-mcp-server:mineru-api-dev",
+        "mineru-vlm": "ocr-mcp-server:mineru-vlm-dev",
+    }
+    image_rows = [
+        {"Service": service, "Repository": image.rsplit(":", 1)[0],
+         "Tag": image.rsplit(":", 1)[1], "ID": f"sha256:{index:064x}"}
+        for index, (service, image) in enumerate(expected.items(), start=1)
+    ]
+    verifier.validate_image_rows(image_rows, expected)
+    with pytest.raises(verifier.VerificationFailure):
+        verifier.validate_image_rows(image_rows[:-1], expected)
+
+    ps_rows = [
+        {"Service": "ocr-production", "Image": expected["ocr-production"],
+         "State": "running", "Health": ""},
+        {"Service": "mineru-api", "Image": expected["mineru-api"],
+         "State": "running", "Health": "healthy"},
+        {"Service": "mineru-vlm", "Image": expected["mineru-vlm"],
+         "State": "running", "Health": "healthy"},
+    ]
+    verifier.validate_runtime_rows(ps_rows, expected)
+    ps_rows[1]["Health"] = "starting"
+    with pytest.raises(verifier.VerificationFailure):
+        verifier.validate_runtime_rows(ps_rows, expected)
+
+
+def test_deployment_verifier_validates_mcp_initialize_contract() -> None:
+    verifier = _load_deployment_verifier()
+    protocol = "2025-03-26"
+    valid = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "protocolVersion": protocol,
+            "capabilities": {},
+            "serverInfo": {"name": "ocr", "version": "1"},
+        },
+    }
+    verifier.validate_initialize_response(valid, request_id=1, protocol=protocol)
+    invalid = {**valid, "id": 99}
+    with pytest.raises(verifier.VerificationFailure, match="mcp_initialize"):
+        verifier.validate_initialize_response(invalid, request_id=1, protocol=protocol)
+
+
+def test_deployment_verifier_log_gate_checks_all_services_and_canaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verifier = _load_deployment_verifier()
+    calls: list[list[str]] = []
+
+    def clean_run(args: list[str], **_: object) -> str:
+        calls.append(args)
+        return "bounded operational metadata"
+
+    monkeypatch.setattr(verifier, "_run", clean_run)
+    verifier.verify_logs("secret-key")
+    assert calls[0][-3:] == ["ocr-production", "mineru-api", "mineru-vlm"]
+
+    monkeypatch.setattr(
+        verifier,
+        "_run",
+        lambda *args, **kwargs: f"leak {verifier.SYNTHETIC_FILENAME_CANARY}",
+    )
+    with pytest.raises(verifier.VerificationFailure, match="log_boundary"):
+        verifier.verify_logs("secret-key")
 
 
 def test_mineru_smoke_synthetic_pdf_is_parseable() -> None:

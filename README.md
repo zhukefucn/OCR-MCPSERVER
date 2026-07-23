@@ -182,8 +182,9 @@ the remote build; assign immutable Git-SHA image tags only after they succeed.
 
 The final integrated gate is in `docs/deployment/task-13-runbook.md`. Run
 `scripts/verify_deployment.py` in `static`, `runtime`, and `e2e` phases, passing
-the API key only through `OCR_VERIFY_API_KEY`. It emits bounded content-free
-JSON and never creates image tags.
+the API key only through `OCR_VERIFY_API_KEY` and the Git-SHA/image-ID candidate
+identity through the required `--run-id`. It emits bounded content-free JSON
+and never creates image tags.
 
 ## 远程 Ubuntu 容器验证
 
