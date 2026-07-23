@@ -238,6 +238,7 @@ def test_mineru_images_install_and_index_complete_cjk_runtime() -> None:
             "fonts-noto-cjk",
             "fontconfig",
             "libgl1",
+            "libglib2.0-0",
         ):
             assert package in source
         assert "apt-get install" in source
