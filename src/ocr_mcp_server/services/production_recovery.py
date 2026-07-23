@@ -7,7 +7,6 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from datetime import timedelta
 from hashlib import sha256
-import math
 from pathlib import Path
 import tempfile
 from uuid import uuid4
@@ -23,7 +22,6 @@ from ..domain.secondary_ocr import (
     ImageCandidate,
     MinerUImageFormat,
     OrthogonalAngle,
-    SecondaryResultState,
 )
 from .orientation_recovery import (
     FullRecoveryPipelineSubmission,
@@ -104,21 +102,12 @@ class ProductionPageOrientationDetector:
                     self._max_file_size_bytes,
                     self._max_image_pixels,
                 )
-                result = await self._paddle.recognize(candidate)
-                angle = getattr(result, "angle", None)
-                confidence = getattr(result, "confidence", None)
-                state = getattr(result, "state", None)
-                if (
-                    not isinstance(angle, OrthogonalAngle)
-                    or isinstance(confidence, bool)
-                    or not isinstance(confidence, (int, float))
-                    or not math.isfinite(confidence)
-                    or not 0 <= confidence <= 1
-                    or state is not SecondaryResultState.VALID
-                    or angle is OrthogonalAngle.DEG_0
-                ):
-                    angle = OrthogonalAngle.DEG_0
-                    confidence = 0.0
+                await self._paddle.recognize(candidate)
+                # PP-Structure exposes the predicted document angle but drops
+                # the orientation classifier score.  Its result confidence is
+                # a layout score, so it must not authorize page rotation.
+                angle = OrthogonalAngle.DEG_0
+                confidence = 0.0
                 evidence.append(
                     OrientationEvidence(
                         page,
@@ -148,13 +137,17 @@ class MappedRecoveryStorage:
             raise ValueError("recovery inputs unavailable")
         async with AsyncExitStack() as stack:
             leases = {}
-            for upload in uploads:
-                assert upload is not None
-                if upload.storage_batch_id in leases:
-                    continue
-                leases[upload.storage_batch_id] = await stack.enter_async_context(
+            storage_batch_ids = sorted(
+                {
+                    upload.storage_batch_id
+                    for upload in uploads
+                    if upload is not None
+                }
+            )
+            for storage_batch_id in storage_batch_ids:
+                leases[storage_batch_id] = await stack.enter_async_context(
                     self._storage.batch_lock(
-                        upload.storage_batch_id,
+                        storage_batch_id,
                         marker_registry=kwargs["marker_registry"],
                         allow_missing_marker=True,
                         allow_retired=False,
@@ -273,18 +266,28 @@ class RecoveryPipelineRunner:
         result = await self._tasks.create_batch(
             f"recovery:{recovery_id}",
             (accepted.file_id,),
+            require_available_uploads_at=created_at,
             **self._retention_options,
         )
+        if len(result.files) != 1:
+            raise ValueError("recovery batch is invalid")
+        batch_accepted = await self._uploads.get(result.files[0].id)
+        if (
+            batch_accepted is None
+            or batch_accepted.adopted_source_file_id != corrected.file_id
+            or batch_accepted.result_version != corrected_input_version
+        ):
+            raise ValueError("recovery batch adoption mismatch")
         if result.created:
             self._orchestration.notify_work()
         return FullRecoveryPipelineSubmission(
             batch_id=result.batch.id,
             status=BatchStatus.QUEUED,
-            result_version=corrected_input_version,
-            adopted_source_file_id=corrected.file_id,
-            accepted_input_file_id=accepted.file_id,
-            accepted_input_sha256=accepted.sha256,
-            accepted_input_size_bytes=accepted.size_bytes,
+            result_version=batch_accepted.result_version,
+            adopted_source_file_id=batch_accepted.adopted_source_file_id,
+            accepted_input_file_id=batch_accepted.file_id,
+            accepted_input_sha256=batch_accepted.sha256,
+            accepted_input_size_bytes=batch_accepted.size_bytes,
         )
 
     async def reconcile(
