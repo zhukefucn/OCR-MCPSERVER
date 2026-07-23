@@ -40,6 +40,8 @@ from .artifacts import (
 )
 from .progress import ProgressCounters, ProgressUnit, map_stage_progress
 from .orientation import (
+    OrientationAssessmentSnapshot,
+    OrientationAssessmentState,
     OrientationDecision,
     OrientationErrorCode,
     OrientationEvidence,
@@ -130,6 +132,8 @@ __all__ = [
     "MinerUSubmission",
     "MinerUImageFormat",
     "OrthogonalAngle",
+    "OrientationAssessmentSnapshot",
+    "OrientationAssessmentState",
     "OrientationClassificationResult",
     "OrientationDecision",
     "OrientationErrorCode",

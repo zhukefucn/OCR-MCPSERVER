@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
@@ -13,11 +14,7 @@ from ocr_mcp_server.api.contracts import (
 )
 from ocr_mcp_server.api.production_gateway import ProductionDocumentGateway
 from ocr_mcp_server.api.gateway import GatewayConflict
-from ocr_mcp_server.domain.orientation import (
-    OrientationDecision,
-    RecoveryTokenBinding,
-)
-from ocr_mcp_server.domain.secondary_ocr import OrthogonalAngle
+from ocr_mcp_server.domain.orientation import RecoveryTokenBinding
 from ocr_mcp_server.domain.files import StoredFile, SupportedMediaType
 from ocr_mcp_server.domain.models import (
     BatchStatus,
@@ -385,26 +382,29 @@ async def test_completed_status_returns_token_once_for_only_credible_rotated_pag
             self.issued = True
             return SimpleNamespace(token="or_" + "a" * 64)
 
-    class Detector:
-        def __init__(self):
-            self.calls = 0
+    orientation = Orientation()
 
-        async def detect(self, request):
+    class Assessments:
+        calls = 0
+
+        async def get(self, requested_file_id, result_version):
             self.calls += 1
-            return (
-                OrientationDecision(
-                    1, OrthogonalAngle.DEG_0, 0.99, "paddle_orientation", True
-                ),
-                OrientationDecision(
-                    2, OrthogonalAngle.DEG_90, 0.96, "paddle_orientation", True
-                ),
+            assert requested_file_id == file_id
+            assert result_version == 2
+            return SimpleNamespace(
+                evidence_ready=True,
+                page_count=2,
+                suspected_pages=(2,),
             )
 
-    orientation = Orientation()
-    detector = Detector()
+    assessments = Assessments()
     gateway = ProductionDocumentGateway(
         intake=SimpleNamespace(),
-        uploads=SimpleNamespace(get=lambda *_: _async_value(SimpleNamespace(page_count=2))),
+        uploads=SimpleNamespace(
+            get=lambda *_: (_ for _ in ()).throw(
+                AssertionError("status must not resolve uploads or invoke Paddle")
+            )
+        ),
         tasks=SimpleNamespace(
             get_batch=lambda *_: _async_value(batch),
             list_batch_files=lambda *_: _async_value((file,)),
@@ -413,14 +413,14 @@ async def test_completed_status_returns_token_once_for_only_credible_rotated_pag
         artifacts=SimpleNamespace(list_for_batch=lambda *_: _async_value((artifact,))),
         recovery=SimpleNamespace(),
         orientation_issuer=orientation,
-        orientation_detector=detector,
+        orientation_assessments=assessments,
         now_factory=lambda: NOW,
     )
     first = await gateway.get_task_status(batch_id)
     second = await gateway.get_task_status(batch_id)
     assert first.files[0].recovery_token == "or_" + "a" * 64
     assert second.files[0].recovery_token is None
-    assert detector.calls == 1
+    assert assessments.calls == 1
 
 
 @pytest.mark.asyncio
@@ -456,15 +456,12 @@ async def test_completed_status_does_not_issue_without_credible_rotated_page() -
         async def issue_once(self, *args, **kwargs):
             raise AssertionError("no token may be issued")
 
-    class Detector:
-        async def detect(self, request):
-            return (
-                OrientationDecision(
-                    1, OrthogonalAngle.DEG_0, 0.99, "paddle_orientation", True
-                ),
-                OrientationDecision(
-                    2, OrthogonalAngle.DEG_270, 0.79, "paddle_uncertain", False
-                ),
+    class Assessments:
+        async def get(self, *args):
+            return SimpleNamespace(
+                evidence_ready=True,
+                page_count=2,
+                suspected_pages=(),
             )
 
     gateway = ProductionDocumentGateway(
@@ -482,9 +479,86 @@ async def test_completed_status_does_not_issue_without_credible_rotated_page() -
         ),
         recovery=SimpleNamespace(),
         orientation_issuer=Orientation(),
-        orientation_detector=Detector(),
+        orientation_assessments=Assessments(),
         now_factory=lambda: NOW,
     )
 
     status = await gateway.get_task_status(batch_id)
     assert status.files[0].recovery_token is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_status_delivers_raw_recovery_token_at_most_once() -> None:
+    file_id, batch_id = str(uuid4()), str(uuid4())
+    artifact = SimpleNamespace(
+        artifact_id="artifact-" + "d" * 64,
+        file_id=file_id,
+        result_version=2,
+        available=True,
+        expires_at=NOW + timedelta(hours=1),
+    )
+    batch = SimpleNamespace(
+        id=batch_id,
+        status=BatchStatus.COMPLETED,
+        progress=100,
+        total_files=1,
+        completed_files=1,
+        failed_files=0,
+    )
+    file = SimpleNamespace(
+        id=file_id,
+        status=FileStatus.COMPLETED,
+        stage=ProcessingStage.COMPLETED,
+        progress=100,
+        last_error_code=None,
+    )
+
+    class Issuer:
+        issued = False
+        lock = asyncio.Lock()
+
+        async def has_issued_source(self, *args):
+            return self.issued
+
+        async def issue_once(self, binding, *, now):
+            async with self.lock:
+                if self.issued:
+                    return None
+                self.issued = True
+                return SimpleNamespace(token="or_" + "e" * 64)
+
+    gateway = ProductionDocumentGateway(
+        intake=SimpleNamespace(),
+        uploads=SimpleNamespace(),
+        tasks=SimpleNamespace(
+            get_batch=lambda *_: _async_value(batch),
+            list_batch_files=lambda *_: _async_value((file,)),
+        ),
+        orchestration=SimpleNamespace(),
+        artifacts=SimpleNamespace(
+            list_for_batch=lambda *_: _async_value((artifact,))
+        ),
+        recovery=SimpleNamespace(),
+        orientation_issuer=Issuer(),
+        orientation_assessments=SimpleNamespace(
+            get=lambda *_: _async_value(
+                SimpleNamespace(
+                    evidence_ready=True,
+                    page_count=1,
+                    suspected_pages=(1,),
+                )
+            )
+        ),
+        now_factory=lambda: NOW,
+    )
+
+    statuses = await asyncio.gather(
+        gateway.get_task_status(batch_id),
+        gateway.get_task_status(batch_id),
+    )
+    tokens = [
+        status.files[0].recovery_token
+        for status in statuses
+        if status.files[0].recovery_token is not None
+    ]
+    assert tokens == ["or_" + "e" * 64]

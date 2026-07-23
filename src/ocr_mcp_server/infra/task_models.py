@@ -228,6 +228,49 @@ class RetentionRecord(Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
 
+class OrientationAssessmentRecord(Base):
+    __tablename__ = "orientation_assessments"
+    __table_args__ = (
+        UniqueConstraint(
+            "file_id",
+            "result_version",
+            name="uq_orientation_assessment_source_result",
+        ),
+        CheckConstraint("result_version >= 1"),
+        CheckConstraint("page_count >= 1"),
+        CheckConstraint(
+            "state IN ('detecting', 'ready', 'no_suspicion', 'failed')"
+        ),
+        CheckConstraint(
+            "(state = 'ready' AND length(suspected_pages) > 0 "
+            "AND error_code IS NULL) OR "
+            "(state IN ('detecting', 'no_suspicion') "
+            "AND suspected_pages = '' AND error_code IS NULL) OR "
+            "(state = 'failed' AND suspected_pages = '' "
+            "AND error_code IS NOT NULL)"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    file_id: Mapped[str] = mapped_column(
+        String(512), ForeignKey("file_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    batch_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("batches.id", ondelete="CASCADE"), nullable=False
+    )
+    result_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    page_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(String(24), nullable=False)
+    suspected_pages: Mapped[str] = mapped_column(String(2048), nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
 class OrientationRecoveryRecord(Base):
     __tablename__ = "orientation_recoveries"
     __table_args__ = (

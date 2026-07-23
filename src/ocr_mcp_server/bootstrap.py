@@ -21,6 +21,9 @@ from .infra.health_probes import (
 )
 from .infra.mineru_adapter import MinerUAdapter
 from .infra.orientation_repository import OrientationRecoveryRepository
+from .infra.orientation_assessment_repository import (
+    OrientationAssessmentRepository,
+)
 from .infra.document_orientation import ImmutableDocumentCorrector
 from .infra.pp_structure_v3 import create_pp_structure_v3_provider
 from .infra.retention_repository import RetentionRepository
@@ -145,6 +148,7 @@ def build_runtime(
     artifacts = ArtifactRepository(sessions)
     retention_repository = RetentionRepository(sessions)
     orientation_repository = OrientationRecoveryRepository(sessions)
+    orientation_assessments = OrientationAssessmentRepository(sessions)
     storage = FileStorage(settings.data_root)
     validator = FileValidator(
         max_pages=settings.limits.max_pages,
@@ -162,6 +166,16 @@ def build_runtime(
     mineru_client = httpx.AsyncClient(follow_redirects=False)
     mineru = MinerUAdapter(client=mineru_client, settings=settings.mineru)
     paddle = create_pp_structure_v3_provider(settings.secondary_ocr)
+    recovery_detector = ValidatedPageOrientationDetector(
+        ProductionPageOrientationDetector(
+            uploads,
+            storage,
+            paddle,
+            max_file_size_bytes=settings.limits.max_file_size_bytes,
+            max_image_pixels=settings.remote_import.max_image_pixels,
+        ),
+        credibility_threshold=settings.secondary_ocr.classification_threshold,
+    )
     artifact_root = Path(settings.data_root).absolute() / "artifacts"
     packaging = ArtifactPackagingStep(
         ArtifactBundler(settings.artifacts.to_limits()),
@@ -183,6 +197,8 @@ def build_runtime(
         max_image_pixels=settings.remote_import.max_image_pixels,
         structured_limits=settings.structured_content.to_limits(),
         result_retention_hours=settings.retention.result_hours,
+        orientation_detector=recovery_detector,
+        orientation_assessments=orientation_assessments,
     )
     orchestration = OrchestrationService(
         tasks,
@@ -211,16 +227,6 @@ def build_runtime(
         worker_id=f"ocr-retention-{os.getpid()}",
     )
     mapped_recovery_storage = MappedRecoveryStorage(uploads, tasks, storage)
-    recovery_detector = ValidatedPageOrientationDetector(
-        ProductionPageOrientationDetector(
-            uploads,
-            storage,
-            paddle,
-            max_file_size_bytes=settings.limits.max_file_size_bytes,
-            max_image_pixels=settings.remote_import.max_image_pixels,
-        ),
-        credibility_threshold=settings.secondary_ocr.classification_threshold,
-    )
     recovery_corrector = MappedDocumentCorrector(
         delegate=ImmutableDocumentCorrector(
             storage,
@@ -271,7 +277,7 @@ def build_runtime(
         artifacts=artifacts,
         recovery=recovery,
         orientation_issuer=orientation_repository,
-        orientation_detector=recovery_detector,
+        orientation_assessments=orientation_assessments,
         remote_fetcher=remote_fetcher,
         retention_options={
             "input_retention_hours": settings.retention.input_hours,
@@ -298,6 +304,7 @@ def build_runtime(
             "artifacts": artifacts,
             "retention": retention_repository,
             "orientation": orientation_repository,
+            "orientation_assessments": orientation_assessments,
         },
         mineru_adapter=mineru,
         mineru_client=mineru_client,

@@ -290,7 +290,11 @@ REQUIRED_MODEL_NODES = (
 )
 
 
-def _offline_model_bundle(tmp_path: Path) -> tuple[Path, Path, Path]:
+def _offline_model_bundle(
+    tmp_path: Path,
+    *,
+    orientation_directory: str = "doc-orientation",
+) -> tuple[Path, Path, Path]:
     model_root = tmp_path / "models"
     model_root.mkdir()
     config: dict[str, object] = {
@@ -331,7 +335,12 @@ def _offline_model_bundle(tmp_path: Path) -> tuple[Path, Path, Path]:
     model_entries: dict[str, str] = {}
     file_entries: list[dict[str, str]] = []
     for index, node_path in enumerate(REQUIRED_MODEL_NODES):
-        relative_dir = Path("weights") / f"model-{index}"
+        relative_dir = (
+            Path(orientation_directory)
+            if node_path
+            == "SubPipelines.DocPreprocessor.SubModules.DocOrientationClassify"
+            else Path("weights") / f"model-{index}"
+        )
         model_dir = model_root / relative_dir
         model_dir.mkdir(parents=True)
         model_file = model_dir / "inference.pdiparams"
@@ -372,6 +381,22 @@ def _offline_model_bundle(tmp_path: Path) -> tuple[Path, Path, Path]:
     return model_root, config_path, manifest_path
 
 
+def test_offline_manifest_requires_fixed_dedicated_orientation_directory(
+    tmp_path: Path,
+) -> None:
+    smoke = _load_smoke_module()
+    model_root, model_config, manifest_path = _offline_model_bundle(
+        tmp_path, orientation_directory="weights/model-1"
+    )
+
+    with pytest.raises(smoke.SmokeFailure, match="model_manifest"):
+        smoke.prepare_offline_config(
+            model_root=model_root,
+            model_config=model_config,
+            model_manifest=manifest_path,
+        )
+
+
 def test_cpu_smoke_checks_versions_features_and_real_prediction(
     tmp_path: Path,
 ) -> None:
@@ -410,12 +435,27 @@ def test_cpu_smoke_checks_versions_features_and_real_prediction(
         def close(self) -> None:
             calls["closed"] = True
 
+    class FakeOrientation:
+        def __init__(self, **kwargs):
+            calls["orientation_constructor"] = kwargs
+
+        def predict(self, input):
+            calls["orientation_input"] = input
+            return [{"label_names": ["0"], "scores": [0.99]}]
+
+        def close(self):
+            calls["orientation_closed"] = True
+
     paddle = SimpleNamespace(
         __version__="3.3.0",
         is_compiled_with_cuda=lambda: False,
         utils=SimpleNamespace(run_check=lambda: calls.setdefault("run_check", True)),
     )
-    paddleocr = SimpleNamespace(__version__="3.5.0", PPStructureV3=FakePipeline)
+    paddleocr = SimpleNamespace(
+        __version__="3.5.0",
+        PPStructureV3=FakePipeline,
+        DocImgOrientationClassification=FakeOrientation,
+    )
 
     summary = smoke.run_smoke(
         device="cpu",
@@ -465,6 +505,14 @@ def test_cpu_smoke_checks_versions_features_and_real_prediction(
     }
     assert calls["run_check"] is True
     assert calls["closed"] is True
+    assert calls["orientation_constructor"] == {
+        "device": "cpu",
+        "enable_mkldnn": False,
+        "model_dir": (model_root / "doc-orientation").as_posix(),
+        "model_name": "PP-LCNet_x1_0_doc_ori",
+        "topk": 1,
+    }
+    assert calls["orientation_closed"] is True
     assert summary == {
         "paddle_version": "3.3.0",
         "paddleocr_version": "3.5.0",
@@ -510,6 +558,16 @@ def test_gpu_smoke_checks_single_visible_gpu_and_real_prediction(
         def close(self) -> None:
             calls["closed"] = True
 
+    class FakeOrientation:
+        def __init__(self, **kwargs):
+            calls["orientation_constructor"] = kwargs
+
+        def predict(self, input):
+            return [{"label_names": ["90"], "scores": [0.98]}]
+
+        def close(self):
+            calls["orientation_closed"] = True
+
     paddle = SimpleNamespace(
         __version__="3.3.0",
         is_compiled_with_cuda=lambda: True,
@@ -520,7 +578,11 @@ def test_gpu_smoke_checks_single_visible_gpu_and_real_prediction(
         ),
         utils=SimpleNamespace(run_check=lambda: calls.setdefault("run_check", True)),
     )
-    paddleocr = SimpleNamespace(__version__="3.5.0", PPStructureV3=FakePipeline)
+    paddleocr = SimpleNamespace(
+        __version__="3.5.0",
+        PPStructureV3=FakePipeline,
+        DocImgOrientationClassification=FakeOrientation,
+    )
 
     summary = smoke.run_smoke(
         device="gpu:0",
@@ -542,6 +604,13 @@ def test_gpu_smoke_checks_single_visible_gpu_and_real_prediction(
     assert calls["device_count"] == 1
     assert calls["run_check"] is True
     assert calls["closed"] is True
+    assert calls["orientation_constructor"] == {
+        "device": "gpu:0",
+        "model_dir": (model_root / "doc-orientation").as_posix(),
+        "model_name": "PP-LCNet_x1_0_doc_ori",
+        "topk": 1,
+    }
+    assert calls["orientation_closed"] is True
     assert summary == {
         "paddle_version": "3.3.0",
         "paddleocr_version": "3.5.0",

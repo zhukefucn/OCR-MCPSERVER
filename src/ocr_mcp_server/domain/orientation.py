@@ -28,6 +28,13 @@ class RecoveryState(StrEnum):
     DELETED = "deleted"
 
 
+class OrientationAssessmentState(StrEnum):
+    DETECTING = "detecting"
+    READY = "ready"
+    NO_SUSPICION = "no_suspicion"
+    FAILED = "failed"
+
+
 class OrientationErrorCode(StrEnum):
     TOKEN_INVALID = "orientation_token_invalid"
     REQUEST_INVALID = "orientation_request_invalid"
@@ -165,6 +172,55 @@ class OrientationDecision:
             evidence.evidence_code,
             credible,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class OrientationAssessmentSnapshot:
+    file_id: str
+    batch_id: str
+    result_version: int
+    page_count: int
+    state: OrientationAssessmentState
+    suspected_pages: tuple[int, ...]
+    error_code: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.file_id, str)
+            or _IDENTIFIER.fullmatch(self.file_id) is None
+            or not _uuid(self.batch_id)
+            or not _positive(self.result_version)
+            or not _positive(self.page_count)
+            or not isinstance(self.state, OrientationAssessmentState)
+        ):
+            raise ValueError("invalid orientation assessment")
+        pages = tuple(self.suspected_pages)
+        if pages:
+            pages = canonical_pages(pages, page_count=self.page_count)
+        if (
+            (self.state is OrientationAssessmentState.READY) is not bool(pages)
+            or (
+                self.state is OrientationAssessmentState.FAILED
+                and (
+                    not isinstance(self.error_code, str)
+                    or _CODE.fullmatch(self.error_code) is None
+                )
+            )
+            or (
+                self.state is not OrientationAssessmentState.FAILED
+                and self.error_code is not None
+            )
+        ):
+            raise ValueError("invalid orientation assessment state")
+        object.__setattr__(self, "suspected_pages", pages)
+        object.__setattr__(self, "created_at", _aware_utc(self.created_at))
+        object.__setattr__(self, "updated_at", _aware_utc(self.updated_at))
+
+    @property
+    def evidence_ready(self) -> bool:
+        return self.state is OrientationAssessmentState.READY
 
 
 @dataclass(frozen=True, slots=True)

@@ -198,10 +198,12 @@ def test_backend_uses_dedicated_document_orientation_classifier_score(
     monkeypatch.setitem(sys.modules, "paddleocr", fake)
     from ocr_mcp_server.infra.pp_structure_v3 import PPStructureV3Backend
 
+    orientation_model_dir = tmp_path / "doc-orientation"
+    orientation_model_dir.mkdir()
     backend = PPStructureV3Backend(
         SecondaryOCRSettings(
             device="gpu:0",
-            orientation_model_dir=Path("/models/doc-orientation"),
+            orientation_model_dir=orientation_model_dir,
             orientation_model_name="PP-LCNet_x1_0_doc_ori",
         )
     )
@@ -210,7 +212,7 @@ def test_backend_uses_dedicated_document_orientation_classifier_score(
 
     assert calls["constructor"] == {
         "device": "gpu:0",
-        "model_dir": "/models/doc-orientation",
+        "model_dir": orientation_model_dir.as_posix(),
         "model_name": "PP-LCNet_x1_0_doc_ori",
         "topk": 1,
     }
@@ -221,6 +223,28 @@ def test_backend_uses_dedicated_document_orientation_classifier_score(
         model_version="PP-LCNet_x1_0_doc_ori",
     )
     assert calls["closed"] is True
+
+
+def test_backend_refuses_missing_orientation_model_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakePipeline:
+        def __init__(self, **kwargs):
+            pass
+
+    fake = ModuleType("paddleocr")
+    fake.PPStructureV3 = FakePipeline  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "paddleocr", fake)
+    from ocr_mcp_server.domain import SecondaryOcrFailure
+    from ocr_mcp_server.infra.pp_structure_v3 import PPStructureV3Backend
+
+    with pytest.raises(SecondaryOcrFailure) as caught:
+        PPStructureV3Backend(
+            SecondaryOCRSettings(
+                orientation_model_dir=tmp_path / "missing-doc-orientation"
+            )
+        )
+    assert caught.value.code == "secondary_ocr_initialization_unavailable"
 
 
 @pytest.mark.parametrize(

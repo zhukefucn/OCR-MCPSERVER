@@ -10,7 +10,6 @@ from ..domain.files import IncomingFile
 from ..domain.models import BatchStatus, FileStatus, utc_now
 from ..domain.orientation import OrientationFailure, RecoveryTokenBinding
 from ..services.orientation_recovery import (
-    OrientationDetectionRequest,
     OrientationRecoveryCommand,
     RecoveryServiceErrorCode,
     RecoveryServiceFailure,
@@ -52,7 +51,7 @@ class ProductionDocumentGateway:
         artifacts,
         recovery,
         orientation_issuer=None,
-        orientation_detector=None,
+        orientation_assessments=None,
         remote_fetcher=None,
         retention_options: dict[str, int] | None = None,
         upload_retention_hours: int = 24,
@@ -67,7 +66,7 @@ class ProductionDocumentGateway:
         self._artifacts = artifacts
         self._recovery = recovery
         self._orientation_issuer = orientation_issuer
-        self._orientation_detector = orientation_detector
+        self._orientation_assessments = orientation_assessments
         self._remote_fetcher = remote_fetcher
         self._retention_options = dict(retention_options or {})
         self._upload_retention_hours = upload_retention_hours
@@ -268,7 +267,17 @@ class ProductionDocumentGateway:
         return sha256(("parse-sources\0" + canonical).encode()).hexdigest()
 
     async def _recovery_tokens(self, *, batch_id, files, artifacts) -> dict[str, str]:
-        if self._orientation_issuer is None or self._orientation_detector is None:
+        """Project durable evidence and deliver each opaque token at most once.
+
+        The raw token is intentionally not recoverable after the winning status
+        response; a disconnected caller must rerun parsing to obtain a new
+        source result rather than causing a token to be re-exposed.
+        """
+
+        if (
+            self._orientation_issuer is None
+            or self._orientation_assessments is None
+        ):
             return {}
         by_file = {
             item.file_id: item for item in artifacts
@@ -288,22 +297,12 @@ class ProductionDocumentGateway:
                     file.id, artifact.result_version
                 ):
                     continue
-                upload = await self._uploads.get(file.id)
-                if upload is None:
+                assessment = await self._orientation_assessments.get(
+                    file.id, artifact.result_version
+                )
+                if assessment is None or not assessment.evidence_ready:
                     continue
-                decisions = await self._orientation_detector.detect(
-                    OrientationDetectionRequest(
-                        batch_id=batch_id,
-                        file_id=file.id,
-                        page_count=upload.page_count,
-                        pages=tuple(range(1, upload.page_count + 1)),
-                    )
-                )
-                suspected_pages = tuple(
-                    decision.page_number
-                    for decision in decisions
-                    if decision.credible and int(decision.angle) != 0
-                )
+                suspected_pages = assessment.suspected_pages
                 if not suspected_pages:
                     continue
                 issued = await self._orientation_issuer.issue_once(
@@ -311,7 +310,7 @@ class ProductionDocumentGateway:
                         file_id=file.id,
                         batch_id=batch_id,
                         source_result_version=artifact.result_version,
-                        page_count=upload.page_count,
+                        page_count=assessment.page_count,
                         suspected_pages=suspected_pages,
                         expires_at=artifact.expires_at,
                     ),

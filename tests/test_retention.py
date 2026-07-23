@@ -24,6 +24,9 @@ from ocr_mcp_server.infra.database import (
     initialize_schema,
 )
 from ocr_mcp_server.infra.retention_repository import RetentionRepository
+from ocr_mcp_server.infra.orientation_assessment_repository import (
+    OrientationAssessmentRepository,
+)
 from ocr_mcp_server.infra.task_models import (
     ArtifactRecord,
     BatchLockMarkerRecord,
@@ -31,6 +34,7 @@ from ocr_mcp_server.infra.task_models import (
     FileTaskRecord,
     ReplacementAuditMetadataRecord,
     RetentionRecord,
+    OrientationAssessmentRecord,
     StageEventRecord,
 )
 from ocr_mcp_server.infra.task_repository import TaskRepository
@@ -780,6 +784,14 @@ async def test_metadata_remains_until_exact_30_day_boundary_then_purges_all_task
 ) -> None:
     repository, tasks, sessions, _ = retention_repository
     batch_id, file_id = await _create_batch(tasks, "purge")
+    assessments = OrientationAssessmentRepository(sessions)
+    assert await assessments.begin(
+        file_id=file_id,
+        batch_id=batch_id,
+        result_version=2,
+        page_count=1,
+        now=NOW,
+    )
     await _insert_artifact(sessions, batch_id, file_id, with_audit=True)
     assert await tasks.claim_next("pipeline", now=NOW, lease_seconds=60) is not None
     data_root = (tmp_path / "data").absolute()
@@ -821,6 +833,9 @@ async def test_metadata_remains_until_exact_30_day_boundary_then_purges_all_task
             select(func.count()).select_from(StageEventRecord)
         ) == 0
         assert await session.get(BatchLockMarkerRecord, batch_id) is None
+        assert await session.scalar(
+            select(func.count()).select_from(OrientationAssessmentRecord)
+        ) == 0
     assert lock_path.read_bytes() == b"\x01"
 
 

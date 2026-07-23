@@ -67,13 +67,23 @@ class PPStructureV3Backend:
                 constructor_options["enable_mkldnn"] = False
             self._pipeline = PPStructureV3(**constructor_options)
             if settings.orientation_model_dir is not None:
+                if (
+                    not settings.orientation_model_dir.is_dir()
+                    or settings.orientation_model_dir.is_symlink()
+                ):
+                    raise ValueError("orientation model directory unavailable")
                 from paddleocr import DocImgOrientationClassification
 
+                orientation_options: dict[str, Any] = {
+                    "device": settings.device,
+                    "model_dir": settings.orientation_model_dir.as_posix(),
+                    "model_name": settings.orientation_model_name,
+                    "topk": 1,
+                }
+                if settings.device == "cpu":
+                    orientation_options["enable_mkldnn"] = False
                 self._orientation_classifier = DocImgOrientationClassification(
-                    device=settings.device,
-                    model_dir=settings.orientation_model_dir.as_posix(),
-                    model_name=settings.orientation_model_name,
-                    topk=1,
+                    **orientation_options
                 )
         except BaseException as exc:
             initialization_failure = SecondaryOcrFailure(

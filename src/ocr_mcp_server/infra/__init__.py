@@ -8,6 +8,7 @@ from .database import (
 )
 from .task_repository import TaskRepository
 from .artifact_repository import ArtifactRepository
+from .orientation_assessment_repository import OrientationAssessmentRepository
 from .retention_repository import RetentionRepository
 from .mineru_adapter import MinerUAdapter, ProgressCallback
 from .secondary_ocr import (
@@ -18,6 +19,7 @@ from .secondary_ocr import (
 
 __all__ = [
     "ArtifactRepository",
+    "OrientationAssessmentRepository",
     "SessionFactory",
     "MinerUAdapter",
     "ProgressCallback",

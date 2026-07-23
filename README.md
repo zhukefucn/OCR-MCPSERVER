@@ -86,6 +86,11 @@ The same bundle must expose the verified `PP-LCNet_x1_0_doc_ori` weights at
 `doc-orientation/`. The gateway constructs PaddleOCR's dedicated document
 orientation classifier from `/models/doc-orientation`; it never substitutes a
 layout confidence score and never downloads this model at runtime.
+`model-manifest.json` must map the PP-Structure
+`DocOrientationClassify` node to exactly `doc-orientation`; the offline smoke
+rejects any other mapping, verifies every file digest, and runs a dedicated
+classifier prediction from that directory in addition to the PP-Structure
+prediction.
 
 The bundle must also contain `model-manifest.json`. Its `models` object maps the
 eleven enabled PaddleX YAML node paths to relative model directories, while its

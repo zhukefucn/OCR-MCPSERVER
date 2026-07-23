@@ -8,6 +8,7 @@ from hashlib import sha256
 from importlib.metadata import PackageNotFoundError, version
 import inspect
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -32,6 +33,11 @@ MAX_TABLE_CELLS = 1000
 DEFAULT_MODEL_CONFIG = Path("/models/pp-structure-v3.yaml")
 DEFAULT_MODEL_MANIFEST = Path("/models/model-manifest.json")
 DEFAULT_MODEL_ROOT = Path("/models")
+DOCUMENT_ORIENTATION_MODEL_NODE = (
+    "SubPipelines.DocPreprocessor.SubModules.DocOrientationClassify"
+)
+DOCUMENT_ORIENTATION_MODEL_DIRECTORY = "doc-orientation"
+DOCUMENT_ORIENTATION_MODEL_NAME = "PP-LCNet_x1_0_doc_ori"
 REQUIRED_MODEL_NODES = (
     "SubModules.LayoutDetection",
     "SubPipelines.DocPreprocessor.SubModules.DocOrientationClassify",
@@ -236,6 +242,11 @@ def prepare_offline_config(
     raw_models = manifest.get("models")
     raw_files = manifest.get("files")
     if not isinstance(raw_models, dict) or set(raw_models) != set(REQUIRED_MODEL_NODES):
+        raise SmokeFailure("model_manifest")
+    if (
+        raw_models.get(DOCUMENT_ORIENTATION_MODEL_NODE)
+        != DOCUMENT_ORIENTATION_MODEL_DIRECTORY
+    ):
         raise SmokeFailure("model_manifest")
     if (
         not isinstance(raw_files, list)
@@ -491,6 +502,29 @@ def validate_prediction_contract(results: list[object]) -> None:
     raise SmokeFailure("prediction_contract")
 
 
+def validate_orientation_prediction_contract(results: list[object]) -> None:
+    """Require one finite top-1 orthogonal label from the dedicated wrapper."""
+
+    if len(results) != 1:
+        raise SmokeFailure("orientation_prediction_contract")
+    page = _result_mapping(results[0])
+    response = page.get("res", page) if page is not None else None
+    labels = response.get("label_names") if isinstance(response, dict) else None
+    scores = response.get("scores") if isinstance(response, dict) else None
+    if (
+        not isinstance(labels, list)
+        or not isinstance(scores, list)
+        or len(labels) != 1
+        or len(scores) != 1
+        or labels[0] not in {"0", "90", "180", "270"}
+        or isinstance(scores[0], bool)
+        or not isinstance(scores[0], (int, float))
+        or not math.isfinite(scores[0])
+        or not 0 <= scores[0] <= 1
+    ):
+        raise SmokeFailure("orientation_prediction_contract")
+
+
 def collect_single_result(results: object) -> list[object]:
     """Consume at most two iterator items and require exactly one page."""
 
@@ -572,6 +606,7 @@ def run_smoke(
 
     paddle_module.utils.run_check()
     pipeline = None
+    orientation_classifier = None
     verified_config = None
     rendered_fixture = None
     try:
@@ -602,13 +637,35 @@ def run_smoke(
                 use_ocr_results_with_table_cells=True,
             )
         )
+        orientation_options = {
+            "device": device,
+            "model_dir": (
+                model_root / DOCUMENT_ORIENTATION_MODEL_DIRECTORY
+            ).as_posix(),
+            "model_name": DOCUMENT_ORIENTATION_MODEL_NAME,
+            "topk": 1,
+        }
+        if device == "cpu":
+            orientation_options["enable_mkldnn"] = False
+        orientation_classifier = (
+            paddleocr_module.DocImgOrientationClassification(
+                **orientation_options
+            )
+        )
+        orientation_results = collect_single_result(
+            orientation_classifier.predict(str(prediction_fixture))
+        )
     finally:
+        orientation_close = getattr(orientation_classifier, "close", None)
+        if callable(orientation_close):
+            orientation_close()
         close = getattr(pipeline, "close", None)
         if callable(close):
             close()
         if rendered_fixture is not None:
             rendered_fixture.unlink(missing_ok=True)
     validate_prediction_contract(results)
+    validate_orientation_prediction_contract(orientation_results)
 
     return {
         "paddle_version": EXPECTED_PADDLE_VERSION,
