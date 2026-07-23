@@ -22,6 +22,7 @@ from uuid import UUID
 import zipfile
 from typing import Protocol
 
+from .._filesystem import is_reparse as _is_reparse
 from ..domain.artifacts import (
     ArtifactBundle,
     ArtifactSnapshot,
@@ -79,12 +80,6 @@ def _canonical_uuid(value: object) -> bool:
         return str(UUID(value)) == value
     except (ValueError, AttributeError, TypeError):
         return False
-
-
-def _is_reparse(value: os.stat_result) -> bool:
-    return stat.S_ISLNK(value.st_mode) or bool(
-        getattr(value, "st_file_attributes", 0) & 0x400
-    )
 
 
 @dataclass(frozen=True, slots=True)

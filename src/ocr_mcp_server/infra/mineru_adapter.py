@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 
+from .._filesystem import is_reparse
 from ..domain import (
     MinerUDocumentResult,
     MinerUErrorCode,
@@ -384,7 +385,7 @@ class MinerUAdapter:
                 ) from None
         except OSError as exc:
             raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE, cause=exc) from None
-        if not stat.S_ISDIR(status.st_mode):
+        if is_reparse(status) or not stat.S_ISDIR(status.st_mode):
             raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
 
     async def _download_archive(

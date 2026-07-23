@@ -6,8 +6,10 @@ from email.parser import BytesParser
 from email.policy import default
 from io import BytesIO
 import json
+import os
 from pathlib import Path
 import stat
+import subprocess
 import threading
 import time
 from typing import Any
@@ -287,6 +289,7 @@ async def test_valid_task_flow_forces_protocol_and_preserves_local_context(
         == result.result_root / "vlm" / "document_content_list.json"
     )
     assert result.images_directory == result.result_root / "vlm" / "images"
+    assert (result.images_directory / "page-1.png").read_bytes() == b"image-bytes"
     assert result.content_list_v2_path.read_text(encoding="utf-8") == "[]"
     assert [item.status for item in progress] == [
         MinerUProgressStatus.PENDING,
@@ -407,6 +410,92 @@ async def test_archive_rejects_regular_file_at_images_directory_path(
 
     assert exc_info.value.code == "mineru_archive_unsafe"
     assert not (tmp_path / "published" / "document").exists()
+
+
+@pytest.mark.parametrize("alias", ["Images", "IMAGES", "images.", "images "])
+@pytest.mark.asyncio
+async def test_archive_rejects_nonliteral_images_directory_alias(
+    tmp_path: Path, alias: str
+) -> None:
+    archive = _zip_entry_bytes(
+        [
+            ("document/vlm/document_content_list_v2.json", "[]"),
+            ("document/vlm/document.md", "# result"),
+            (f"document/vlm/{alias}/page.png", b"image"),
+        ]
+    )
+
+    with pytest.raises(MinerUFailure) as exc_info:
+        await _parse_with_handler(tmp_path, _archive_handler(archive))
+
+    assert exc_info.value.code == "mineru_archive_unsafe"
+    assert not (tmp_path / "published" / "document").exists()
+
+
+def test_images_directory_helper_rejects_regular_file(tmp_path: Path) -> None:
+    from ocr_mcp_server.infra.mineru_adapter import MinerUAdapter
+
+    images = tmp_path / "images"
+    images.write_bytes(b"not-a-directory")
+
+    with pytest.raises(MinerUFailure) as exc_info:
+        MinerUAdapter._ensure_private_images_directory(images)
+
+    assert exc_info.value.code == "mineru_archive_unsafe"
+
+
+def test_images_directory_helper_rejects_symlink(tmp_path: Path) -> None:
+    from ocr_mcp_server.infra.mineru_adapter import MinerUAdapter
+
+    target = tmp_path / "target"
+    target.mkdir()
+    images = tmp_path / "images"
+    try:
+        images.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks unavailable")
+
+    with pytest.raises(MinerUFailure) as exc_info:
+        MinerUAdapter._ensure_private_images_directory(images)
+
+    assert exc_info.value.code == "mineru_archive_unsafe"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO regression")
+def test_images_directory_helper_rejects_fifo(tmp_path: Path) -> None:
+    from ocr_mcp_server.infra.mineru_adapter import MinerUAdapter
+
+    images = tmp_path / "images"
+    os.mkfifo(images)
+
+    with pytest.raises(MinerUFailure) as exc_info:
+        MinerUAdapter._ensure_private_images_directory(images)
+
+    assert exc_info.value.code == "mineru_archive_unsafe"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_images_directory_helper_rejects_windows_junction(tmp_path: Path) -> None:
+    from ocr_mcp_server.infra.mineru_adapter import MinerUAdapter
+
+    target = tmp_path / "target"
+    target.mkdir()
+    images = tmp_path / "images"
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(images), str(target)],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip("directory junctions unavailable")
+
+    try:
+        with pytest.raises(MinerUFailure) as exc_info:
+            MinerUAdapter._ensure_private_images_directory(images)
+        assert exc_info.value.code == "mineru_archive_unsafe"
+    finally:
+        if os.path.lexists(images):
+            os.rmdir(images)
 
 
 @pytest.mark.asyncio
@@ -1235,6 +1324,8 @@ async def test_valid_archive_allows_directory_records_after_file_records(
     result = await _parse_with_handler(tmp_path, _archive_handler(archive))
 
     assert result.content_list_v2_path.is_file()
+    assert result.images_directory.is_dir()
+    assert (result.images_directory / "page.png").read_bytes() == b"image"
 
 
 @pytest.mark.asyncio

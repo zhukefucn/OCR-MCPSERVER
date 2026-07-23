@@ -187,6 +187,12 @@ def _validate_entries(
         )
         if any(not part for part in normalized):
             raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
+        if (
+            len(parts) >= 3
+            and normalized[2] == "images"
+            and parts[2] != "images"
+        ):
+            raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
         if normalized in normalized_destinations:
             raise MinerUFailure(MinerUErrorCode.UNSAFE_ARCHIVE) from None
         normalized_destinations.add(normalized)
