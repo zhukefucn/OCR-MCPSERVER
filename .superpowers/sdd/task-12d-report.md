@@ -246,6 +246,26 @@ issues. They were addressed as one coordinated TDD wave.
 No push, sync, image build, deployment, production fault control, heavy dependency,
 or new telemetry backend was added.
 
+## Linux cooperative-wait test hardening
+
+- Ubuntu RED: the fixed 200-iteration `asyncio.sleep(0)` loop exhausted before a
+  loaded aiosqlite worker could commit terminal state, despite completing in well
+  under a real second on an unloaded runner.
+- GREEN: orchestration `wait_until` now uses the event loop's monotonic clock, a
+  two-second bounded deadline, and a 5 ms positive cooperative sleep. Production
+  orchestration timing is unchanged.
+- Every `wait_until`-driven service test closes its service in `finally`, including
+  timeout and assertion-failure paths. The Linux-failing retry/sibling case can no
+  longer retain its dispatcher or aiosqlite work and poison later TestClient
+  shutdown.
+- Orchestration file: `22 passed in 2.25s`; focused Task 12 retry:
+  `288 passed in 11.50s`; complete isolated suite:
+  `1011 passed, 20 skipped in 22.25s`.
+- `pip check` reports no broken requirements, `compileall` exits 0, and
+  `git diff --check` exits 0 with informational Windows LF/CRLF notices only.
+
+No production timing, push, sync, build, or deployment was changed.
+
 ## Ubuntu/Linux ordering and ownership gate
 
 The Ubuntu full-suite gate exposed one timing-sensitive assertion and a retained

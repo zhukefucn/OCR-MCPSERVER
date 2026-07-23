@@ -98,12 +98,17 @@ class CallablePipeline(FilePipeline):
         return await self.callback(file, progress, cancellation)
 
 
-async def wait_until(predicate: Callable[[], Awaitable[bool]]) -> None:
-    for _ in range(200):
+async def wait_until(
+    predicate: Callable[[], Awaitable[bool]], *, timeout: float = 2.0
+) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
         if await predicate():
             return
-        await asyncio.sleep(0)
-    raise AssertionError("condition did not become true")
+        if loop.time() >= deadline:
+            raise AssertionError("condition did not become true")
+        await asyncio.sleep(0.005)
 
 
 @pytest.mark.asyncio
@@ -323,8 +328,10 @@ async def test_success_progress_is_persisted_before_throttled_notifications(
             and sink.items[-1].status is FileStatus.COMPLETED_WITH_WARNINGS
         )
 
-    await wait_until(terminal)
-    await service.close()
+    try:
+        await wait_until(terminal)
+    finally:
+        await service.close()
 
     persisted = await repository.get_file("file-a")
     assert persisted.status is FileStatus.COMPLETED_WITH_WARNINGS
@@ -409,8 +416,10 @@ async def test_retry_unknown_and_nonretryable_failures_are_safe_and_siblings_con
         status = (await repository.get_batch(created.batch.id)).status
         return status is BatchStatus.COMPLETED_WITH_ERRORS
 
-    await wait_until(terminal)
-    await service.close()
+    try:
+        await wait_until(terminal)
+    finally:
+        await service.close()
     files = await repository.list_batch_files(created.batch.id)
 
     assert calls == {
@@ -492,8 +501,11 @@ async def test_queue_saturation_and_duplicate_wakes_never_lose_or_duplicate_dura
         ]
         return statuses == [BatchStatus.COMPLETED, BatchStatus.COMPLETED]
 
-    await wait_until(both_terminal)
-    await service.close()
+    try:
+        await wait_until(both_terminal)
+    finally:
+        release.set()
+        await service.close()
 
     assert False in wake_results
     assert calls == {"file-a": 1, "file-b": 1}
@@ -542,8 +554,10 @@ async def test_startup_and_periodic_recovery_handle_expiry_and_exhaustion(
             is BatchStatus.FAILED
         )
 
-    await wait_until(recovered_terminal)
-    await service.close()
+    try:
+        await wait_until(recovered_terminal)
+    finally:
+        await service.close()
 
     assert calls == ["recoverable-file"]
     assert (await repository.get_file("recoverable-file")).attempt_count == 2
@@ -655,25 +669,27 @@ async def test_periodic_recovery_emits_requeue_before_the_recovered_file_is_recl
     async def recovery_timer_is_armed() -> bool:
         return any(deadline == 5 for deadline, _future in clock._sleepers)
 
-    await wait_until(recovery_timer_is_armed)
-    clock.advance(6)
+    try:
+        await wait_until(recovery_timer_is_armed)
+        clock.advance(6)
 
-    await recovery_seen.wait()
-    await entered.wait()
-    statuses = [item.status for item in sink.items]
-    assert statuses.index(FileStatus.QUEUED) < statuses.index(FileStatus.PROCESSING)
-    recovery_notification = next(
-        item for item in sink.items if item.status is FileStatus.QUEUED
-    )
-    events = await repository.list_batch_events(recovery_notification.batch_id)
-    assert any(
-        event.version == recovery_notification.version
-        and event.new_status is FileStatus.QUEUED
-        and event.error_code == "lease_expired"
-        for event in events
-    )
-    release.set()
-    await service.close()
+        await recovery_seen.wait()
+        await entered.wait()
+        statuses = [item.status for item in sink.items]
+        assert statuses.index(FileStatus.QUEUED) < statuses.index(FileStatus.PROCESSING)
+        recovery_notification = next(
+            item for item in sink.items if item.status is FileStatus.QUEUED
+        )
+        events = await repository.list_batch_events(recovery_notification.batch_id)
+        assert any(
+            event.version == recovery_notification.version
+            and event.new_status is FileStatus.QUEUED
+            and event.error_code == "lease_expired"
+            for event in events
+        )
+    finally:
+        release.set()
+        await service.close()
 
 
 @pytest.mark.asyncio
@@ -711,19 +727,21 @@ async def test_idle_poll_and_periodic_recovery_find_work_without_wake_tokens(
             is BatchStatus.COMPLETED
         )
 
-    await wait_until(first_terminal)
-    periodic = await repository.create_batch("periodic", ["file-b"])
-    await repository.claim_next("dead-worker", now=clock.now(), lease_seconds=2)
-    clock.advance(6)
+    try:
+        await wait_until(first_terminal)
+        periodic = await repository.create_batch("periodic", ["file-b"])
+        await repository.claim_next("dead-worker", now=clock.now(), lease_seconds=2)
+        clock.advance(6)
 
-    async def second_terminal() -> bool:
-        return (
-            (await repository.get_batch(periodic.batch.id)).status
-            is BatchStatus.COMPLETED
-        )
+        async def second_terminal() -> bool:
+            return (
+                (await repository.get_batch(periodic.batch.id)).status
+                is BatchStatus.COMPLETED
+            )
 
-    await wait_until(second_terminal)
-    await service.close()
+        await wait_until(second_terminal)
+    finally:
+        await service.close()
     assert calls == ["file-a", "file-b"]
 
 
@@ -811,19 +829,21 @@ async def test_heartbeat_extends_lease_and_lease_loss_cancels_pipeline_without_t
         current = await repository.get_file("file-a")
         return current.version > initial.version
 
-    await wait_until(heartbeat_seen)
-    renewed = await repository.get_file("file-a")
-    assert renewed.lease_expires_at == clock.now() + timedelta(seconds=5)
+    try:
+        await wait_until(heartbeat_seen)
+        renewed = await repository.get_file("file-a")
+        assert renewed.lease_expires_at == clock.now() + timedelta(seconds=5)
 
-    await repository.recover_expired_leases(
-        now=renewed.lease_expires_at + timedelta(seconds=1)
-    )
-    clock.advance(2)
-    await cancelled.wait()
-    persisted = await repository.get_file("file-a")
-    assert persisted.status is FileStatus.QUEUED
-    assert persisted.progress == 12
-    await service.close()
+        await repository.recover_expired_leases(
+            now=renewed.lease_expires_at + timedelta(seconds=1)
+        )
+        clock.advance(2)
+        await cancelled.wait()
+        persisted = await repository.get_file("file-a")
+        assert persisted.status is FileStatus.QUEUED
+        assert persisted.progress == 12
+    finally:
+        await service.close()
     assert (await repository.get_file("file-a")).status is not FileStatus.CANCELLED
     assert [outcome for outcome, _ in observations.tasks] == [TaskOutcome.LEASE_CONFLICT]
 
@@ -893,14 +913,16 @@ async def test_sink_failure_and_cancellation_fall_back_to_polling_and_lifecycle_
         worker_identity="worker",
     )
     await service.start()
-    with pytest.raises(ServiceLifecycleError):
-        await service.start()
+    try:
+        with pytest.raises(ServiceLifecycleError):
+            await service.start()
 
-    async def terminal() -> bool:
-        return (await repository.get_batch(created.batch.id)).status is BatchStatus.COMPLETED
+        async def terminal() -> bool:
+            return (await repository.get_batch(created.batch.id)).status is BatchStatus.COMPLETED
 
-    await wait_until(terminal)
-    await service.close()
+        await wait_until(terminal)
+    finally:
+        await service.close()
     await service.close()
 
     assert service.notify_work() is False
@@ -949,27 +971,29 @@ async def test_transient_claim_persistence_error_returns_worker_to_idle_poll_wit
         worker_identity="worker",
     )
     await service.start()
-    await first_failure_seen.wait()
+    try:
+        await first_failure_seen.wait()
 
-    async def idle_timer_is_armed() -> bool:
-        return any(deadline == 1 for deadline, _future in clock._sleepers)
+        async def idle_timer_is_armed() -> bool:
+            return any(deadline == 1 for deadline, _future in clock._sleepers)
 
-    await wait_until(idle_timer_is_armed)
-    assert (await repository.get_batch(created.batch.id)).status is BatchStatus.QUEUED
-    clock.advance(1)
-    await asyncio.wait_for(pipeline_entered.wait(), timeout=1)
+        await wait_until(idle_timer_is_armed)
+        assert (await repository.get_batch(created.batch.id)).status is BatchStatus.QUEUED
+        clock.advance(1)
+        await asyncio.wait_for(pipeline_entered.wait(), timeout=1)
 
-    async def terminal() -> bool:
-        return (await repository.get_batch(created.batch.id)).status is BatchStatus.COMPLETED
+        async def terminal() -> bool:
+            return (await repository.get_batch(created.batch.id)).status is BatchStatus.COMPLETED
 
-    await wait_until(terminal)
-    assert flaky_repository.claim_attempts >= 2
-    assert any(
-        task.get_name() == "ocr-worker-0" and not task.done()
-        for task in service._tasks
-    )
-    assert secret not in caplog.text
-    await service.close()
+        await wait_until(terminal)
+        assert flaky_repository.claim_attempts >= 2
+        assert any(
+            task.get_name() == "ocr-worker-0" and not task.done()
+            for task in service._tasks
+        )
+        assert secret not in caplog.text
+    finally:
+        await service.close()
 
 
 def test_pipeline_failure_and_lifecycle_errors_discard_unsafe_causes() -> None:
