@@ -112,7 +112,7 @@ async def _request_upstream(
     method: str,
     path: str,
     *,
-    data: list[tuple[str, str]] | None = None,
+    data: Mapping[str, str] | None = None,
     files: list[tuple[str, tuple[str, object, str]]] | None = None,
 ) -> Response:
     try:
@@ -227,6 +227,14 @@ async def submit_task(request: Request) -> Response:
     form = await request.form(max_files=1, max_fields=64, max_part_size=64 * 1024)
     try:
         items = list(form.multi_items())
+        data: dict[str, str] = {}
+        for key, value in items:
+            if not isinstance(value, UploadFile):
+                if key in data:
+                    raise HTTPException(
+                        status_code=400, detail="duplicate_form_field"
+                    )
+                data[key] = str(value)
         try:
             validate_fixed_fields(items)
         except PolicyViolation as exc:
@@ -234,7 +242,6 @@ async def submit_task(request: Request) -> Response:
                 status_code=400, detail="fixed_policy_violation"
             ) from exc
 
-        data: list[tuple[str, str]] = []
         files: list[tuple[str, tuple[str, object, str]]] = []
         total_file_bytes = 0
         for key, value in items:
@@ -251,8 +258,6 @@ async def submit_task(request: Request) -> Response:
                     raise HTTPException(
                         status_code=400, detail="unsupported_upload"
                     ) from exc
-            else:
-                data.append((key, str(value)))
         if total_file_bytes > MAX_REQUEST_BYTES:
             raise HTTPException(status_code=413, detail="request_too_large")
         if len(files) != 1:

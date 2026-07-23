@@ -317,3 +317,94 @@ async def test_submit_task_closes_form_upload_on_every_exit(
             await proxy.submit_task(FakeRequest())
 
     assert upload.file.closed is True
+
+
+@pytest.mark.asyncio
+async def test_submit_task_forwards_real_async_multipart_and_closes_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proxy = _load_proxy()
+    upload = UploadFile(BytesIO(b"synthetic-document"), filename="statement.pdf")
+    form = FormData(
+        [
+            ("backend", "vlm-http-client"),
+            ("server_url", "http://mineru-vlm:30000"),
+            ("return_md", "true"),
+            ("files", upload),
+        ]
+    )
+    captured: dict[str, object] = {}
+    clients: list[httpx.AsyncClient] = []
+    real_client = httpx.AsyncClient
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = await request.aread()
+        captured["content_type"] = request.headers["content-type"]
+        return httpx.Response(
+            202,
+            content=b'{"task_id":"task-1"}',
+            headers={"content-type": "application/json"},
+        )
+
+    def client_factory(**kwargs: object) -> httpx.AsyncClient:
+        client = real_client(
+            transport=httpx.MockTransport(handler),
+            **kwargs,
+        )
+        clients.append(client)
+        return client
+
+    class FakeRequest:
+        headers = {"content-length": "1024"}
+
+        @staticmethod
+        async def form(**kwargs: object) -> FormData:
+            return form
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", client_factory)
+    response = await proxy.submit_task(FakeRequest())
+    body = b"".join([chunk async for chunk in response.body_iterator])
+
+    multipart = captured["body"]
+    assert isinstance(multipart, bytes)
+    assert b"synthetic-document" in multipart
+    assert multipart.count(b'name="return_md"') == 1
+    assert str(captured["content_type"]).startswith("multipart/form-data; boundary=")
+    assert body == b'{"task_id":"task-1"}'
+    assert upload.file.closed is True
+    assert clients[0].is_closed is True
+
+
+@pytest.mark.asyncio
+async def test_submit_task_rejects_duplicate_non_file_field_and_closes_upload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proxy = _load_proxy()
+    upload = UploadFile(BytesIO(b"synthetic"), filename="statement.pdf")
+    form = FormData(
+        [
+            ("backend", "vlm-http-client"),
+            ("server_url", "http://mineru-vlm:30000"),
+            ("return_md", "true"),
+            ("return_md", "false"),
+            ("files", upload),
+        ]
+    )
+
+    class FakeRequest:
+        headers = {"content-length": "1024"}
+
+        @staticmethod
+        async def form(**kwargs: object) -> FormData:
+            return form
+
+    async def unexpected_upstream(*args: object, **kwargs: object) -> Response:
+        pytest.fail("ambiguous form reached upstream")
+
+    monkeypatch.setattr(proxy, "_request_upstream", unexpected_upstream)
+    with pytest.raises(HTTPException) as exc_info:
+        await proxy.submit_task(FakeRequest())
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "duplicate_form_field"
+    assert upload.file.closed is True
