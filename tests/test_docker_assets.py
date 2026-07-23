@@ -300,7 +300,8 @@ def test_production_profile_exposes_only_the_gpu_gateway() -> None:
     }
     assert production["environment"] == {
         "OCR_SERVER__HOST": "0.0.0.0",
-        "OCR_SERVER__PORT": "8000",
+            "OCR_SERVER__PORT": "8000",
+            "OCR_PUBLIC_BASE_URL": "${OCR_PUBLIC_BASE_URL:?OCR_PUBLIC_BASE_URL is required}",
         "OCR_DATA_ROOT": "/data",
         "OCR_DATABASE__URL": "sqlite+aiosqlite:////data/ocr.sqlite3",
         "OCR_MINERU__API_URL": "http://mineru-api:8000",

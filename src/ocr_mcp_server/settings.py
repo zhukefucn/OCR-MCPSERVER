@@ -357,6 +357,7 @@ class AppSettings(BaseSettings):
     )
 
     server: ServerSettings = Field(default_factory=ServerSettings)
+    public_base_url: AnyHttpUrl = AnyHttpUrl("https://localhost")
     auth: AuthenticationSettings = Field(default_factory=AuthenticationSettings)
     data_root: Path = Path("data")
     limits: LimitsSettings = Field(default_factory=LimitsSettings)

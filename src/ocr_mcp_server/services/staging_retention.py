@@ -10,27 +10,72 @@ from .retention import OwnedBatchRootDeleter
 
 
 class StagingUploadRetention:
-    def __init__(self, uploads, data_root: Path) -> None:
+    def __init__(
+        self,
+        uploads,
+        data_root: Path,
+        *,
+        storage,
+        marker_registry,
+        deleter: OwnedBatchRootDeleter | None = None,
+    ) -> None:
         self._uploads = uploads
         self._data_root = Path(data_root).absolute()
-        self._deleter = OwnedBatchRootDeleter()
+        self._storage = storage
+        self._marker_registry = marker_registry
+        self._deleter = deleter or OwnedBatchRootDeleter()
 
     async def run_once(self, *, now: datetime, limit: int) -> int:
-        claimed = await self._uploads.claim_expired(now=now, limit=limit)
+        candidates = await self._uploads.list_expired_candidates(
+            now=now, limit=limit
+        )
         deleted = 0
-        for upload in claimed:
+        for candidate in candidates:
             try:
-                await asyncio.to_thread(
-                    self._deleter.delete,
-                    self._data_root,
-                    upload.storage_batch_id,
-                    tombstone_name=f".retention-upload-{upload.file_id}",
-                )
-                if await self._uploads.delete_retired(upload.file_id):
-                    deleted += 1
+                async with self._storage.batch_lock(
+                    candidate.storage_batch_id,
+                    marker_registry=self._marker_registry,
+                    allow_missing_marker=True,
+                    allow_retired=True,
+                ) as batch_lock:
+                    upload = await self._uploads.claim_expired_one(
+                        candidate.file_id, now=now
+                    )
+                    if upload is None:
+                        continue
+                    await _to_thread_before_cancelling(
+                        self._deleter.delete,
+                        self._data_root,
+                        upload.storage_batch_id,
+                        tombstone_name=f".retention-upload-{upload.file_id}",
+                    )
+                    batch_lock.retire()
+                    if await self._uploads.delete_retired(upload.file_id):
+                        deleted += 1
             except Exception:
                 continue
         return deleted
+
+
+async def _to_thread_before_cancelling(function, /, *args, **kwargs):
+    """Keep the batch lock held until an already-started deletion has stopped."""
+
+    worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    cancelled: asyncio.CancelledError | None = None
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+    try:
+        result = worker.result()
+    except BaseException:
+        if cancelled is not None:
+            raise cancelled from None
+        raise
+    if cancelled is not None:
+        raise cancelled
+    return result
 
 
 class ProductionRetentionWorker:

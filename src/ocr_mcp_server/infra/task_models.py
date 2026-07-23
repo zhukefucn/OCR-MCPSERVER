@@ -53,6 +53,7 @@ class BatchRecord(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     idempotency_key: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    source_fingerprint: Mapped[str | None] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     total_files: Mapped[int] = mapped_column(Integer, nullable=False)
     completed_files: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

@@ -207,6 +207,10 @@ class FileStorage:
         self._active_leases_guard = threading.Lock()
         self._active_leases: dict[str, BatchLockLease] = {}
 
+    @property
+    def data_root(self) -> Path:
+        return self._data_root
+
     def _mint_batch_lock(
         self,
         batch_id: str,

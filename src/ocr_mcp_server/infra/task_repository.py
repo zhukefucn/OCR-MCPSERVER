@@ -40,7 +40,13 @@ from ..domain.tasks import (
     StageEventSnapshot,
 )
 from .database import SessionFactory
-from .task_models import BatchRecord, FileTaskRecord, RetentionRecord, StageEventRecord
+from .task_models import (
+    BatchRecord,
+    FileTaskRecord,
+    RetentionRecord,
+    StageEventRecord,
+    UploadRecord,
+)
 
 _ERROR_CODE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}\Z")
 _TERMINAL = frozenset(
@@ -84,13 +90,27 @@ class TaskRepository:
         intermediate_retention_hours: int = DEFAULT_INTERMEDIATE_RETENTION_HOURS,
         result_retention_hours: int = DEFAULT_RESULT_RETENTION_HOURS,
         audit_metadata_retention_days: int = DEFAULT_AUDIT_METADATA_RETENTION_DAYS,
+        require_available_uploads_at: datetime | None = None,
+        source_fingerprint: str | None = None,
     ) -> CreateBatchResult:
         ids = tuple(file_ids)
+        available_at = (
+            None
+            if require_available_uploads_at is None
+            else _require_time(require_available_uploads_at)
+        )
         if (
             not idempotency_key.strip()
             or not ids
             or any(not item.strip() for item in ids)
             or len(set(ids)) != len(ids)
+            or (
+                source_fingerprint is not None
+                and (
+                    len(source_fingerprint) != 64
+                    or any(character not in "0123456789abcdef" for character in source_fingerprint)
+                )
+            )
             or isinstance(max_attempts, bool)
             or max_attempts < 1
             or any(
@@ -111,6 +131,7 @@ class TaskRepository:
         batch = BatchRecord(
             id=new_id(),
             idempotency_key=idempotency_key,
+            source_fingerprint=source_fingerprint,
             status=BatchStatus.QUEUED.value,
             total_files=len(ids),
             completed_files=0,
@@ -167,6 +188,19 @@ class TaskRepository:
         )
         try:
             async with self._sessions() as session:
+                if available_at is not None:
+                    await session.execute(text("BEGIN IMMEDIATE"))
+                    available_ids = set(
+                        await session.scalars(
+                            select(UploadRecord.file_id).where(
+                                UploadRecord.file_id.in_(ids),
+                                UploadRecord.retired_at.is_(None),
+                                UploadRecord.expires_at > available_at,
+                            )
+                        )
+                    )
+                    if available_ids != set(ids):
+                        raise InputValidationError()
                 session.add(batch)
                 session.add_all(files)
                 session.add(retention)
@@ -731,6 +765,7 @@ class TaskRepository:
             processing_files=record.processing_files,
             queued_files=record.queued_files,
             current_file_id=record.current_file_id,
+            source_fingerprint=record.source_fingerprint,
             progress=record.progress,
             created_at=_utc(record.created_at),
             updated_at=_utc(record.updated_at),

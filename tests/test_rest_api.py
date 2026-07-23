@@ -4,6 +4,7 @@ from collections.abc import AsyncIterable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -161,6 +162,29 @@ def test_route_client_helper_does_not_enter_app_lifespan(
 
     assert response.status_code == 200
     assert entered is False
+
+
+def test_artifact_download_route_is_authenticated_and_streams_resolved_zip(
+    tmp_path,
+) -> None:
+    artifact_id = str(uuid4())
+    archive = tmp_path / "result.zip"
+    archive.write_bytes(b"PK-safe")
+
+    class Downloads:
+        async def resolve(self, value):
+            assert value == artifact_id
+            return SimpleNamespace(path=archive, media_type="application/zip")
+
+    settings = AppSettings(auth={"api_keys": [KEY]})
+    app = create_app(settings, gateway=FakeGateway(), artifact_download=Downloads())
+    with TestClient(app) as api:
+        assert api.get(f"/v1/artifacts/{artifact_id}").status_code == 401
+        response = api.get(
+            f"/v1/artifacts/{artifact_id}", headers={"X-API-Key": KEY}
+        )
+    assert response.status_code == 200
+    assert response.content == b"PK-safe"
 
 
 def test_binary_upload_streams_to_gateway_and_returns_receipt() -> None:

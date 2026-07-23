@@ -27,6 +27,7 @@ from .infra.retention_repository import RetentionRepository
 from .infra.task_repository import TaskRepository
 from .infra.upload_repository import UploadRepository
 from .services.artifacts import ArtifactBundler, ArtifactPackagingStep
+from .services.artifact_download import ArtifactDownloadService
 from .services.file_intake import FileIntakeService
 from .services.file_storage import FileStorage
 from .services.file_validation import FileValidator
@@ -74,6 +75,7 @@ class RuntimeResources:
         orientation_recovery: object,
         document_gateway: object,
         readiness: ReadinessService,
+        artifact_download: object | None = None,
         schema_initializer: SchemaInitializer = initialize_schema,
     ) -> None:
         self.engine = engine
@@ -87,6 +89,7 @@ class RuntimeResources:
         self.orientation_recovery = orientation_recovery
         self.document_gateway = document_gateway
         self.readiness = readiness
+        self.artifact_download = artifact_download
         self._schema_initializer = schema_initializer
         self._started = False
         self._closed = False
@@ -164,6 +167,7 @@ def build_runtime(
         marker_registry=retention_repository,
         write_lease_seconds=settings.retention.cleanup_lease_seconds,
     )
+    artifact_download = ArtifactDownloadService(artifacts, artifact_root)
     pipeline = ProductionFilePipeline(
         uploads=uploads,
         storage=storage,
@@ -191,7 +195,12 @@ def build_runtime(
     )
     retention_service = ProductionRetentionWorker(
         batch_retention=batch_retention,
-        staging_retention=StagingUploadRetention(uploads, settings.data_root),
+        staging_retention=StagingUploadRetention(
+            uploads,
+            settings.data_root,
+            storage=storage,
+            marker_registry=retention_repository,
+        ),
         now_factory=utc_now,
         interval_seconds=settings.retention.cleanup_interval_seconds,
         lease_seconds=settings.retention.cleanup_lease_seconds,
@@ -232,7 +241,6 @@ def build_runtime(
             "result_retention_hours": settings.retention.result_hours,
             "audit_metadata_retention_days": settings.retention.audit_metadata_days,
         },
-        upload_retention_hours=settings.retention.input_hours,
     )
     recovery = OrientationRecoveryCoordinator(
         repository=orientation_repository,
@@ -259,6 +267,7 @@ def build_runtime(
         orchestration=orchestration,
         artifacts=artifacts,
         recovery=recovery,
+        orientation_issuer=orientation_repository,
         remote_fetcher=remote_fetcher,
         retention_options={
             "input_retention_hours": settings.retention.input_hours,
@@ -266,6 +275,7 @@ def build_runtime(
             "result_retention_hours": settings.retention.result_hours,
             "audit_metadata_retention_days": settings.retention.audit_metadata_days,
         },
+        artifact_base_url=f"{str(settings.public_base_url).rstrip('/')}/v1/artifacts",
     )
     readiness = build_readiness(
         session_factory=sessions,
@@ -293,6 +303,7 @@ def build_runtime(
         orientation_recovery=recovery,
         document_gateway=gateway,
         readiness=readiness,
+        artifact_download=artifact_download,
     )
 
 

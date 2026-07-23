@@ -277,6 +277,19 @@ class ArtifactRepository:
             ArtifactRecord.file_id, ArtifactRecord.result_version, ArtifactRecord.id
         ))
 
+    async def get_by_public_id(self, public_id: str) -> ArtifactSnapshot | None:
+        from ..services.artifact_download import public_artifact_id
+
+        try:
+            async with self._sessions() as session:
+                records = (await session.scalars(select(ArtifactRecord))).all()
+                for record in records:
+                    if public_artifact_id(record.id) == public_id:
+                        return self._artifact_snapshot(record)
+                return None
+        except SQLAlchemyError:
+            _fail(ArtifactErrorCode.INDEX_FAILED)
+
     async def _read_artifacts(self, statement) -> tuple[ArtifactSnapshot, ...]:
         try:
             async with self._sessions() as session:

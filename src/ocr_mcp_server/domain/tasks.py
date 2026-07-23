@@ -32,6 +32,7 @@ class BatchSnapshot:
     processing_files: int = 0
     queued_files: int = 0
     current_file_id: str | None = None
+    source_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         _require_utc(self.created_at)
@@ -115,3 +116,7 @@ class CreateBatchResult:
     batch: BatchSnapshot
     files: tuple[FileTaskSnapshot, ...]
     created: bool
+
+    @property
+    def source_fingerprint(self) -> str | None:
+        return self.batch.source_fingerprint

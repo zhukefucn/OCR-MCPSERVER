@@ -7,6 +7,7 @@ import re
 from typing import Awaitable, TypeVar
 
 from fastapi import APIRouter, Request, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from .contracts import (
@@ -158,6 +159,24 @@ async def parse_documents(
 async def get_task_status(batch_id: CanonicalId, request: Request) -> BatchStatusResponse:
     return await _safe_gateway_call(
         _gateway(request).get_task_status(batch_id), BatchStatusResponse
+    )
+
+
+@router.get("/artifacts/{artifact_id}", response_class=FileResponse)
+async def download_artifact(artifact_id: CanonicalId, request: Request):
+    service = getattr(request.app.state, "artifact_download", None)
+    if service is None:
+        raise GatewayUnavailable()
+    try:
+        resolved = await service.resolve(artifact_id)
+    except GatewayFailure:
+        raise
+    except Exception:
+        raise GatewayFailure() from None
+    return FileResponse(
+        resolved.path,
+        media_type=resolved.media_type,
+        filename=f"{artifact_id}.zip",
     )
 
 

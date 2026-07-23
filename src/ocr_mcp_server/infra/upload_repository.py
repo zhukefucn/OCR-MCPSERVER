@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import delete, exists, select, update
+from sqlalchemy import delete, exists, select, text, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from ..domain.errors import PersistenceError
@@ -95,15 +95,6 @@ class UploadRepository:
             if idempotency_key is not None:
                 existing = await self.get_by_idempotency_key(idempotency_key)
                 if existing is not None:
-                    await self.register(
-                        stored,
-                        storage_batch_id=storage_batch_id,
-                        idempotency_key=None,
-                        created_at=created_at,
-                        expires_at=expires_at,
-                        adopted_source_file_id=adopted_source_file_id,
-                        result_version=result_version,
-                    )
                     return existing
             raise PersistenceError() from None
         except SQLAlchemyError as exc:
@@ -182,6 +173,7 @@ class UploadRepository:
         )
         try:
             async with self._sessions() as session:
+                await session.execute(text("BEGIN IMMEDIATE"))
                 ids = tuple(
                     await session.scalars(
                         select(UploadRecord.file_id)
@@ -213,6 +205,86 @@ class UploadRepository:
                         claimed.append(self._snapshot(record))
                 await session.commit()
                 return tuple(claimed)
+        except SQLAlchemyError as exc:
+            raise PersistenceError(cause=exc) from None
+
+    async def list_expired_candidates(
+        self, *, now: datetime, limit: int
+    ) -> tuple[UploadSnapshot, ...]:
+        if (
+            now.tzinfo is None
+            or type(limit) is not int
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError("invalid upload cleanup request")
+        active = exists(
+            select(FileTaskRecord.id).where(
+                FileTaskRecord.id == UploadRecord.file_id,
+                FileTaskRecord.status.in_(("queued", "processing")),
+            )
+        )
+        active_recovery = exists(
+            select(OrientationRecoveryRecord.token_digest).where(
+                OrientationRecoveryRecord.file_id == UploadRecord.file_id,
+                OrientationRecoveryRecord.state == "claimed",
+            )
+        )
+        try:
+            async with self._sessions() as session:
+                records = tuple(
+                    await session.scalars(
+                        select(UploadRecord)
+                        .where(
+                            UploadRecord.expires_at <= now.astimezone(UTC),
+                            UploadRecord.retired_at.is_(None),
+                            ~active,
+                            ~active_recovery,
+                        )
+                        .order_by(UploadRecord.expires_at, UploadRecord.file_id)
+                        .limit(limit)
+                    )
+                )
+                return tuple(self._snapshot(record) for record in records)
+        except SQLAlchemyError as exc:
+            raise PersistenceError(cause=exc) from None
+
+    async def claim_expired_one(
+        self, file_id: str, *, now: datetime
+    ) -> UploadSnapshot | None:
+        _uuid(file_id)
+        if now.tzinfo is None:
+            raise ValueError("invalid upload cleanup request")
+        now_db = now.astimezone(UTC)
+        active = exists(
+            select(FileTaskRecord.id).where(
+                FileTaskRecord.id == UploadRecord.file_id,
+                FileTaskRecord.status.in_(("queued", "processing")),
+            )
+        )
+        active_recovery = exists(
+            select(OrientationRecoveryRecord.token_digest).where(
+                OrientationRecoveryRecord.file_id == UploadRecord.file_id,
+                OrientationRecoveryRecord.state == "claimed",
+            )
+        )
+        try:
+            async with self._sessions() as session:
+                await session.execute(text("BEGIN IMMEDIATE"))
+                result = await session.execute(
+                    update(UploadRecord)
+                    .where(
+                        UploadRecord.file_id == file_id,
+                        UploadRecord.expires_at <= now_db,
+                        UploadRecord.retired_at.is_(None),
+                        ~active,
+                        ~active_recovery,
+                    )
+                    .values(retired_at=now_db)
+                    .returning(UploadRecord)
+                )
+                record = result.scalar_one_or_none()
+                await session.commit()
+                return None if record is None else self._snapshot(record)
         except SQLAlchemyError as exc:
             raise PersistenceError(cause=exc) from None
 

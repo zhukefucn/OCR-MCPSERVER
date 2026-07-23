@@ -63,6 +63,7 @@ def create_app(
     *,
     gateway: object | None = None,
     runtime: object | None = None,
+    artifact_download: object | None = None,
     registry: CollectorRegistry | None = None,
     observability: ObservabilitySink | None = None,
     readiness: ReadinessService | None = None,
@@ -87,6 +88,11 @@ def create_app(
     )
     resolved_gateway = (
         getattr(runtime, "document_gateway") if runtime is not None else gateway
+    )
+    resolved_artifact_download = (
+        getattr(runtime, "artifact_download", None)
+        if runtime is not None
+        else artifact_download
     )
     resolved_readiness = (
         getattr(runtime, "readiness")
@@ -128,6 +134,7 @@ def create_app(
     )
     app.state.settings = resolved_settings
     app.state.gateway = resolved_gateway
+    app.state.artifact_download = resolved_artifact_download
     app.state.mcp_server = mcp_server
     app.include_router(router)
 

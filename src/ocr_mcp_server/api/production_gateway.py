@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from uuid import NAMESPACE_URL, uuid4, uuid5
+from hashlib import sha256
+from uuid import uuid4
 
 from ..domain.files import IncomingFile
 from ..domain.models import BatchStatus, utc_now
+from ..domain.orientation import OrientationFailure, RecoveryTokenBinding
 from ..services.orientation_recovery import (
     OrientationRecoveryCommand,
     RecoveryServiceErrorCode,
     RecoveryServiceFailure,
 )
+from ..services.artifact_download import public_artifact_id
 from .contracts import (
     ArtifactReference,
     BatchStatusResponse,
@@ -47,6 +50,7 @@ class ProductionDocumentGateway:
         orchestration,
         artifacts,
         recovery,
+        orientation_issuer=None,
         remote_fetcher=None,
         retention_options: dict[str, int] | None = None,
         upload_retention_hours: int = 24,
@@ -60,6 +64,8 @@ class ProductionDocumentGateway:
         self._orchestration = orchestration
         self._artifacts = artifacts
         self._recovery = recovery
+        self._orientation_issuer = orientation_issuer
+        self._issued_tokens: dict[tuple[str, int], str] = {}
         self._remote_fetcher = remote_fetcher
         self._retention_options = dict(retention_options or {})
         self._upload_retention_hours = upload_retention_hours
@@ -98,6 +104,10 @@ class ProductionDocumentGateway:
                 expires_at=created_at
                 + timedelta(hours=self._upload_retention_hours),
             )
+            if snapshot.file_id != stored.file_id:
+                discard = getattr(self._intake, "discard_upload", None)
+                if callable(discard):
+                    await discard(storage_batch_id)
             return _upload_receipt(snapshot)
         except GatewayFailure:
             raise
@@ -113,6 +123,17 @@ class ProductionDocumentGateway:
         progress: ProgressCallback | None = None,
     ) -> ParseSubmission:
         try:
+            fingerprint = self.source_fingerprint(request.sources)
+            if request.idempotency_key is not None:
+                lookup = getattr(self._tasks, "get_by_idempotency_key", None)
+                if callable(lookup):
+                    existing = await lookup(request.idempotency_key)
+                    if existing is not None:
+                        if getattr(existing, "source_fingerprint", None) != fingerprint:
+                            raise GatewayConflict()
+                        return ParseSubmission(
+                            batch_id=existing.batch.id, status=existing.batch.status
+                        )
             file_ids: list[str] = []
             total = len(request.sources)
             for index, source in enumerate(request.sources, start=1):
@@ -143,9 +164,12 @@ class ProductionDocumentGateway:
                 file_ids.append(upload.file_id)
                 await _progress(progress, index, total)
             key = request.idempotency_key or f"parse:{self._id_factory()}"
+            adoption_at = self._now_factory()
             created = await self._tasks.create_batch(
                 key,
                 file_ids,
+                source_fingerprint=fingerprint,
+                require_available_uploads_at=adoption_at,
                 **self._retention_options,
             )
             if created.created:
@@ -176,9 +200,7 @@ class ProductionDocumentGateway:
             references = (
                 [
                     ArtifactReference(
-                        artifact_id=str(
-                            uuid5(NAMESPACE_URL, f"ocr-artifact:{item.artifact_id}")
-                        ),
+                        artifact_id=public_artifact_id(item.artifact_id),
                         download_url=(
                             f"{self._artifact_base_url}/{item.artifact_id}"
                         ),
@@ -189,6 +211,9 @@ class ProductionDocumentGateway:
                 ]
                 if terminal
                 else []
+            )
+            recovery_tokens = await self._recovery_tokens(
+                batch_id=batch_id, files=files, artifacts=artifacts
             )
             return BatchStatusResponse(
                 batch_id=batch.id,
@@ -211,6 +236,7 @@ class ProductionDocumentGateway:
                                 message="The file could not be processed.",
                             )
                         ),
+                        recovery_token=recovery_tokens.get(item.id),
                     )
                     for item in files
                 ],
@@ -222,6 +248,53 @@ class ProductionDocumentGateway:
             raise GatewayInvalidRequest() from None
         except Exception as exc:
             raise _mapped_failure(exc) from None
+
+    @staticmethod
+    def source_fingerprint(sources) -> str:
+        canonical = "\n".join(
+            f"file:{source.file_id}"
+            if source.file_id is not None
+            else f"url:{str(source.url)}"
+            for source in sources
+        )
+        return sha256(("parse-sources\0" + canonical).encode()).hexdigest()
+
+    async def _recovery_tokens(self, *, batch_id, files, artifacts) -> dict[str, str]:
+        if self._orientation_issuer is None:
+            return {}
+        by_file = {
+            item.file_id: item for item in artifacts
+            if item.available and hasattr(item, "file_id")
+        }
+        decorated: dict[str, str] = {}
+        for file in files:
+            artifact = by_file.get(file.id)
+            if artifact is None:
+                continue
+            key = (file.id, artifact.result_version)
+            if key in self._issued_tokens:
+                decorated[file.id] = self._issued_tokens[key]
+                continue
+            upload = await self._uploads.get(file.id)
+            if upload is None:
+                continue
+            try:
+                issued = await self._orientation_issuer.issue(
+                    RecoveryTokenBinding(
+                        file_id=file.id,
+                        batch_id=batch_id,
+                        source_result_version=artifact.result_version,
+                        page_count=upload.page_count,
+                        suspected_pages=tuple(range(1, upload.page_count + 1)),
+                        expires_at=artifact.expires_at,
+                    ),
+                    now=self._now_factory(),
+                )
+            except OrientationFailure:
+                continue
+            self._issued_tokens[key] = issued.token
+            decorated[file.id] = issued.token
+        return decorated
 
     async def reparse_with_page_orientation(
         self,

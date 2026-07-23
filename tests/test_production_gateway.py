@@ -12,6 +12,8 @@ from ocr_mcp_server.api.contracts import (
     ParseDocumentsRequest,
 )
 from ocr_mcp_server.api.production_gateway import ProductionDocumentGateway
+from ocr_mcp_server.api.gateway import GatewayConflict
+from ocr_mcp_server.domain.orientation import RecoveryTokenBinding
 from ocr_mcp_server.domain.files import StoredFile, SupportedMediaType
 from ocr_mcp_server.domain.models import (
     BatchStatus,
@@ -81,6 +83,43 @@ async def test_gateway_upload_replays_durable_idempotency_mapping() -> None:
 
 
 @pytest.mark.asyncio
+async def test_upload_idempotency_race_discards_loser_content() -> None:
+    winner, loser = _stored(), _stored()
+    discarded = []
+
+    class Intake:
+        async def ingest_upload(self, *args):
+            return loser
+
+        async def discard_upload(self, storage_batch_id):
+            discarded.append(storage_batch_id)
+
+    class Uploads:
+        async def get_by_idempotency_key(self, key):
+            return None
+
+        async def register(self, stored, **kwargs):
+            return SimpleNamespace(
+                file_id=winner.file_id, size_bytes=winner.size_bytes,
+                media_type=winner.media_type,
+            )
+
+    gateway = ProductionDocumentGateway(
+        intake=Intake(), uploads=Uploads(), tasks=SimpleNamespace(),
+        orchestration=SimpleNamespace(), artifacts=SimpleNamespace(),
+        recovery=SimpleNamespace(), id_factory=lambda: "storage-race",
+    )
+    async def content():
+        yield b"%PDF-1.4"
+    await gateway.upload_document(
+        content(), display_name="a.pdf",
+        media_type="application/pdf", content_length=8,
+        idempotency_key="upload-race",
+    )
+    assert discarded == ["storage-race"]
+
+
+@pytest.mark.asyncio
 async def test_gateway_creates_durable_batch_notifies_and_projects_status() -> None:
     file_id = str(uuid4())
     batch_id = str(uuid4())
@@ -126,6 +165,7 @@ async def test_gateway_creates_durable_batch_notifies_and_projects_status() -> N
         async def create_batch(self, key, file_ids, **kwargs):
             assert key == "parse-1"
             assert tuple(file_ids) == (file_id,)
+            assert kwargs["require_available_uploads_at"] == NOW
             return CreateBatchResult(batch, (file,), True)
 
         async def get_batch(self, value):
@@ -155,6 +195,7 @@ async def test_gateway_creates_durable_batch_notifies_and_projects_status() -> N
         orchestration=orchestration,
         artifacts=Artifacts(),
         recovery=SimpleNamespace(),
+        now_factory=lambda: NOW,
     )
     submitted = await gateway.parse_documents(
         ParseDocumentsRequest(
@@ -259,3 +300,80 @@ async def test_gateway_projects_internal_artifact_id_to_public_uuid() -> None:
     )
     status = await gateway.get_task_status(batch_id)
     assert str(uuid4()).count("-") == status.artifacts[0].artifact_id.count("-")
+
+
+async def _async_value(value):
+    return value
+
+
+@pytest.mark.asyncio
+async def test_parse_idempotency_replays_before_remote_fetch_and_rejects_mismatch() -> None:
+    batch_id = str(uuid4())
+    request = ParseDocumentsRequest(
+        sources=[DocumentSource(url="https://files.example.test/a.pdf")],
+        idempotency_key="parse-remote",
+    )
+
+    class Tasks:
+        async def get_by_idempotency_key(self, key):
+            return SimpleNamespace(
+                batch=SimpleNamespace(id=batch_id, status=BatchStatus.QUEUED),
+                source_fingerprint=ProductionDocumentGateway.source_fingerprint(
+                    request.sources
+                ),
+            )
+
+    class Intake:
+        async def ingest_remote(self, *args):
+            raise AssertionError("idempotent replay must not fetch")
+
+    gateway = ProductionDocumentGateway(
+        intake=Intake(), uploads=SimpleNamespace(), tasks=Tasks(),
+        orchestration=SimpleNamespace(), artifacts=SimpleNamespace(),
+        recovery=SimpleNamespace(), remote_fetcher=object(),
+    )
+    assert (await gateway.parse_documents(request)).batch_id == batch_id
+    with pytest.raises(GatewayConflict):
+        await gateway.parse_documents(
+            ParseDocumentsRequest(
+                sources=[DocumentSource(url="https://files.example.test/b.pdf")],
+                idempotency_key="parse-remote",
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_completed_status_issues_and_decorates_digest_backed_recovery_token() -> None:
+    file_id, batch_id = str(uuid4()), str(uuid4())
+    artifact = SimpleNamespace(
+        artifact_id="artifact-" + "b" * 64, file_id=file_id, result_version=2,
+        available=True, expires_at=NOW + timedelta(hours=1),
+    )
+    batch = SimpleNamespace(
+        id=batch_id, status=BatchStatus.COMPLETED, progress=100,
+        total_files=1, completed_files=1, failed_files=0,
+    )
+    file = SimpleNamespace(
+        id=file_id, status=FileStatus.COMPLETED, stage=ProcessingStage.COMPLETED,
+        progress=100, last_error_code=None,
+    )
+
+    class Orientation:
+        async def issue(self, binding, *, now):
+            assert isinstance(binding, RecoveryTokenBinding)
+            assert binding.suspected_pages == (1, 2)
+            return SimpleNamespace(token="or_" + "a" * 64)
+
+    gateway = ProductionDocumentGateway(
+        intake=SimpleNamespace(),
+        uploads=SimpleNamespace(get=lambda *_: _async_value(SimpleNamespace(page_count=2))),
+        tasks=SimpleNamespace(
+            get_batch=lambda *_: _async_value(batch),
+            list_batch_files=lambda *_: _async_value((file,)),
+        ),
+        orchestration=SimpleNamespace(),
+        artifacts=SimpleNamespace(list_for_batch=lambda *_: _async_value((artifact,))),
+        recovery=SimpleNamespace(), orientation_issuer=Orientation(),
+    )
+    status = await gateway.get_task_status(batch_id)
+    assert status.files[0].recovery_token == "or_" + "a" * 64

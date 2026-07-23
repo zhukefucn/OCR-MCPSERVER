@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+import asyncio
 from datetime import datetime
 from typing import Protocol
 
@@ -74,6 +75,16 @@ class FileIntakeService:
         self._max_batch_size_bytes = max_batch_size_bytes
         self._now_factory = now_factory
         self._write_lease_seconds = write_lease_seconds
+
+    async def discard_upload(self, storage_batch_id: str) -> None:
+        from .retention import OwnedBatchRootDeleter
+
+        await asyncio.to_thread(
+            OwnedBatchRootDeleter().delete,
+            self._storage.data_root,
+            storage_batch_id,
+            tombstone_name=f".discard-upload-{storage_batch_id}",
+        )
 
     async def ingest_upload(
         self,
