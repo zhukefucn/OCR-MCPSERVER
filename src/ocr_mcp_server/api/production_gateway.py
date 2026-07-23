@@ -191,6 +191,12 @@ class ProductionDocumentGateway:
                 raise GatewayNotFound()
             files = await self._tasks.list_batch_files(batch_id)
             artifacts = await self._artifacts.list_for_batch(batch_id)
+            now = self._now_factory()
+            visible_artifacts = tuple(
+                item
+                for item in artifacts
+                if item.available and item.expires_at > now
+            )
             terminal = batch.status in {
                 BatchStatus.COMPLETED,
                 BatchStatus.COMPLETED_WITH_ERRORS,
@@ -207,14 +213,13 @@ class ProductionDocumentGateway:
                         ),
                         expires_at=item.expires_at,
                     )
-                    for item in artifacts
-                    if item.available
+                    for item in visible_artifacts
                 ]
                 if terminal
                 else []
             )
             recovery_tokens = await self._recovery_tokens(
-                batch_id=batch_id, files=files, artifacts=artifacts
+                batch_id=batch_id, files=files, artifacts=visible_artifacts
             )
             return BatchStatusResponse(
                 batch_id=batch.id,

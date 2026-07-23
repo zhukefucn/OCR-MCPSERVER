@@ -137,7 +137,10 @@ def build_runtime(
     del event_logger
     engine = __import_database_engine(settings)
     sessions = __import_session_factory(engine)
-    tasks = TaskRepository(sessions)
+    tasks = TaskRepository(
+        sessions,
+        max_batch_size_bytes=settings.limits.max_batch_size_bytes,
+    )
     uploads = UploadRepository(sessions)
     artifacts = ArtifactRepository(sessions)
     retention_repository = RetentionRepository(sessions)

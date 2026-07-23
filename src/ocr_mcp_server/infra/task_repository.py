@@ -14,6 +14,7 @@ from ..domain.constants import (
     DEFAULT_AUDIT_METADATA_RETENTION_DAYS,
     DEFAULT_INPUT_RETENTION_HOURS,
     DEFAULT_INTERMEDIATE_RETENTION_HOURS,
+    DEFAULT_MAX_BATCH_SIZE_BYTES,
     DEFAULT_RESULT_RETENTION_HOURS,
 )
 from ..domain.errors import (
@@ -77,8 +78,20 @@ def _validate_error_code(value: str | None) -> None:
 
 
 class TaskRepository:
-    def __init__(self, session_factory: SessionFactory) -> None:
+    def __init__(
+        self,
+        session_factory: SessionFactory,
+        *,
+        max_batch_size_bytes: int = DEFAULT_MAX_BATCH_SIZE_BYTES,
+    ) -> None:
+        if (
+            isinstance(max_batch_size_bytes, bool)
+            or not isinstance(max_batch_size_bytes, int)
+            or max_batch_size_bytes < 1
+        ):
+            raise ValueError("invalid maximum batch size")
         self._sessions = session_factory
+        self._max_batch_size_bytes = max_batch_size_bytes
 
     async def create_batch(
         self,
@@ -126,6 +139,8 @@ class TaskRepository:
             raise InputValidationError()
         existing = await self._get_by_key(idempotency_key)
         if existing is not None:
+            if existing.source_fingerprint != source_fingerprint:
+                raise InputValidationError()
             return existing
         now = utc_now()
         batch = BatchRecord(
@@ -190,16 +205,23 @@ class TaskRepository:
             async with self._sessions() as session:
                 if available_at is not None:
                     await session.execute(text("BEGIN IMMEDIATE"))
-                    available_ids = set(
-                        await session.scalars(
-                            select(UploadRecord.file_id).where(
+                    available_rows = (
+                        await session.execute(
+                            select(
+                                UploadRecord.file_id,
+                                UploadRecord.size_bytes,
+                            ).where(
                                 UploadRecord.file_id.in_(ids),
                                 UploadRecord.retired_at.is_(None),
                                 UploadRecord.expires_at > available_at,
                             )
                         )
-                    )
-                    if available_ids != set(ids):
+                    ).all()
+                    if (
+                        {row.file_id for row in available_rows} != set(ids)
+                        or sum(row.size_bytes for row in available_rows)
+                        > self._max_batch_size_bytes
+                    ):
                         raise InputValidationError()
                 session.add(batch)
                 session.add_all(files)
@@ -213,6 +235,8 @@ class TaskRepository:
         except IntegrityError:
             existing = await self._get_by_key(idempotency_key)
             if existing is not None:
+                if existing.source_fingerprint != source_fingerprint:
+                    raise InputValidationError()
                 return existing
             raise PersistenceError() from None
         except SQLAlchemyError as exc:

@@ -46,7 +46,21 @@ async def initialize_schema(engine: AsyncEngine) -> None:
         Path(database).parent.mkdir(parents=True, exist_ok=True)
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        await connection.run_sync(_migrate_batch_source_fingerprint)
         await connection.run_sync(_migrate_orientation_takeover_columns)
+
+
+def _migrate_batch_source_fingerprint(connection) -> None:
+    """Add the content-free parse fingerprint to pre-Task-13 databases."""
+
+    existing = {
+        row[1]
+        for row in connection.exec_driver_sql("PRAGMA table_info(batches)")
+    }
+    if "source_fingerprint" not in existing:
+        connection.exec_driver_sql(
+            "ALTER TABLE batches ADD COLUMN source_fingerprint VARCHAR(64)"
+        )
 
 
 def _migrate_orientation_takeover_columns(connection) -> None:

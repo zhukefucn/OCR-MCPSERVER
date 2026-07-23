@@ -288,6 +288,11 @@ async def test_gateway_projects_internal_artifact_id_to_public_uuid() -> None:
                     available=True,
                     expires_at=NOW + timedelta(hours=1),
                 ),
+                SimpleNamespace(
+                    artifact_id="artifact-" + "b" * 64,
+                    available=True,
+                    expires_at=NOW,
+                ),
             )
 
     gateway = ProductionDocumentGateway(
@@ -297,8 +302,10 @@ async def test_gateway_projects_internal_artifact_id_to_public_uuid() -> None:
         orchestration=SimpleNamespace(),
         artifacts=Artifacts(),
         recovery=SimpleNamespace(),
+        now_factory=lambda: NOW,
     )
     status = await gateway.get_task_status(batch_id)
+    assert len(status.artifacts) == 1
     assert str(uuid4()).count("-") == status.artifacts[0].artifact_id.count("-")
     assert str(status.artifacts[0].download_url).endswith(
         f"/{status.artifacts[0].artifact_id}"
@@ -377,6 +384,7 @@ async def test_completed_status_issues_and_decorates_digest_backed_recovery_toke
         orchestration=SimpleNamespace(),
         artifacts=SimpleNamespace(list_for_batch=lambda *_: _async_value((artifact,))),
         recovery=SimpleNamespace(), orientation_issuer=Orientation(),
+        now_factory=lambda: NOW,
     )
     status = await gateway.get_task_status(batch_id)
     assert status.files[0].recovery_token == "or_" + "a" * 64

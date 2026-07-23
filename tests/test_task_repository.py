@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
@@ -13,6 +14,7 @@ from ocr_mcp_server.domain.errors import (
     LeaseConflictError,
     StateTransitionError,
 )
+from ocr_mcp_server.domain.files import StoredFile, SupportedMediaType
 from ocr_mcp_server.domain.models import BatchStatus, FileStatus, ProcessingStage
 from ocr_mcp_server.infra.database import (
     create_database_engine,
@@ -20,6 +22,7 @@ from ocr_mcp_server.infra.database import (
     initialize_schema,
 )
 from ocr_mcp_server.infra.task_repository import TaskRepository
+from ocr_mcp_server.infra.upload_repository import UploadRepository
 
 
 def database_url(path: Path) -> str:
@@ -67,6 +70,34 @@ async def test_schema_and_sqlite_pragmas_are_explicit(repository) -> None:
 
 
 @pytest.mark.asyncio
+async def test_initialize_schema_migrates_legacy_batch_fingerprint_column(
+    tmp_path: Path,
+) -> None:
+    url = database_url(tmp_path / "legacy-batches.sqlite3")
+    engine = create_database_engine(url)
+    await initialize_schema(engine)
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql(
+            "ALTER TABLE batches DROP COLUMN source_fingerprint"
+        )
+    await engine.dispose()
+
+    restarted = create_database_engine(url)
+    await initialize_schema(restarted)
+    try:
+        async with restarted.connect() as connection:
+            columns = {
+                row[1]
+                for row in (
+                    await connection.exec_driver_sql("PRAGMA table_info(batches)")
+                ).all()
+            }
+        assert "source_fingerprint" in columns
+    finally:
+        await restarted.dispose()
+
+
+@pytest.mark.asyncio
 async def test_create_batch_is_idempotent_and_validates_safe_identifiers(repository) -> None:
     repo, _ = repository
     first = await repo.create_batch("digest-1", ["file-a", "file-b"])
@@ -93,6 +124,93 @@ async def test_concurrent_create_batch_converges_on_one_batch(repository) -> Non
 
     assert len({result.batch.id for result in results}) == 1
     assert sum(result.created for result in results) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_idempotency_loser_rejects_different_fingerprint(
+    repository,
+) -> None:
+    repo, _ = repository
+    original_get = repo._get_by_key
+    initial_calls = 0
+    both_initial = asyncio.Event()
+
+    async def synchronized_get(key):
+        nonlocal initial_calls
+        initial_calls += 1
+        if initial_calls <= 2:
+            if initial_calls == 2:
+                both_initial.set()
+            await both_initial.wait()
+            return None
+        return await original_get(key)
+
+    repo._get_by_key = synchronized_get
+    outcomes = await asyncio.gather(
+        repo.create_batch(
+            "fingerprint-race",
+            ["same-file"],
+            source_fingerprint="a" * 64,
+        ),
+        repo.create_batch(
+            "fingerprint-race",
+            ["same-file"],
+            source_fingerprint="b" * 64,
+        ),
+        return_exceptions=True,
+    )
+
+    assert sum(
+        not isinstance(outcome, BaseException) and outcome.created
+        for outcome in outcomes
+    ) == 1
+    assert sum(isinstance(outcome, InputValidationError) for outcome in outcomes) == 1
+
+
+@pytest.mark.asyncio
+async def test_atomic_upload_adoption_enforces_total_batch_bytes(
+    tmp_path: Path,
+) -> None:
+    engine = create_database_engine(database_url(tmp_path / "capacity.sqlite3"))
+    await initialize_schema(engine)
+    sessions = create_session_factory(engine)
+    uploads = UploadRepository(sessions)
+    repository = TaskRepository(sessions, max_batch_size_bytes=10)
+    now = datetime(2026, 7, 23, tzinfo=UTC)
+    file_ids = (str(uuid4()), str(uuid4()))
+    for file_id in file_ids:
+        await uploads.register(
+            StoredFile(
+                file_id=file_id,
+                path=tmp_path / f"{file_id}.pdf",
+                sha256=file_id.replace("-", "") * 2,
+                size_bytes=6,
+                media_type=SupportedMediaType.PDF,
+                extension=".pdf",
+                page_count=1,
+                width=None,
+                height=None,
+            ),
+            storage_batch_id=str(uuid4()),
+            idempotency_key=None,
+            created_at=now,
+            expires_at=now + timedelta(hours=1),
+        )
+    try:
+        with pytest.raises(InputValidationError):
+            await repository.create_batch(
+                "too-large",
+                file_ids,
+                require_available_uploads_at=now,
+            )
+        accepted = await repository.create_batch(
+            "within-limit",
+            file_ids[:1],
+            require_available_uploads_at=now,
+        )
+        assert accepted.created is True
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
