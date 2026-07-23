@@ -20,7 +20,15 @@ import yaml
 EXPECTED_PADDLE_VERSION = "3.3.0"
 EXPECTED_PADDLEOCR_VERSION = "3.5.0"
 MAX_METADATA_BYTES = 1024 * 1024
+MAX_FIXTURE_BYTES = 16 * 1024 * 1024
 MAX_MANIFEST_FILES = 10_000
+MAX_MODEL_DIRECTORIES = 512
+MAX_IMAGE_WIDTH = 4096
+MAX_IMAGE_HEIGHT = 4096
+MAX_IMAGE_PIXELS = 16_000_000
+MAX_TABLE_COLUMNS = 20
+MAX_TABLE_ROWS = 100
+MAX_TABLE_CELLS = 1000
 DEFAULT_MODEL_CONFIG = Path("/models/pp-structure-v3.yaml")
 DEFAULT_MODEL_MANIFEST = Path("/models/model-manifest.json")
 DEFAULT_MODEL_ROOT = Path("/models")
@@ -131,14 +139,31 @@ def _validate_all_local_model_dirs(value: object, root: Path) -> None:
     if isinstance(value, dict):
         for key, child in value.items():
             if key == "model_dir" and child is not None:
-                candidate = Path(child).resolve() if isinstance(child, str) else None
-                if candidate is None or root not in candidate.parents or not candidate.is_dir():
-                    raise SmokeFailure("model_path")
+                _validate_absolute_model_dir(root, child)
             else:
                 _validate_all_local_model_dirs(child, root)
     elif isinstance(value, list):
         for child in value:
             _validate_all_local_model_dirs(child, root)
+
+
+def _validate_absolute_model_dir(root: Path, raw_path: object) -> Path:
+    candidate = Path(raw_path) if isinstance(raw_path, str) else None
+    if candidate is None or not candidate.is_absolute():
+        raise SmokeFailure("model_path")
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise SmokeFailure("model_path") from exc
+    unresolved = root
+    for component in relative.parts:
+        unresolved /= component
+        if unresolved.is_symlink():
+            raise SmokeFailure("model_path")
+    resolved = unresolved.resolve()
+    if root not in resolved.parents or not resolved.is_dir():
+        raise SmokeFailure("model_path")
+    return resolved
 
 
 def prepare_offline_config(
@@ -219,28 +244,59 @@ def prepare_offline_config(
         if not any(model_dir in file_path.parents for file_path in verified_files):
             raise SmokeFailure("model_manifest")
         configured_dir = _model_node(config, node_path).get("model_dir")
-        if (
-            not isinstance(configured_dir, str)
-            or not Path(configured_dir).is_absolute()
-            or Path(configured_dir).resolve() != model_dir
-        ):
+        if _validate_absolute_model_dir(root, configured_dir) != model_dir:
             raise SmokeFailure("model_path")
     _validate_all_local_model_dirs(config, root)
-    files_on_disk: set[Path] = set()
-    for model_dir in verified_model_dirs:
-        for candidate in model_dir.rglob("*"):
-            if candidate.is_symlink():
-                raise SmokeFailure("model_path")
-            if candidate.is_file():
-                resolved_candidate = candidate.resolve()
-                if root not in resolved_candidate.parents:
-                    raise SmokeFailure("model_path")
-                files_on_disk.add(resolved_candidate)
     listed_model_files = {
         file_path
         for file_path in verified_files
         if any(model_dir in file_path.parents for model_dir in verified_model_dirs)
     }
+    if set(verified_files) != listed_model_files | {manifest_config}:
+        raise SmokeFailure("model_manifest")
+
+    files_on_disk: set[Path] = set()
+    visited_directories: set[Path] = set()
+    pending_directories = list(verified_model_dirs)
+    scheduled_directories = set(verified_model_dirs)
+    if len(pending_directories) > MAX_MODEL_DIRECTORIES:
+        raise SmokeFailure("model_manifest")
+    while pending_directories:
+        current = pending_directories.pop()
+        if current in visited_directories:
+            continue
+        visited_directories.add(current)
+        try:
+            entries = os.scandir(current)
+        except OSError as exc:
+            raise SmokeFailure("model_unavailable") from exc
+        with entries:
+            for entry in entries:
+                candidate = Path(entry.path)
+                if entry.is_symlink():
+                    raise SmokeFailure("model_path")
+                if entry.is_dir(follow_symlinks=False):
+                    resolved_directory = candidate.resolve()
+                    if root not in resolved_directory.parents:
+                        raise SmokeFailure("model_path")
+                    if resolved_directory not in scheduled_directories:
+                        scheduled_directories.add(resolved_directory)
+                        pending_directories.append(resolved_directory)
+                        if len(scheduled_directories) > MAX_MODEL_DIRECTORIES:
+                            raise SmokeFailure("model_manifest")
+                elif entry.is_file(follow_symlinks=False):
+                    resolved_candidate = candidate.resolve()
+                    if root not in resolved_candidate.parents:
+                        raise SmokeFailure("model_path")
+                    files_on_disk.add(resolved_candidate)
+                    if (
+                        len(files_on_disk) > len(listed_model_files)
+                        or len(files_on_disk) > MAX_MANIFEST_FILES
+                        or resolved_candidate not in listed_model_files
+                    ):
+                        raise SmokeFailure("model_manifest")
+                else:
+                    raise SmokeFailure("model_path")
     if files_on_disk != listed_model_files:
         raise SmokeFailure("model_manifest")
     return model_config
@@ -259,11 +315,17 @@ def render_synthetic_fixture(fixture: Path) -> Path:
         or type(width) is not int
         or type(height) is not int
         or width < 1200
+        or width > MAX_IMAGE_WIDTH
         or height < 800
+        or height > MAX_IMAGE_HEIGHT
+        or width * height > MAX_IMAGE_PIXELS
         or not isinstance(columns, list)
         or len(columns) < 3
+        or len(columns) > MAX_TABLE_COLUMNS
         or not isinstance(rows, list)
         or len(rows) < 4
+        or len(rows) > MAX_TABLE_ROWS
+        or (len(rows) + 1) * len(columns) > MAX_TABLE_CELLS
     ):
         raise SmokeFailure("fixture_contract")
     all_rows = [columns, *rows]
@@ -318,6 +380,36 @@ def render_synthetic_fixture(fixture: Path) -> Path:
     return rendered
 
 
+def validate_image_fixture(fixture: Path) -> Path:
+    """Validate a bounded PNG/JPEG fixture before Paddle sees it."""
+
+    try:
+        if fixture.is_symlink() or not fixture.is_file():
+            raise SmokeFailure("fixture_unavailable")
+        if not 0 < fixture.stat().st_size <= MAX_FIXTURE_BYTES:
+            raise SmokeFailure("fixture_size")
+        from PIL import Image
+
+        with Image.open(fixture) as image:
+            if image.format not in {"PNG", "JPEG"}:
+                raise SmokeFailure("fixture_format")
+            width, height = image.size
+            if (
+                width < 1
+                or height < 1
+                or width > MAX_IMAGE_WIDTH
+                or height > MAX_IMAGE_HEIGHT
+                or width * height > MAX_IMAGE_PIXELS
+            ):
+                raise SmokeFailure("fixture_dimensions")
+            image.verify()
+    except SmokeFailure:
+        raise
+    except Exception as exc:
+        raise SmokeFailure("fixture_format") from exc
+    return fixture
+
+
 def _result_mapping(result: object) -> dict[str, Any] | None:
     missing = object()
     try:
@@ -362,6 +454,23 @@ def validate_prediction_contract(results: list[object]) -> None:
         if has_table or has_formula:
             return
     raise SmokeFailure("prediction_contract")
+
+
+def collect_single_result(results: object) -> list[object]:
+    """Consume at most two iterator items and require exactly one page."""
+
+    missing = object()
+    try:
+        iterator = iter(results)
+        first = next(iterator)
+        second = next(iterator, missing)
+    except StopIteration as exc:
+        raise SmokeFailure("prediction_count") from exc
+    except Exception as exc:
+        raise SmokeFailure("prediction_count") from exc
+    if second is not missing:
+        raise SmokeFailure("prediction_count")
+    return [first]
 
 
 def _is_distribution_installed(
@@ -429,13 +538,15 @@ def run_smoke(
         prediction_fixture = fixture
         if fixture.suffix.lower() == ".json":
             rendered_fixture = render_synthetic_fixture(fixture)
-            prediction_fixture = rendered_fixture
+            prediction_fixture = validate_image_fixture(rendered_fixture)
+        else:
+            prediction_fixture = validate_image_fixture(fixture)
         pipeline = paddleocr_module.PPStructureV3(
             device=device,
             paddlex_config=str(verified_config),
             **_FIXED_FEATURES,
         )
-        results = list(
+        results = collect_single_result(
             pipeline.predict(
                 str(prediction_fixture),
                 **_FIXED_FEATURES,

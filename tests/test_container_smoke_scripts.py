@@ -336,6 +336,66 @@ def test_offline_model_manifest_rejects_unlisted_model_file(tmp_path: Path) -> N
         )
 
 
+def test_offline_model_inventory_rejects_unbounded_directories(tmp_path: Path) -> None:
+    smoke = _load_smoke_module()
+    model_root, config_path, manifest_path = _offline_model_bundle(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    first_model_dir = model_root / manifest["models"][REQUIRED_MODEL_NODES[0]]
+    for index in range(smoke.MAX_MODEL_DIRECTORIES + 1):
+        (first_model_dir / f"empty-{index}").mkdir()
+
+    with pytest.raises(smoke.SmokeFailure, match="model_manifest"):
+        smoke.prepare_offline_config(
+            model_root=model_root,
+            model_config=config_path,
+            model_manifest=manifest_path,
+        )
+
+
+def test_manifest_file_count_matches_config_and_model_inventory(tmp_path: Path) -> None:
+    smoke = _load_smoke_module()
+    model_root, config_path, manifest_path = _offline_model_bundle(tmp_path)
+    extra = model_root / "extra.txt"
+    extra.write_bytes(b"extra")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"].append(
+        {"path": "extra.txt", "sha256": sha256(extra.read_bytes()).hexdigest()}
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(smoke.SmokeFailure, match="model_manifest"):
+        smoke.prepare_offline_config(
+            model_root=model_root,
+            model_config=config_path,
+            model_manifest=manifest_path,
+        )
+
+
+def test_extra_config_model_dir_rejects_symlink_component(tmp_path: Path) -> None:
+    smoke = _load_smoke_module()
+    model_root, config_path, manifest_path = _offline_model_bundle(tmp_path)
+    real_dir = model_root / "disabled-real"
+    real_dir.mkdir()
+    linked_dir = model_root / "disabled-link"
+    try:
+        linked_dir.symlink_to(real_dir, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks unavailable")
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["SubModules"]["Disabled"] = {"model_dir": str(linked_dir)}
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][0]["sha256"] = sha256(config_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(smoke.SmokeFailure, match="model_path"):
+        smoke.prepare_offline_config(
+            model_root=model_root,
+            model_config=config_path,
+            model_manifest=manifest_path,
+        )
+
+
 def test_metadata_parser_rejects_oversized_file_before_reading(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -367,6 +427,68 @@ def test_prediction_contract_accepts_real_result_json_property() -> None:
             }
 
     smoke.validate_prediction_contract([Result(internal="ignored")])
+
+
+def test_prediction_collection_consumes_at_most_two_and_requires_one() -> None:
+    smoke = _load_smoke_module()
+    consumed = 0
+
+    def infinite_results():
+        nonlocal consumed
+        while True:
+            consumed += 1
+            yield {"res": {}}
+
+    with pytest.raises(smoke.SmokeFailure, match="prediction_count"):
+        smoke.collect_single_result(infinite_results())
+    assert consumed == 2
+
+
+def test_non_json_fixture_requires_bounded_verified_image(tmp_path: Path) -> None:
+    smoke = _load_smoke_module()
+    from PIL import Image
+
+    unsupported = tmp_path / "fixture.bmp"
+    Image.new("RGB", (100, 100), "white").save(unsupported)
+    with pytest.raises(smoke.SmokeFailure, match="fixture_format"):
+        smoke.validate_image_fixture(unsupported)
+
+    too_wide = tmp_path / "fixture.png"
+    Image.new("RGB", (smoke.MAX_IMAGE_WIDTH + 1, 10), "white").save(too_wide)
+    with pytest.raises(smoke.SmokeFailure, match="fixture_dimensions"):
+        smoke.validate_image_fixture(too_wide)
+
+    oversized = tmp_path / "oversized.png"
+    oversized.write_bytes(b"x" * (smoke.MAX_FIXTURE_BYTES + 1))
+    with pytest.raises(smoke.SmokeFailure, match="fixture_size"):
+        smoke.validate_image_fixture(oversized)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        {"width": 5000},
+        {"height": 5000},
+        {"columns": [str(index) for index in range(21)]},
+        {"rows": [["1", "2", "3", "4", "5"] for _ in range(101)]},
+        {
+            "columns": [str(index) for index in range(20)],
+            "rows": [["1"] * 20 for _ in range(60)],
+        },
+    ),
+)
+def test_synthetic_fixture_dimensions_and_cells_are_bounded(
+    tmp_path: Path, mutation: dict[str, object]
+) -> None:
+    smoke = _load_smoke_module()
+    source = REPOSITORY_ROOT / "scripts" / "fixtures" / "pp_structure_smoke.json"
+    blueprint = json.loads(source.read_text(encoding="utf-8"))
+    blueprint.update(mutation)
+    fixture = tmp_path / "fixture.json"
+    fixture.write_text(json.dumps(blueprint), encoding="utf-8")
+
+    with pytest.raises(smoke.SmokeFailure, match="fixture_contract"):
+        smoke.render_synthetic_fixture(fixture)
 
 
 def test_offline_model_manifest_rejects_symlinked_metadata(tmp_path: Path) -> None:

@@ -182,6 +182,24 @@ def test_ppstructure_cpu_profile_has_no_public_paddle_endpoint() -> None:
     assert "30000" not in str(cpu_gateway)
 
 
+def test_ppstructure_cpu_installs_only_required_bookworm_runtime_libraries() -> None:
+    dockerfile = _read_text("docker/ocr-gateway-ppstructure.Dockerfile")
+    normalized = dockerfile.lower()
+    runtime_install = re.search(
+        r"run apt-get update\s+\\\s+&& apt-get install -y --no-install-recommends\s+\\\s+"
+        r"libgl1 libglib2\.0-0 libgomp1\s+\\\s+"
+        r"&& rm -rf /var/lib/apt/lists/\*",
+        normalized,
+    )
+
+    assert runtime_install is not None
+    assert runtime_install.start() < normalized.index("python -m pip install")
+    for forbidden in ("build-essential", "gcc", "g++", "make", "cmake"):
+        assert forbidden not in normalized
+    assert "/var/cache/apt" not in normalized
+    assert normalized.count("apt-get update") == 1
+
+
 def test_gateway_dockerfile_builds_the_installed_package_as_non_root() -> None:
     dockerfile = _read_text("docker/ocr-gateway.Dockerfile")
     normalized = dockerfile.lower()
