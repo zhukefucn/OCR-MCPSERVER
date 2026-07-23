@@ -354,3 +354,55 @@ closed with focused RED/GREEN tests before the final suite.
 
 No push, sync, image build, deployment, production fault control, heavy dependency,
 or new telemetry backend was added.
+
+## Non-blocking safe event logging boundary
+
+The final review found that metrics were dispatched off-thread but safe structured
+logging still invoked `logging.Handler.emit` synchronously from the HTTP event
+loop. A permanently blocking handler therefore blocked `/health/live`.
+
+### RED/GREEN design
+
+- RED: an actual blocking `logging.Handler` held the live request until a 300 ms
+  test release. No bounded log queue, worker lifecycle, or app ownership state
+  existed.
+- GREEN: `SafeEventLogDispatcher` snapshots every `SafeLogEvent` before admission,
+  uses a bounded capacity-256 FIFO queue and exactly one independent daemon worker,
+  and drops on full or closed state without blocking the caller. It is deliberately
+  separate from the Prometheus dispatcher so a blocked handler cannot delay metric
+  recording.
+- The worker contains ordinary handler failures and sink-originated
+  `asyncio.CancelledError`. Invalid or hostile values fail content-free during
+  `_snapshot` before they can enter the queue. Thread-start failure closes and
+  drains the dispatcher without affecting business work.
+- `drain`, `close`, and `wait_closed` use finite deadlines. A handler already
+  executing cannot be killed by Python; close remains bounded, queued events are
+  discarded, and the worker exits after the handler returns.
+
+### App lifecycle and ownership
+
+- Default and raw injected event loggers are wrapped as app-owned inactive
+  dispatchers. Lifespan activates them and closes only those wrappers.
+- Construction and requests made without lifespan create no log worker. Repeated
+  TestClient lifespans leave no `ocr-safe-log-*` workers.
+- An externally supplied `SafeEventLogDispatcher` is reused and remains externally
+  owned; app shutdown does not close it unexpectedly.
+- Uvicorn access logging remains disabled with no built-in log configuration and
+  critical log level, as verified by the existing entrypoint test.
+
+### Final evidence
+
+- Logging/HTTP/auth/fault matrix: `103 passed in 5.43s`.
+- Final Task 12 focused set: `288 passed in 11.91s` using basetemp
+  `.pytest-tmp/log-focused-final`.
+- Complete isolated suite: `1011 passed, 20 skipped in 21.47s` using basetemp
+  `.pytest-tmp/log-full-final`.
+- Ultimate post-review focused set: `288 passed in 11.60s` using basetemp
+  `.pytest-tmp/log-focused-ultimate`.
+- Ultimate post-review complete suite: `1011 passed, 20 skipped in 22.73s` using
+  basetemp `.pytest-tmp/log-full-ultimate`.
+- `pip check` reports no broken requirements, `compileall` exits 0, and
+  `git diff --check` exits 0 with informational Windows LF/CRLF notices only.
+
+No push, sync, image build, deployment, production fault control, heavy dependency,
+or new telemetry backend was added.

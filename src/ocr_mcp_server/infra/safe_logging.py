@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
+from queue import Empty, Full, Queue
+import threading
+import time
+import weakref
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Protocol
 from uuid import UUID
 
 from ocr_mcp_server.domain.models import ProcessingStage
@@ -190,9 +196,231 @@ class SafeEventLogger:
             return
 
 
+class SafeEventSink(Protocol):
+    def emit(self, event: SafeLogEvent) -> None: ...
+
+
+class _SafeEventDispatchState:
+    def __init__(
+        self,
+        sink: SafeEventSink,
+        capacity: int,
+        *,
+        active: bool,
+    ) -> None:
+        try:
+            self.sink_reference = weakref.ref(sink)
+            self.sink_strong = None
+        except TypeError:
+            self.sink_reference = None
+            self.sink_strong = sink
+        self.queue: Queue[SafeLogEvent | object] = Queue(maxsize=capacity)
+        self.lock = threading.Lock()
+        self.active = active
+        self.started = False
+        self.closed = False
+        self.dropped = 0
+        self.stop_token = object()
+
+
+def _stop_safe_event_state(state: _SafeEventDispatchState) -> None:
+    with state.lock:
+        if state.closed:
+            return
+        state.closed = True
+        started = state.started
+    while True:
+        try:
+            state.queue.get_nowait()
+        except Empty:
+            break
+        else:
+            state.queue.task_done()
+    if started:
+        try:
+            state.queue.put_nowait(state.stop_token)
+        except Full:
+            return
+
+
+def _run_safe_event_state(state: _SafeEventDispatchState) -> None:
+    while True:
+        try:
+            item = state.queue.get(timeout=0.05)
+        except Empty:
+            with state.lock:
+                if state.closed:
+                    return
+            continue
+        try:
+            if item is state.stop_token:
+                return
+            if type(item) is not SafeLogEvent:
+                continue
+            with state.lock:
+                closed = state.closed
+            if closed:
+                continue
+            sink = (
+                state.sink_strong
+                if state.sink_reference is None
+                else state.sink_reference()
+            )
+            if sink is not None:
+                try:
+                    sink.emit(item)
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+        finally:
+            state.queue.task_done()
+
+
+class SafeEventLogDispatcher:
+    """Bounded, content-safe logging adapter with one FIFO worker."""
+
+    def __init__(
+        self,
+        sink: SafeEventSink,
+        *,
+        capacity: int = 256,
+        autostart: bool = True,
+    ) -> None:
+        try:
+            valid_sink = callable(getattr(sink, "emit"))
+        except Exception:
+            valid_sink = False
+        if (
+            not valid_sink
+            or isinstance(capacity, bool)
+            or not isinstance(capacity, int)
+            or capacity < 1
+            or not isinstance(autostart, bool)
+        ):
+            raise _invalid()
+        self._state = _SafeEventDispatchState(
+            sink, capacity, active=autostart
+        )
+        self._thread = threading.Thread(
+            target=_run_safe_event_state,
+            args=(self._state,),
+            name=f"ocr-safe-log-{id(self._state):x}",
+            daemon=True,
+        )
+        self._finalizer = weakref.finalize(
+            self, _stop_safe_event_state, self._state
+        )
+
+    @property
+    def pending(self) -> int:
+        return self._state.queue.qsize()
+
+    @property
+    def dropped(self) -> int:
+        with self._state.lock:
+            return self._state.dropped
+
+    @property
+    def worker_count(self) -> int:
+        return 1
+
+    @property
+    def alive_workers(self) -> int:
+        return int(self._thread.is_alive())
+
+    def emit(self, event: SafeLogEvent) -> None:
+        snapshot = _snapshot(event)
+        with self._state.lock:
+            if self._state.closed:
+                self._state.dropped += 1
+                return
+            try:
+                self._state.queue.put_nowait(snapshot)
+            except Full:
+                self._state.dropped += 1
+                return
+            if self._state.active and not self._state.started:
+                self._start_locked()
+
+    def activate(self) -> None:
+        with self._state.lock:
+            if self._state.closed or self._state.active:
+                return
+            self._state.active = True
+            if self._state.queue.qsize() and not self._state.started:
+                self._start_locked()
+
+    def _start_locked(self) -> None:
+        try:
+            self._thread.start()
+        except Exception:
+            self._state.closed = True
+            while True:
+                try:
+                    self._state.queue.get_nowait()
+                except Empty:
+                    break
+                else:
+                    self._state.dropped += 1
+                    self._state.queue.task_done()
+            return
+        self._state.started = True
+
+    def drain(self, timeout: float = 1.0) -> bool:
+        timeout = _timeout(timeout)
+        deadline = time.monotonic() + timeout
+        while self._state.queue.unfinished_tasks:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.001)
+        return True
+
+    def close(self, *, timeout: float = 0.1) -> None:
+        timeout = _timeout(timeout)
+        deadline = time.monotonic() + timeout
+        self.drain(timeout)
+        self._finalizer()
+        if self._thread.ident is not None:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                self._thread.join(remaining)
+
+    def wait_closed(self, timeout: float = 1.0) -> bool:
+        timeout = _timeout(timeout)
+        if self._thread.ident is not None:
+            self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+
+def _timeout(value: object) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise _invalid()
+    return float(value)
+
+
+def nonblocking_safe_event_logger(
+    sink: SafeEventSink,
+    *,
+    autostart: bool = True,
+) -> tuple[SafeEventSink, SafeEventLogDispatcher | None]:
+    if isinstance(sink, SafeEventLogDispatcher):
+        return sink, None
+    dispatcher = SafeEventLogDispatcher(sink, autostart=autostart)
+    return dispatcher, dispatcher
+
+
 __all__ = [
     "JsonEventFormatter",
+    "SafeEventLogDispatcher",
     "SafeEventLogger",
+    "SafeEventSink",
     "SafeLogEvent",
     "SafeLogEventName",
+    "nonblocking_safe_event_logger",
 ]

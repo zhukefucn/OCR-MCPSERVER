@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ocr_mcp_server.infra.safe_logging import (
-    SafeEventLogger,
+    SafeEventSink,
     SafeLogEvent,
     SafeLogEventName,
 )
@@ -36,7 +36,7 @@ class HttpObservabilityMiddleware:
         app: ASGIApp,
         *,
         sink: ObservabilitySink,
-        logger: SafeEventLogger,
+        logger: SafeEventSink,
         route_templates: frozenset[str],
         clock: Callable[[], float] = time.monotonic,
     ) -> None:

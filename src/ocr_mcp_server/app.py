@@ -19,7 +19,13 @@ from .api.gateway import GatewayFailure, GatewayUploadTooLarge
 from .api.mcp import create_mcp_server
 from .api.observability import HttpObservabilityMiddleware
 from .infra.prometheus_observability import PrometheusObservability
-from .infra.safe_logging import JsonEventFormatter, SafeEventLogger
+from .infra.safe_logging import (
+    JsonEventFormatter,
+    SafeEventLogDispatcher,
+    SafeEventLogger,
+    SafeEventSink,
+    nonblocking_safe_event_logger,
+)
 from .services.health import (
     DependencyStatus,
     ProbeCode,
@@ -58,7 +64,7 @@ def create_app(
     registry: CollectorRegistry | None = None,
     observability: ObservabilitySink | None = None,
     readiness: ReadinessService | None = None,
-    event_logger: SafeEventLogger | None = None,
+    event_logger: SafeEventSink | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> FastAPI:
     """Create the HTTP application without starting external services."""
@@ -73,6 +79,10 @@ def create_app(
     resolved_observability, owned_dispatcher = nonblocking_observability(
         raw_observability, autostart=False
     )
+    raw_event_logger = event_logger if event_logger is not None else _event_logger()
+    resolved_logger, owned_log_dispatcher = nonblocking_safe_event_logger(
+        raw_event_logger, autostart=False
+    )
     mcp_server = create_mcp_server(gateway)
     mcp_app = mcp_server.http_app(path="/mcp")
 
@@ -80,6 +90,8 @@ def create_app(
     async def lifespan(application):
         if owned_dispatcher is not None:
             owned_dispatcher.activate()
+        if owned_log_dispatcher is not None:
+            owned_log_dispatcher.activate()
         try:
             async with mcp_app.lifespan(application):
                 yield
@@ -88,6 +100,8 @@ def create_app(
                 resolved_readiness.close_observability()
             if owned_dispatcher is not None:
                 owned_dispatcher.close()
+            if owned_log_dispatcher is not None:
+                owned_log_dispatcher.close()
 
     app = _ObservedFastAPI(
         title="OCR MCP Server",
@@ -99,7 +113,6 @@ def create_app(
     app.state.mcp_server = mcp_server
     app.include_router(router)
 
-    resolved_logger = event_logger if event_logger is not None else _event_logger()
     resolved_readiness = (
         readiness
         if readiness is not None
@@ -111,6 +124,13 @@ def create_app(
     app.state.observability_dispatcher = (
         resolved_observability
         if isinstance(resolved_observability, ObservationDispatcher)
+        else None
+    )
+    app.state.event_logger = resolved_logger
+    app.state.event_logger_target = raw_event_logger
+    app.state.event_log_dispatcher = (
+        resolved_logger
+        if isinstance(resolved_logger, SafeEventLogDispatcher)
         else None
     )
     app.state.readiness = resolved_readiness

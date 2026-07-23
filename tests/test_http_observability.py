@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import logging
 import threading
 import time
 import weakref
@@ -19,7 +20,12 @@ from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_l
 from ocr_mcp_server.api.observability import HttpObservabilityMiddleware
 from ocr_mcp_server.app import create_app
 from ocr_mcp_server.infra.prometheus_observability import PrometheusObservability
-from ocr_mcp_server.infra.safe_logging import SafeLogEvent, SafeLogEventName
+from ocr_mcp_server.infra.safe_logging import (
+    SafeEventLogDispatcher,
+    SafeEventLogger,
+    SafeLogEvent,
+    SafeLogEventName,
+)
 from ocr_mcp_server.services.health import (
     DependencyStatus,
     ProbeCode,
@@ -311,6 +317,98 @@ def test_repeated_testclient_lifespans_leave_no_app_dispatch_workers() -> None:
         for thread in threading.enumerate()
         if thread.name.startswith("ocr-observation-")
     } == prior_workers
+
+
+def test_blocked_logging_handler_never_delays_live_response() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            del record
+            entered.set()
+            release.wait()
+
+    underlying = logging.Logger("blocked-http-handler", level=logging.INFO)
+    underlying.addHandler(BlockingHandler())
+    app = create_app(
+        AppSettings(auth={"api_keys": []}),
+        event_logger=SafeEventLogger(underlying),
+    )
+    timer = threading.Timer(0.3, release.set)
+    timer.start()
+    try:
+        with TestClient(app) as client:
+            started = time.monotonic()
+            response = client.get("/health/live")
+            elapsed = time.monotonic() - started
+            assert response.status_code == 200
+            assert elapsed < 0.1
+            assert entered.wait(0.2)
+    finally:
+        release.set()
+        timer.cancel()
+    dispatcher = app.state.event_log_dispatcher
+    assert dispatcher.wait_closed(0.2)
+
+
+def test_no_lifespan_request_does_not_start_app_log_worker() -> None:
+    release = threading.Event()
+
+    class BlockingHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            del record
+            release.wait()
+
+    underlying = logging.Logger("no-lifespan-log-handler", level=logging.INFO)
+    underlying.addHandler(BlockingHandler())
+    app = create_app(
+        AppSettings(auth={"api_keys": []}),
+        event_logger=SafeEventLogger(underlying),
+    )
+    client = TestClient(app)
+    timer = threading.Timer(0.3, release.set)
+    timer.start()
+    try:
+        started = time.monotonic()
+        response = client.get("/health/live")
+        elapsed = time.monotonic() - started
+        assert response.status_code == 200
+        assert elapsed < 0.1
+        assert app.state.event_log_dispatcher.alive_workers == 0
+    finally:
+        release.set()
+        timer.cancel()
+        client.close()
+
+
+def test_repeated_lifespans_leave_no_app_log_workers_and_external_is_not_closed() -> None:
+    prior_workers = {
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith("ocr-safe-log-")
+    }
+    for _ in range(4):
+        with TestClient(create_app(AppSettings(auth={"api_keys": []}))) as client:
+            assert client.get("/health/live").status_code == 200
+    assert {
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith("ocr-safe-log-")
+    } == prior_workers
+
+    external = SafeEventLogDispatcher(
+        SafeEventLogger(logging.Logger("external-log-dispatcher"))
+    )
+    with TestClient(
+        create_app(AppSettings(auth={"api_keys": []}), event_logger=external)
+    ) as client:
+        assert client.get("/health/live").status_code == 200
+    external.emit(SafeLogEvent(event=SafeLogEventName.HTTP_REQUEST_COMPLETED))
+    assert external.drain(0.2)
+    assert external.alive_workers == 1
+    external.close()
+    assert external.wait_closed(0.2)
 
 
 def test_metrics_render_failure_is_content_free_503(monkeypatch: pytest.MonkeyPatch) -> None:
