@@ -421,6 +421,30 @@ def test_zip_is_deterministic_safe_and_contains_only_verified_explicit_inputs(tm
         assert [entry["name"] for entry in manifest["entries"]] == names[:-1]
 
 
+def test_zip_accepts_semantically_identical_pretty_printed_mineru_source(
+    tmp_path: Path,
+) -> None:
+    result, publication, _, _ = _inputs(tmp_path)
+    source_document = json.loads(publication.original_snapshot_path.read_bytes())
+    result.content_list_v2_path.write_text(
+        json.dumps(source_document, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    bundle = ArtifactBundler(
+        ArtifactLimits(1_000_000, 100_000, 20, 100_000)
+    ).publish(
+        result,
+        publication,
+        artifact_root=(tmp_path / "artifacts").absolute(),
+        batch_id=BATCH_ID,
+        created_at=NOW,
+        expires_at=NOW + timedelta(hours=24),
+    )
+
+    assert bundle.path.is_file()
+
+
 def test_zip_rejects_noncanonical_batch_identity_before_creating_artifact_root(
     tmp_path: Path,
 ) -> None:

@@ -1464,7 +1464,7 @@ class ArtifactBundler:
         ) != loaded["content_list_v2.json"]:
             _fail(ArtifactErrorCode.INVALID_INPUT)
         source_original = _read_file(result.content_list_v2_path, result_root, self._limits.max_entry_bytes, ArtifactErrorCode.UNSAFE_SOURCE)
-        if sha256(source_original).hexdigest() != publication.original_sha256:
+        if _canonical_json(_strict_json(source_original)) != loaded["original_content_list_v2.json"]:
             _fail(ArtifactErrorCode.INVALID_INPUT)
 
         image_names: dict[str, str] = {}
