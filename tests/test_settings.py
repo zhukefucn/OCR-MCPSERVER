@@ -44,6 +44,11 @@ def test_settings_defaults_match_domain_constraints() -> None:
     assert settings.secondary_ocr.classification_threshold == 0.8
     assert settings.secondary_ocr.paddlex_config is None
     assert settings.secondary_ocr.formula_model_name == "PP-FormulaNet_plus-S"
+    assert settings.secondary_ocr.orientation_model_dir is None
+    assert (
+        settings.secondary_ocr.orientation_model_name
+        == "PP-LCNet_x1_0_doc_ori"
+    )
     assert settings.structured_content.max_utf8_bytes >= settings.structured_content.max_characters
     assert settings.structured_content.max_html_elements >= settings.structured_content.max_table_cells
     assert settings.structured_content.max_artifact_bytes >= settings.structured_content.max_utf8_bytes
@@ -334,7 +339,9 @@ def test_secondary_ocr_settings_load_from_yaml_and_environment(
         "  queue_capacity: 3\n"
         "  classification_threshold: 0.7\n"
         "  paddlex_config: /models/pipeline.yaml\n"
-        "  formula_model_name: PP-FormulaNet_plus-M\n",
+        "  formula_model_name: PP-FormulaNet_plus-M\n"
+        "  orientation_model_dir: /models/doc-orientation\n"
+        "  orientation_model_name: Trusted-Doc-Ori\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("OCR_SECONDARY_OCR__DEVICE", "gpu")
@@ -347,6 +354,8 @@ def test_secondary_ocr_settings_load_from_yaml_and_environment(
     assert settings.classification_threshold == 0.7
     assert settings.paddlex_config == Path("/models/pipeline.yaml")
     assert settings.formula_model_name == "PP-FormulaNet_plus-M"
+    assert settings.orientation_model_dir == Path("/models/doc-orientation")
+    assert settings.orientation_model_name == "Trusted-Doc-Ori"
 
 
 def test_secondary_ocr_settings_accept_explicit_first_gpu() -> None:
@@ -368,6 +377,7 @@ def test_secondary_ocr_settings_accept_explicit_first_gpu() -> None:
         ("classification_threshold", 1.01),
         ("classification_threshold", float("nan")),
         ("formula_model_name", ""),
+        ("orientation_model_name", ""),
         ("unexpected_runtime_option", True),
     ],
 )
@@ -387,6 +397,8 @@ def test_example_yaml_documents_secondary_ocr_deployment_defaults() -> None:
     assert settings.classification_threshold == 0.8
     assert settings.paddlex_config is None
     assert settings.formula_model_name == "PP-FormulaNet_plus-S"
+    assert settings.orientation_model_dir is None
+    assert settings.orientation_model_name == "PP-LCNet_x1_0_doc_ori"
 
 
 @pytest.mark.parametrize(

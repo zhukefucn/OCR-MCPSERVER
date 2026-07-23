@@ -20,6 +20,7 @@ from ocr_mcp_server.domain import (
     SecondaryResultKind,
     SecondaryResultState,
 )
+from ocr_mcp_server.domain.secondary_ocr import OrientationClassificationResult
 
 
 class QueueObservability:
@@ -106,6 +107,48 @@ async def test_worker_owns_factory_inference_and_close_on_one_thread(
     assert worker.lifecycle.value == "closed"
     assert worker.queue_depth == 0
     assert worker.owner_thread_alive is False
+
+
+@pytest.mark.asyncio
+async def test_orientation_classification_runs_on_same_single_owner_thread(
+    tmp_path: Path,
+) -> None:
+    from ocr_mcp_server.infra.secondary_ocr import SingleOwnerSecondaryOcrWorker
+
+    events: list[tuple[str, int, str | None]] = []
+    owner_ready = threading.Event()
+    owner_ready.set()
+
+    class Backend(_Backend):
+        def classify_orientation(
+            self, candidate: ImageCandidate
+        ) -> OrientationClassificationResult:
+            self.events.append(
+                ("classify_orientation", threading.get_ident(), candidate.candidate_id)
+            )
+            return OrientationClassificationResult(
+                angle=OrthogonalAngle.DEG_270,
+                confidence=0.96,
+                model_version="trusted",
+            )
+
+    def factory() -> Backend:
+        events.append(("factory", threading.get_ident(), None))
+        return Backend(threading.Event(), owner_ready, events)
+
+    worker = SingleOwnerSecondaryOcrWorker(factory, queue_capacity=2)
+    await worker.start()
+    result = await worker.classify_orientation(_candidate(tmp_path))
+    await worker.close()
+
+    assert result.angle is OrthogonalAngle.DEG_270
+    assert result.confidence == 0.96
+    assert [event[0] for event in events] == [
+        "factory",
+        "classify_orientation",
+        "close",
+    ]
+    assert len({event[1] for event in events}) == 1
 
 
 @pytest.mark.asyncio

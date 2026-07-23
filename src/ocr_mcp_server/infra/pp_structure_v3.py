@@ -9,6 +9,7 @@ from typing import Any, Mapping
 from ..domain import (
     ImageCandidate,
     OrthogonalAngle,
+    OrientationClassificationResult,
     SecondaryContentFormat,
     SecondaryOCREngine,
     SecondaryOcrErrorCode,
@@ -46,6 +47,8 @@ class PPStructureV3Backend:
             "pipeline": "PP-StructureV3",
             "formula": settings.formula_model_name,
         }
+        self._orientation_model_name = settings.orientation_model_name
+        self._orientation_classifier = None
         initialization_failure: SecondaryOcrFailure | None = None
         try:
             from paddleocr import PPStructureV3
@@ -63,6 +66,15 @@ class PPStructureV3Backend:
             if settings.device == "cpu":
                 constructor_options["enable_mkldnn"] = False
             self._pipeline = PPStructureV3(**constructor_options)
+            if settings.orientation_model_dir is not None:
+                from paddleocr import DocImgOrientationClassification
+
+                self._orientation_classifier = DocImgOrientationClassification(
+                    device=settings.device,
+                    model_dir=settings.orientation_model_dir.as_posix(),
+                    model_name=settings.orientation_model_name,
+                    topk=1,
+                )
         except BaseException as exc:
             initialization_failure = SecondaryOcrFailure(
                 SecondaryOcrErrorCode.INITIALIZATION_UNAVAILABLE, cause=exc
@@ -89,7 +101,26 @@ class PPStructureV3Backend:
             model_versions=self._model_versions,
         )
 
+    def classify_orientation(
+        self, candidate: ImageCandidate
+    ) -> OrientationClassificationResult:
+        if self._orientation_classifier is None:
+            return _safe_orientation_result(self._orientation_model_name)
+        try:
+            raw_result = self._orientation_classifier.predict(
+                str(candidate.primary_path)
+            )
+        except BaseException:
+            return _safe_orientation_result(self._orientation_model_name)
+        return normalize_doc_orientation_result(
+            raw_result, model_version=self._orientation_model_name
+        )
+
     def close(self) -> None:
+        if self._orientation_classifier is not None:
+            orientation_close = getattr(self._orientation_classifier, "close", None)
+            if callable(orientation_close):
+                orientation_close()
         close = getattr(self._pipeline, "close", None)
         if callable(close):
             close()
@@ -260,6 +291,48 @@ def _recognized_values(results: list[object], field: str) -> list[str]:
     return values
 
 
+def normalize_doc_orientation_result(
+    raw_result: object,
+    *,
+    model_version: str,
+) -> OrientationClassificationResult:
+    """Normalize only the documented top-1 image-classification JSON fields."""
+
+    try:
+        if not isinstance(raw_result, list) or len(raw_result) != 1:
+            raise ValueError
+        result = raw_result[0]
+        missing = object()
+        json_contract = inspect.getattr_static(result, "json", missing)
+        if json_contract is not missing:
+            result = result.json
+        elif not isinstance(result, Mapping):
+            raise ValueError
+        if not isinstance(result, Mapping):
+            raise ValueError
+        response = result.get("res")
+        if not isinstance(response, Mapping):
+            raise ValueError
+        labels = response.get("label_names")
+        scores = response.get("scores")
+        if (
+            not isinstance(labels, list)
+            or not isinstance(scores, list)
+            or len(labels) != 1
+            or len(scores) != 1
+            or labels[0] not in {"0", "90", "180", "270"}
+            or not _finite_score(scores[0])
+        ):
+            raise ValueError
+        return OrientationClassificationResult(
+            angle=OrthogonalAngle(int(labels[0])),
+            confidence=float(scores[0]),
+            model_version=model_version,
+        )
+    except BaseException:
+        return _safe_orientation_result(model_version)
+
+
 def _finite_score(value: object) -> bool:
     return (
         not isinstance(value, bool)
@@ -285,4 +358,12 @@ def _safe_result(
         engine=SecondaryOCREngine.PP_STRUCTURE_V3,
         model_versions=model_versions,
         state=state,
+    )
+
+
+def _safe_orientation_result(model_version: str) -> OrientationClassificationResult:
+    return OrientationClassificationResult(
+        angle=OrthogonalAngle.DEG_0,
+        confidence=0.0,
+        model_version=model_version,
     )

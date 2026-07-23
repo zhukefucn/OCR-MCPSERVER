@@ -199,6 +199,33 @@ async def test_issue_rejects_second_token_for_same_file_result_version(repositor
 
 
 @pytest.mark.asyncio
+async def test_issue_once_returns_raw_token_once_and_restart_keeps_it_usable(
+    repository,
+) -> None:
+    repo, engine, batch_id, _ = repository
+    first = await repo.issue_once(binding(batch_id), now=NOW)
+    restarted = OrientationRecoveryRepository(create_session_factory(engine))
+
+    assert first is not None
+    assert await restarted.has_issued_source(FILE_ID, 2)
+    assert await restarted.issue_once(binding(batch_id), now=NOW) is None
+    claimed = await restarted.claim(first.token, (2,), now=NOW)
+    assert claimed.snapshot.suspected_pages == (2, 4)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_issue_once_has_exactly_one_raw_token(repository) -> None:
+    repo, _, batch_id, _ = repository
+
+    results = await asyncio.gather(
+        *(repo.issue_once(binding(batch_id), now=NOW) for _ in range(4))
+    )
+
+    issued = [result for result in results if result is not None]
+    assert len(issued) == 1
+
+
+@pytest.mark.asyncio
 async def test_list_claimed_is_bounded_and_keeps_claim_for_durable_reconciliation(repository) -> None:
     repo, engine, batch_id, _ = repository
     issue = await repo.issue(binding(batch_id), now=NOW)

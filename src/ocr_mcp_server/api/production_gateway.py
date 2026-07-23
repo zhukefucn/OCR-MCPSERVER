@@ -7,9 +7,10 @@ from hashlib import sha256
 from uuid import uuid4
 
 from ..domain.files import IncomingFile
-from ..domain.models import BatchStatus, utc_now
+from ..domain.models import BatchStatus, FileStatus, utc_now
 from ..domain.orientation import OrientationFailure, RecoveryTokenBinding
 from ..services.orientation_recovery import (
+    OrientationDetectionRequest,
     OrientationRecoveryCommand,
     RecoveryServiceErrorCode,
     RecoveryServiceFailure,
@@ -51,6 +52,7 @@ class ProductionDocumentGateway:
         artifacts,
         recovery,
         orientation_issuer=None,
+        orientation_detector=None,
         remote_fetcher=None,
         retention_options: dict[str, int] | None = None,
         upload_retention_hours: int = 24,
@@ -65,7 +67,7 @@ class ProductionDocumentGateway:
         self._artifacts = artifacts
         self._recovery = recovery
         self._orientation_issuer = orientation_issuer
-        self._issued_tokens: dict[tuple[str, int], str] = {}
+        self._orientation_detector = orientation_detector
         self._remote_fetcher = remote_fetcher
         self._retention_options = dict(retention_options or {})
         self._upload_retention_hours = upload_retention_hours
@@ -266,7 +268,7 @@ class ProductionDocumentGateway:
         return sha256(("parse-sources\0" + canonical).encode()).hexdigest()
 
     async def _recovery_tokens(self, *, batch_id, files, artifacts) -> dict[str, str]:
-        if self._orientation_issuer is None:
+        if self._orientation_issuer is None or self._orientation_detector is None:
             return {}
         by_file = {
             item.file_id: item for item in artifacts
@@ -275,31 +277,50 @@ class ProductionDocumentGateway:
         decorated: dict[str, str] = {}
         for file in files:
             artifact = by_file.get(file.id)
-            if artifact is None:
-                continue
-            key = (file.id, artifact.result_version)
-            if key in self._issued_tokens:
-                decorated[file.id] = self._issued_tokens[key]
-                continue
-            upload = await self._uploads.get(file.id)
-            if upload is None:
+            if (
+                artifact is None
+                or file.status
+                not in {FileStatus.COMPLETED, FileStatus.COMPLETED_WITH_WARNINGS}
+            ):
                 continue
             try:
-                issued = await self._orientation_issuer.issue(
+                if await self._orientation_issuer.has_issued_source(
+                    file.id, artifact.result_version
+                ):
+                    continue
+                upload = await self._uploads.get(file.id)
+                if upload is None:
+                    continue
+                decisions = await self._orientation_detector.detect(
+                    OrientationDetectionRequest(
+                        batch_id=batch_id,
+                        file_id=file.id,
+                        page_count=upload.page_count,
+                        pages=tuple(range(1, upload.page_count + 1)),
+                    )
+                )
+                suspected_pages = tuple(
+                    decision.page_number
+                    for decision in decisions
+                    if decision.credible and int(decision.angle) != 0
+                )
+                if not suspected_pages:
+                    continue
+                issued = await self._orientation_issuer.issue_once(
                     RecoveryTokenBinding(
                         file_id=file.id,
                         batch_id=batch_id,
                         source_result_version=artifact.result_version,
                         page_count=upload.page_count,
-                        suspected_pages=tuple(range(1, upload.page_count + 1)),
+                        suspected_pages=suspected_pages,
                         expires_at=artifact.expires_at,
                     ),
                     now=self._now_factory(),
                 )
             except OrientationFailure:
                 continue
-            self._issued_tokens[key] = issued.token
-            decorated[file.id] = issued.token
+            if issued is not None:
+                decorated[file.id] = issued.token
         return decorated
 
     async def reparse_with_page_orientation(

@@ -74,6 +74,8 @@ secondary_ocr:
   classification_threshold: 0.8
   paddlex_config: null
   formula_model_name: PP-FormulaNet_plus-S
+  orientation_model_dir: null
+  orientation_model_name: PP-LCNet_x1_0_doc_ori
 
 structured_content:
   max_characters: 1000000

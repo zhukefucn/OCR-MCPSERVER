@@ -18,7 +18,7 @@ from ocr_mcp_server.services.production_recovery import (
     RecoveryPipelineRunner,
 )
 from PIL import Image
-from ocr_mcp_server.domain.secondary_ocr import SecondaryResultState
+from ocr_mcp_server.domain.secondary_ocr import OrientationClassificationResult
 
 
 @pytest.mark.asyncio
@@ -71,7 +71,7 @@ async def test_metadata_detector_normalizes_nonzero_pdf_rotation(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_image_orientation_fails_closed_without_classifier_confidence(
+async def test_image_orientation_uses_dedicated_classifier_confidence(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "rotated.png"
@@ -101,12 +101,12 @@ async def test_image_orientation_fails_closed_without_classifier_confidence(
             return stored
 
     class Paddle:
-        async def recognize(self, candidate):
+        async def classify_orientation(self, candidate):
             assert candidate.primary_path == path
-            return SimpleNamespace(
+            return OrientationClassificationResult(
                 angle=OrthogonalAngle.DEG_90,
                 confidence=0.91,
-                state=SecondaryResultState.VALID,
+                model_version="trusted",
             )
 
     evidence = await ProductionPageOrientationDetector(
@@ -116,9 +116,9 @@ async def test_image_orientation_fails_closed_without_classifier_confidence(
         max_file_size_bytes=30 * 1024 * 1024,
         max_image_pixels=100,
     ).detect(OrientationDetectionRequest(str(uuid4()), file_id, 1, (1,)))
-    assert evidence[0].angle is OrthogonalAngle.DEG_0
-    assert evidence[0].confidence == 0.0
-    assert evidence[0].evidence_code == "paddle_uncertain"
+    assert evidence[0].angle is OrthogonalAngle.DEG_90
+    assert evidence[0].confidence == 0.91
+    assert evidence[0].evidence_code == "paddle_orientation"
 
 
 @pytest.mark.asyncio
@@ -142,11 +142,11 @@ async def test_uncertain_paddle_result_is_zero_confidence(tmp_path: Path) -> Non
     )
 
     class Paddle:
-        async def recognize(self, candidate):
-            return SimpleNamespace(
+        async def classify_orientation(self, candidate):
+            return OrientationClassificationResult(
                 angle=OrthogonalAngle.DEG_0,
-                confidence=0.2,
-                state=SecondaryResultState.UNCERTAIN,
+                confidence=0.0,
+                model_version="trusted",
             )
 
     detector = ProductionPageOrientationDetector(

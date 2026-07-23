@@ -27,6 +27,7 @@ services:
     environment:
       OCR_SECONDARY_OCR__DEVICE: cpu
       OCR_SECONDARY_OCR__PADDLEX_CONFIG: /models/pp-structure-v3.yaml
+      OCR_SECONDARY_OCR__ORIENTATION_MODEL_DIR: /models/doc-orientation
     volumes:
       - ocr-data:/data
       - ./config/example.yaml:/app/config/example.yaml:ro
@@ -47,6 +48,7 @@ services:
     environment:
       OCR_SECONDARY_OCR__DEVICE: gpu:0
       OCR_SECONDARY_OCR__PADDLEX_CONFIG: /models/pp-structure-v3.yaml
+      OCR_SECONDARY_OCR__ORIENTATION_MODEL_DIR: /models/doc-orientation
     volumes:
       - ocr-data:/data
       - ./config/example.yaml:/app/config/example.yaml:ro
@@ -82,6 +84,7 @@ services:
       OCR_MINERU__VLM_SERVER_URL: http://mineru-vlm:30000
       OCR_SECONDARY_OCR__DEVICE: gpu:0
       OCR_SECONDARY_OCR__PADDLEX_CONFIG: /models/pp-structure-v3.yaml
+      OCR_SECONDARY_OCR__ORIENTATION_MODEL_DIR: /models/doc-orientation
       OCR_AUTH__API_KEYS: "${OCR_AUTH__API_KEYS:?OCR_AUTH__API_KEYS is required}"
     volumes:
       - ocr-data:/data

@@ -193,6 +193,8 @@ class SecondaryOCRSettings(_SettingsSection):
     classification_threshold: float = Field(default=0.8, gt=0, le=1)
     paddlex_config: Path | None = None
     formula_model_name: str = "PP-FormulaNet_plus-S"
+    orientation_model_dir: Path | None = None
+    orientation_model_name: str = "PP-LCNet_x1_0_doc_ori"
 
     @field_validator("queue_capacity", "classification_threshold", mode="before")
     @classmethod
@@ -201,12 +203,12 @@ class SecondaryOCRSettings(_SettingsSection):
             raise ValueError("boolean values are not numeric deployment settings")
         return value
 
-    @field_validator("formula_model_name")
+    @field_validator("formula_model_name", "orientation_model_name")
     @classmethod
-    def require_formula_model_identity(cls, value: str) -> str:
+    def require_model_identity(cls, value: str) -> str:
         identity = value.strip()
         if not identity:
-            raise ValueError("formula model identity is required")
+            raise ValueError("model identity is required")
         return identity
 
 

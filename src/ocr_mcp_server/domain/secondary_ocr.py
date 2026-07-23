@@ -60,6 +60,25 @@ class SecondaryResultState(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class OrientationClassificationResult:
+    """Content-free top-1 result from the dedicated document classifier."""
+
+    angle: OrthogonalAngle
+    confidence: float
+    model_version: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.angle, OrthogonalAngle)
+            or not _is_finite_number(self.confidence)
+            or not 0 <= self.confidence <= 1
+            or not isinstance(self.model_version, str)
+            or not self.model_version.strip()
+        ):
+            raise ValueError("invalid orientation classification result")
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateReference:
     source_kind: CandidateSourceKind
     page_index: int | None = None
@@ -355,6 +374,10 @@ class SecondaryOcrProvider(Protocol):
     engine: SecondaryOCREngine
 
     async def recognize(self, candidate: ImageCandidate) -> SecondaryOcrResult: ...
+
+    async def classify_orientation(
+        self, candidate: ImageCandidate
+    ) -> OrientationClassificationResult: ...
 
 
 def _validate_bbox(values: tuple[float, float, float, float]) -> None:

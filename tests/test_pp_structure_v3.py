@@ -18,6 +18,7 @@ from ocr_mcp_server.domain import (
     SecondaryResultKind,
     SecondaryResultState,
 )
+from ocr_mcp_server.domain.secondary_ocr import OrientationClassificationResult
 from ocr_mcp_server.settings import SecondaryOCRSettings
 
 
@@ -169,6 +170,80 @@ def test_cpu_backend_disables_mkldnn(
     PPStructureV3Backend(SecondaryOCRSettings(device="cpu"))
 
     assert calls["constructor"]["enable_mkldnn"] is False  # type: ignore[index]
+
+
+def test_backend_uses_dedicated_document_orientation_classifier_score(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: dict[str, object] = {}
+
+    class FakePipeline:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeOrientationClassifier:
+        def __init__(self, **kwargs):
+            calls["constructor"] = kwargs
+
+        def predict(self, input):
+            calls["input"] = input
+            return [{"res": {"label_names": ["90"], "scores": [0.97]}}]
+
+        def close(self):
+            calls["closed"] = True
+
+    fake = ModuleType("paddleocr")
+    fake.PPStructureV3 = FakePipeline  # type: ignore[attr-defined]
+    fake.DocImgOrientationClassification = FakeOrientationClassifier  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "paddleocr", fake)
+    from ocr_mcp_server.infra.pp_structure_v3 import PPStructureV3Backend
+
+    backend = PPStructureV3Backend(
+        SecondaryOCRSettings(
+            device="gpu:0",
+            orientation_model_dir=Path("/models/doc-orientation"),
+            orientation_model_name="PP-LCNet_x1_0_doc_ori",
+        )
+    )
+    result = backend.classify_orientation(_candidate(tmp_path))
+    backend.close()
+
+    assert calls["constructor"] == {
+        "device": "gpu:0",
+        "model_dir": "/models/doc-orientation",
+        "model_name": "PP-LCNet_x1_0_doc_ori",
+        "topk": 1,
+    }
+    assert calls["input"] == str(tmp_path / "bank-secret.png")
+    assert result == OrientationClassificationResult(
+        angle=OrthogonalAngle.DEG_90,
+        confidence=0.97,
+        model_version="PP-LCNet_x1_0_doc_ori",
+    )
+    assert calls["closed"] is True
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        [],
+        [{"res": {"label_names": ["90"], "scores": []}}],
+        [{"res": {"label_names": ["45"], "scores": [0.99]}}],
+        [{"res": {"label_names": ["90"], "scores": [float("nan")]}}],
+    ],
+)
+def test_document_orientation_normalizer_fails_closed(raw) -> None:
+    from ocr_mcp_server.infra.pp_structure_v3 import (
+        normalize_doc_orientation_result,
+    )
+
+    assert normalize_doc_orientation_result(
+        raw, model_version="trusted"
+    ) == OrientationClassificationResult(
+        angle=OrthogonalAngle.DEG_0,
+        confidence=0.0,
+        model_version="trusted",
+    )
 
 
 def test_mapping_result_prefers_json_property_over_raw_mapping() -> None:

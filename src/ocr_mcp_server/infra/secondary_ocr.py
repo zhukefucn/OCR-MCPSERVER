@@ -12,6 +12,7 @@ from typing import Callable, Protocol
 
 from ..domain import (
     ImageCandidate,
+    OrientationClassificationResult,
     SecondaryOCREngine,
     SecondaryOcrErrorCode,
     SecondaryOcrFailure,
@@ -29,6 +30,10 @@ class SynchronousSecondaryOcrBackend(Protocol):
 
     def recognize(self, candidate: ImageCandidate) -> SecondaryOcrResult: ...
 
+    def classify_orientation(
+        self, candidate: ImageCandidate
+    ) -> OrientationClassificationResult: ...
+
     def close(self) -> None: ...
 
 
@@ -42,9 +47,15 @@ class SecondaryOcrWorkerLifecycle(StrEnum):
 
 
 @dataclass(slots=True)
-class _Job:
+class _RecognitionJob:
     candidate: ImageCandidate
     outcome: Future[SecondaryOcrResult]
+
+
+@dataclass(slots=True)
+class _OrientationJob:
+    candidate: ImageCandidate
+    outcome: Future[OrientationClassificationResult]
 
 
 _STOP = object()
@@ -69,7 +80,9 @@ class SingleOwnerSecondaryOcrWorker:
             observability
         )
         self._observability_target = observability
-        self._queue: Queue[_Job | object] = Queue(maxsize=queue_capacity)
+        self._queue: Queue[_RecognitionJob | _OrientationJob | object] = Queue(
+            maxsize=queue_capacity
+        )
         self._lock = threading.RLock()
         self._lifecycle = SecondaryOcrWorkerLifecycle.CREATED
         self._thread: threading.Thread | None = None
@@ -138,7 +151,17 @@ class SingleOwnerSecondaryOcrWorker:
 
     async def recognize(self, candidate: ImageCandidate) -> SecondaryOcrResult:
         outcome: Future[SecondaryOcrResult] = Future()
-        job = _Job(candidate=candidate, outcome=outcome)
+        job = _RecognitionJob(candidate=candidate, outcome=outcome)
+        return await self._submit(job)
+
+    async def classify_orientation(
+        self, candidate: ImageCandidate
+    ) -> OrientationClassificationResult:
+        outcome: Future[OrientationClassificationResult] = Future()
+        job = _OrientationJob(candidate=candidate, outcome=outcome)
+        return await self._submit(job)
+
+    async def _submit(self, job):
         with self._lock:
             if self._lifecycle is not SecondaryOcrWorkerLifecycle.RUNNING:
                 raise SecondaryOcrFailure(SecondaryOcrErrorCode.NOT_STARTED)
@@ -152,7 +175,7 @@ class SingleOwnerSecondaryOcrWorker:
             self._observe_queue_depth()
         if saturated:
             raise SecondaryOcrFailure(SecondaryOcrErrorCode.QUEUE_SATURATED)
-        wrapped = asyncio.wrap_future(outcome)
+        wrapped = asyncio.wrap_future(job.outcome)
         try:
             return await asyncio.shield(wrapped)
         except asyncio.CancelledError:
@@ -226,7 +249,7 @@ class SingleOwnerSecondaryOcrWorker:
             except Empty:
                 return
             try:
-                if isinstance(item, _Job):
+                if isinstance(item, (_RecognitionJob, _OrientationJob)):
                     self._waiting_jobs -= 1
                     _set_exception_if_pending(
                         item.outcome,
@@ -269,14 +292,14 @@ class SingleOwnerSecondaryOcrWorker:
 
             while True:
                 item = self._queue.get()
-                if isinstance(item, _Job):
+                if isinstance(item, (_RecognitionJob, _OrientationJob)):
                     with self._lock:
                         self._waiting_jobs -= 1
                     self._observe_queue_depth()
                 try:
                     if item is _STOP:
                         break
-                    assert isinstance(item, _Job)
+                    assert isinstance(item, (_RecognitionJob, _OrientationJob))
                     with self._lock:
                         accepting = (
                             self._lifecycle is SecondaryOcrWorkerLifecycle.RUNNING
@@ -288,7 +311,10 @@ class SingleOwnerSecondaryOcrWorker:
                         )
                         continue
                     try:
-                        result = backend.recognize(item.candidate)
+                        if isinstance(item, _RecognitionJob):
+                            result = backend.recognize(item.candidate)
+                        else:
+                            result = backend.classify_orientation(item.candidate)
                     except BaseException as exc:
                         _set_exception_if_pending(
                             item.outcome,

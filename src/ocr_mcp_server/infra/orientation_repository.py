@@ -167,6 +167,50 @@ class OrientationRecoveryRepository:
                 raise OrientationFailure(OrientationErrorCode.PERSISTENCE_FAILED) from None
         raise OrientationFailure(OrientationErrorCode.PERSISTENCE_FAILED) from None
 
+    async def issue_once(
+        self, binding: RecoveryTokenBinding, *, now: datetime
+    ) -> RecoveryTokenIssue | None:
+        """Return the raw token only to the single atomic insert winner."""
+
+        try:
+            return await self.issue(binding, now=now)
+        except OrientationFailure as exc:
+            if (
+                exc.code == OrientationErrorCode.REQUEST_CONFLICT.value
+                and await self._source_token_exists(binding)
+            ):
+                return None
+            raise
+
+    async def has_issued_source(
+        self, file_id: str, source_result_version: int
+    ) -> bool:
+        """Check the durable digest row without recovering or exposing its token."""
+
+        if (
+            not isinstance(file_id, str)
+            or not file_id
+            or type(source_result_version) is not int
+            or source_result_version < 1
+        ):
+            raise OrientationFailure(OrientationErrorCode.REQUEST_INVALID) from None
+        try:
+            async with self._sessions() as session:
+                existing = await session.scalar(
+                    select(OrientationRecoveryRecord.token_digest).where(
+                        OrientationRecoveryRecord.file_id == file_id,
+                        OrientationRecoveryRecord.source_result_version
+                        == source_result_version,
+                    )
+                )
+                return existing is not None
+        except SQLAlchemyError:
+            raise OrientationFailure(OrientationErrorCode.PERSISTENCE_FAILED) from None
+        except OrientationFailure:
+            raise
+        except Exception:
+            raise OrientationFailure(OrientationErrorCode.PERSISTENCE_FAILED) from None
+
     async def _source_token_exists(self, binding: RecoveryTokenBinding) -> bool:
         try:
             async with self._sessions() as session:

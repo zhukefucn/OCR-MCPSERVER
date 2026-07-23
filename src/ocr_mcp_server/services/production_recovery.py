@@ -102,19 +102,16 @@ class ProductionPageOrientationDetector:
                     self._max_file_size_bytes,
                     self._max_image_pixels,
                 )
-                await self._paddle.recognize(candidate)
-                # PP-Structure exposes the predicted document angle but drops
-                # the orientation classifier score.  Its result confidence is
-                # a layout score, so it must not authorize page rotation.
-                angle = OrthogonalAngle.DEG_0
-                confidence = 0.0
+                classification = await self._paddle.classify_orientation(candidate)
+                angle = classification.angle
+                confidence = classification.confidence
                 evidence.append(
                     OrientationEvidence(
                         page,
                         angle,
                         float(confidence),
                         "paddle_orientation"
-                        if angle is not OrthogonalAngle.DEG_0
+                        if confidence > 0
                         else "paddle_uncertain",
                     )
                 )

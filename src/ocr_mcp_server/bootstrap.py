@@ -271,6 +271,7 @@ def build_runtime(
         artifacts=artifacts,
         recovery=recovery,
         orientation_issuer=orientation_repository,
+        orientation_detector=recovery_detector,
         remote_fetcher=remote_fetcher,
         retention_options={
             "input_retention_hours": settings.retention.input_hours,

@@ -186,6 +186,7 @@ def test_compose_keeps_the_minimal_gateway_and_adds_ppstructure_profiles() -> No
     assert cpu_gateway["environment"] == {
         "OCR_SECONDARY_OCR__DEVICE": "cpu",
         "OCR_SECONDARY_OCR__PADDLEX_CONFIG": "/models/pp-structure-v3.yaml",
+        "OCR_SECONDARY_OCR__ORIENTATION_MODEL_DIR": "/models/doc-orientation",
     }
     assert cpu_gateway["ports"] == ["${OCR_GATEWAY_PORT:-8000}:8000"]
     assert cpu_gateway["init"] is True
@@ -201,6 +202,7 @@ def test_compose_keeps_the_minimal_gateway_and_adds_ppstructure_profiles() -> No
     assert gpu_gateway["environment"] == {
         "OCR_SECONDARY_OCR__DEVICE": "gpu:0",
         "OCR_SECONDARY_OCR__PADDLEX_CONFIG": "/models/pp-structure-v3.yaml",
+        "OCR_SECONDARY_OCR__ORIENTATION_MODEL_DIR": "/models/doc-orientation",
     }
     assert gpu_gateway["volumes"] == cpu_gateway["volumes"]
     assert gpu_gateway["ports"] == ["${OCR_GATEWAY_PORT:-8000}:8000"]
@@ -308,6 +310,7 @@ def test_production_profile_exposes_only_the_gpu_gateway() -> None:
         "OCR_MINERU__VLM_SERVER_URL": "http://mineru-vlm:30000",
         "OCR_SECONDARY_OCR__DEVICE": "gpu:0",
         "OCR_SECONDARY_OCR__PADDLEX_CONFIG": "/models/pp-structure-v3.yaml",
+        "OCR_SECONDARY_OCR__ORIENTATION_MODEL_DIR": "/models/doc-orientation",
         "OCR_AUTH__API_KEYS": "${OCR_AUTH__API_KEYS:?OCR_AUTH__API_KEYS is required}",
     }
     assert production["deploy"]["resources"]["reservations"]["devices"] == [

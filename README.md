@@ -82,6 +82,10 @@ vLLM, or PaddleOCR-VL runtime. Place the verified PP-StructureV3 model bundle in
 `models/pp-structure-v3/`, including `pp-structure-v3.yaml`; Compose mounts that
 directory at `/models` read-only. Record and verify the bundle manifest and its
 SHA-256 before startup. The container does not download models during startup.
+The same bundle must expose the verified `PP-LCNet_x1_0_doc_ori` weights at
+`doc-orientation/`. The gateway constructs PaddleOCR's dedicated document
+orientation classifier from `/models/doc-orientation`; it never substitutes a
+layout confidence score and never downloads this model at runtime.
 
 The bundle must also contain `model-manifest.json`. Its `models` object maps the
 eleven enabled PaddleX YAML node paths to relative model directories, while its

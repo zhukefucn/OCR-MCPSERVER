@@ -13,7 +13,11 @@ from ocr_mcp_server.api.contracts import (
 )
 from ocr_mcp_server.api.production_gateway import ProductionDocumentGateway
 from ocr_mcp_server.api.gateway import GatewayConflict
-from ocr_mcp_server.domain.orientation import RecoveryTokenBinding
+from ocr_mcp_server.domain.orientation import (
+    OrientationDecision,
+    RecoveryTokenBinding,
+)
+from ocr_mcp_server.domain.secondary_ocr import OrthogonalAngle
 from ocr_mcp_server.domain.files import StoredFile, SupportedMediaType
 from ocr_mcp_server.domain.models import (
     BatchStatus,
@@ -353,7 +357,7 @@ async def test_parse_idempotency_replays_before_remote_fetch_and_rejects_mismatc
 
 
 @pytest.mark.asyncio
-async def test_completed_status_issues_and_decorates_digest_backed_recovery_token() -> None:
+async def test_completed_status_returns_token_once_for_only_credible_rotated_pages() -> None:
     file_id, batch_id = str(uuid4()), str(uuid4())
     artifact = SimpleNamespace(
         artifact_id="artifact-" + "b" * 64, file_id=file_id, result_version=2,
@@ -369,11 +373,35 @@ async def test_completed_status_issues_and_decorates_digest_backed_recovery_toke
     )
 
     class Orientation:
-        async def issue(self, binding, *, now):
+        def __init__(self):
+            self.issued = False
+
+        async def has_issued_source(self, file_id, source_result_version):
+            return self.issued
+
+        async def issue_once(self, binding, *, now):
             assert isinstance(binding, RecoveryTokenBinding)
-            assert binding.suspected_pages == (1, 2)
+            assert binding.suspected_pages == (2,)
+            self.issued = True
             return SimpleNamespace(token="or_" + "a" * 64)
 
+    class Detector:
+        def __init__(self):
+            self.calls = 0
+
+        async def detect(self, request):
+            self.calls += 1
+            return (
+                OrientationDecision(
+                    1, OrthogonalAngle.DEG_0, 0.99, "paddle_orientation", True
+                ),
+                OrientationDecision(
+                    2, OrthogonalAngle.DEG_90, 0.96, "paddle_orientation", True
+                ),
+            )
+
+    orientation = Orientation()
+    detector = Detector()
     gateway = ProductionDocumentGateway(
         intake=SimpleNamespace(),
         uploads=SimpleNamespace(get=lambda *_: _async_value(SimpleNamespace(page_count=2))),
@@ -383,8 +411,80 @@ async def test_completed_status_issues_and_decorates_digest_backed_recovery_toke
         ),
         orchestration=SimpleNamespace(),
         artifacts=SimpleNamespace(list_for_batch=lambda *_: _async_value((artifact,))),
-        recovery=SimpleNamespace(), orientation_issuer=Orientation(),
+        recovery=SimpleNamespace(),
+        orientation_issuer=orientation,
+        orientation_detector=detector,
         now_factory=lambda: NOW,
     )
+    first = await gateway.get_task_status(batch_id)
+    second = await gateway.get_task_status(batch_id)
+    assert first.files[0].recovery_token == "or_" + "a" * 64
+    assert second.files[0].recovery_token is None
+    assert detector.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_completed_status_does_not_issue_without_credible_rotated_page() -> None:
+    file_id, batch_id = str(uuid4()), str(uuid4())
+    artifact = SimpleNamespace(
+        artifact_id="artifact-" + "c" * 64,
+        file_id=file_id,
+        result_version=2,
+        available=True,
+        expires_at=NOW + timedelta(hours=1),
+    )
+    batch = SimpleNamespace(
+        id=batch_id,
+        status=BatchStatus.COMPLETED,
+        progress=100,
+        total_files=1,
+        completed_files=1,
+        failed_files=0,
+    )
+    file = SimpleNamespace(
+        id=file_id,
+        status=FileStatus.COMPLETED,
+        stage=ProcessingStage.COMPLETED,
+        progress=100,
+        last_error_code=None,
+    )
+
+    class Orientation:
+        async def has_issued_source(self, *args):
+            return False
+
+        async def issue_once(self, *args, **kwargs):
+            raise AssertionError("no token may be issued")
+
+    class Detector:
+        async def detect(self, request):
+            return (
+                OrientationDecision(
+                    1, OrthogonalAngle.DEG_0, 0.99, "paddle_orientation", True
+                ),
+                OrientationDecision(
+                    2, OrthogonalAngle.DEG_270, 0.79, "paddle_uncertain", False
+                ),
+            )
+
+    gateway = ProductionDocumentGateway(
+        intake=SimpleNamespace(),
+        uploads=SimpleNamespace(
+            get=lambda *_: _async_value(SimpleNamespace(page_count=2))
+        ),
+        tasks=SimpleNamespace(
+            get_batch=lambda *_: _async_value(batch),
+            list_batch_files=lambda *_: _async_value((file,)),
+        ),
+        orchestration=SimpleNamespace(),
+        artifacts=SimpleNamespace(
+            list_for_batch=lambda *_: _async_value((artifact,))
+        ),
+        recovery=SimpleNamespace(),
+        orientation_issuer=Orientation(),
+        orientation_detector=Detector(),
+        now_factory=lambda: NOW,
+    )
+
     status = await gateway.get_task_status(batch_id)
-    assert status.files[0].recovery_token == "or_" + "a" * 64
+    assert status.files[0].recovery_token is None
