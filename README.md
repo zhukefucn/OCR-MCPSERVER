@@ -3,8 +3,9 @@
 Python 3.11 OCR service for Ubuntu Server. The repository contains the durable
 SQLite task model, bounded orchestration and secondary-OCR workers, REST and MCP
 transports, artifact handling, orientation recovery, health endpoints, safe
-logging, and Prometheus metrics. The container intentionally excludes the heavy
-MinerU and Paddle runtime dependencies until their deployment task composes them.
+logging, and Prometheus metrics. Heavy OCR dependencies remain isolated in
+separate pinned Paddle and MinerU image targets so CPU-only clients do not install
+CUDA, vLLM, or PaddleOCR-VL.
 REST 与 MCP 共享同一服务层（services），业务状态转换不绑定到传输协议。
 项目已从最初的仓库骨架发展为经过测试的服务实现。
 
@@ -133,9 +134,45 @@ constructor intentionally omits the CPU-only `enable_mkldnn` option. Perform
 the real image build and smoke on the approved RTX 5090 Ubuntu host before
 assigning an immutable tag.
 
+## MinerU API and VLM images
+
+The `mineru` profile builds two internal-only services. `mineru-api` pins
+`mineru==3.2.0` and exposes a fixed-policy facade to the loopback official API.
+Only `vlm-http-client` with `http://mineru-vlm:30000` is accepted; callers cannot
+select a backend or VLM endpoint. `mineru-vlm` pins
+`vllm/vllm-openai:v0.11.2` plus `mineru[core]==3.2.0`, reserves one NVIDIA GPU,
+and starts with `--gpu-memory-utilization 0.45`.
+
+Place the controller-verified MinerU model snapshot in
+`models/mineru-vlm/`. Compose mounts it read-only at `/models/mineru-vlm`, and
+the explicit `--model /models/mineru-vlm` command prevents startup-time model
+selection or download. Record and verify the snapshot manifest and SHA-256
+before startup. Neither MinerU service publishes a host port.
+
+On the approved Ubuntu GPU host, the controller-owned validation sequence is:
+
+```bash
+docker compose --profile mineru build mineru-vlm mineru-api
+docker compose --profile mineru up -d mineru-vlm mineru-api
+docker compose --profile mineru ps
+docker compose --profile mineru exec mineru-vlm \
+  python /app/scripts/smoke_mineru.py
+```
+
+The smoke verifies exact package versions, one CUDA 12.0-capable visible GPU,
+both health surfaces, a loaded VLM model, and one synthetic PDF task whose ZIP
+contains bounded non-empty Markdown. It emits only version, capability, and
+result-count fields. Run this immediately after the remote build; assign
+immutable Git-SHA image tags only after it succeeds.
+
 ## 远程 Ubuntu 容器验证
 
-当前容器镜像仅包含 FastAPI 网关，不包含 MinerU 或 Paddle 推理依赖。本机只运行测试，不执行 Docker 镜像构建；尚未在远程 Ubuntu 完成构建和启动验证。
+本机只运行测试和静态门禁，不执行 GPU Docker 镜像构建。Paddle 与
+MinerU/vLLM 使用独立镜像目标；在远程 Ubuntu 完成构建、启动和 smoke
+验证前，不得给候选镜像固定版本。
+尚未在远程 Ubuntu 完成构建和启动验证。
+默认 `ocr-gateway` 镜像仅包含 FastAPI 网关，不包含 MinerU 或 Paddle 推理依赖；
+推理依赖只存在于对应 profile 的独立镜像中。
 
 代码同步到 Ubuntu Server 后，在仓库根目录执行：
 

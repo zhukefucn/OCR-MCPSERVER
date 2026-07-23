@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import importlib.util
 from hashlib import sha256
+from io import BytesIO
 import json
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from zipfile import ZipFile
 
+import httpx
 import pytest
 import yaml
 
@@ -22,6 +25,147 @@ def _load_smoke_module() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_mineru_smoke_module() -> ModuleType:
+    path = REPOSITORY_ROOT / "scripts" / "smoke_mineru.py"
+    spec = importlib.util.spec_from_file_location("smoke_mineru", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_mineru_smoke_synthetic_pdf_is_parseable() -> None:
+    from pypdf import PdfReader
+
+    smoke = _load_mineru_smoke_module()
+    pdf = smoke.synthetic_pdf()
+    document = PdfReader(BytesIO(pdf))
+
+    assert len(document.pages) == 1
+    stream = pdf.split(b"stream\n", 1)[1].split(b"\nendstream", 1)[0] + b"\n"
+    declared_length = int(pdf.split(b"/Length ", 1)[1].split(b" ", 1)[0])
+    assert declared_length == len(stream)
+
+
+@pytest.mark.asyncio
+async def test_mineru_smoke_checks_versions_cuda_services_and_zip_markdown() -> None:
+    smoke = _load_mineru_smoke_module()
+    seen: list[tuple[str, str]] = []
+    zip_buffer = BytesIO()
+    with ZipFile(zip_buffer, "w") as archive:
+        archive.writestr("result.md", "synthetic result")
+
+    async def handler(request):
+        seen.append((request.method, request.url.path))
+        if request.url.host == "mineru-vlm" and request.url.path == "/health":
+            return httpx.Response(200)
+        if request.url.host == "mineru-vlm" and request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "fixed-model"}]})
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"})
+        if request.method == "POST":
+            body = await request.aread()
+            assert b"vlm-http-client" in body
+            assert b"http://mineru-vlm:30000" in body
+            return httpx.Response(
+                202,
+                json={
+                    "task_id": "task-1",
+                    "status_url": "http://mineru-api:8000/tasks/task-1",
+                    "result_url": "http://mineru-api:8000/tasks/task-1/result",
+                },
+            )
+        if request.url.path == "/tasks/task-1":
+            return httpx.Response(200, json={"status": "completed"})
+        return httpx.Response(
+            200,
+            content=zip_buffer.getvalue(),
+            headers={"content-type": "application/zip"},
+        )
+
+    summary = await smoke.run_smoke(
+        api_base_url="http://mineru-api:8000",
+        vlm_base_url="http://mineru-vlm:30000",
+        package_version=lambda name: {"mineru": "3.2.0", "vllm": "0.11.2"}[name],
+        cuda_capability=lambda: (12, 0),
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert summary == {
+        "mineru_version": "3.2.0",
+        "vllm_version": "0.11.2",
+        "cuda_capability": "12.0",
+        "result_count": 1,
+    }
+    assert ("POST", "/tasks") in seen
+    assert ("GET", "/tasks/task-1/result") in seen
+
+
+@pytest.mark.asyncio
+async def test_mineru_smoke_rejects_wrong_cuda_capability() -> None:
+    smoke = _load_mineru_smoke_module()
+
+    with pytest.raises(smoke.SmokeFailure, match="cuda_capability"):
+        await smoke.run_smoke(
+            api_base_url="http://mineru-api:8000",
+            vlm_base_url="http://mineru-vlm:30000",
+            package_version=lambda name: {
+                "mineru": "3.2.0",
+                "vllm": "0.11.2",
+            }[name],
+            cuda_capability=lambda: (8, 9),
+            transport=httpx.MockTransport(lambda request: httpx.Response(500)),
+        )
+
+
+@pytest.mark.parametrize(
+    ("status_url", "result_url"),
+    (
+        (
+            "http://attacker.invalid/tasks/task-1",
+            "http://mineru-api:8000/tasks/task-1/result",
+        ),
+        (
+            "http://mineru-api:8000/tasks/other",
+            "http://mineru-api:8000/tasks/task-1/result",
+        ),
+        (
+            "http://mineru-api:8000/tasks/task-1",
+            "http://mineru-api:8000/tasks/task-1/result/extra",
+        ),
+    ),
+)
+def test_mineru_smoke_rejects_noncanonical_task_urls(
+    status_url: str, result_url: str
+) -> None:
+    smoke = _load_mineru_smoke_module()
+
+    with pytest.raises(smoke.SmokeFailure, match="task_submit"):
+        smoke.validate_task_urls(
+            api_base_url="http://mineru-api:8000",
+            task_id="task-1",
+            status_url=status_url,
+            result_url=result_url,
+        )
+
+
+def test_mineru_smoke_rejects_zip_member_count_and_markdown_expansion() -> None:
+    smoke = _load_mineru_smoke_module()
+    too_many = BytesIO()
+    with ZipFile(too_many, "w") as archive:
+        for index in range(smoke.MAX_ZIP_MEMBERS + 1):
+            archive.writestr(f"entry-{index}.txt", b"x")
+        archive.writestr("result.md", b"valid")
+    with pytest.raises(smoke.SmokeFailure, match="task_result"):
+        smoke.validate_result_zip(too_many.getvalue())
+
+    expanded = BytesIO()
+    with ZipFile(expanded, "w") as archive:
+        archive.writestr("result.md", b"x" * (smoke.MAX_MARKDOWN_BYTES + 1))
+    with pytest.raises(smoke.SmokeFailure, match="task_result"):
+        smoke.validate_result_zip(expanded.getvalue())
 
 
 REQUIRED_MODEL_NODES = (

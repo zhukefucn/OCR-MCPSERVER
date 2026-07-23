@@ -150,6 +150,8 @@ def test_compose_keeps_the_minimal_gateway_and_adds_ppstructure_profiles() -> No
         "ocr-gateway",
         "ocr-gateway-ppstructure-cpu",
         "ocr-gateway-ppstructure-gpu",
+        "mineru-api",
+        "mineru-vlm",
     }
     assert set(compose["volumes"]) == {"ocr-data"}
 
@@ -205,6 +207,56 @@ def test_compose_keeps_the_minimal_gateway_and_adds_ppstructure_profiles() -> No
     assert gpu_gateway["restart"] == "unless-stopped"
 
 
+def test_mineru_images_are_pinned_fixed_and_offline() -> None:
+    api = _read_text("docker/mineru-api.Dockerfile")
+    vlm = _read_text("docker/mineru-vlm.Dockerfile")
+    combined = f"{api}\n{vlm}".lower()
+
+    assert "mineru==3.2.0" in api
+    assert "scripts/mineru_fixed_api.py" in api
+    assert '["python", "/app/scripts/mineru_fixed_api.py"]' in api
+    assert "vllm/vllm-openai:v0.11.2" in vlm
+    assert "mineru[core]==3.2.0" in vlm
+    assert "mineru-openai-server" in vlm
+    assert "--engine" in vlm and "vllm" in vlm
+    assert "--gpu-memory-utilization" in vlm and "0.45" in vlm
+    assert "--model" in vlm
+    assert "/models/mineru-vlm" in vlm
+    assert ":latest" not in combined
+    assert ">=" not in combined
+    assert "models-download" not in combined
+
+
+def test_mineru_compose_is_internal_fixed_and_least_privilege() -> None:
+    compose = _compose_config()
+    api = compose["services"]["mineru-api"]
+    vlm = compose["services"]["mineru-vlm"]
+
+    assert api["profiles"] == ["mineru"]
+    assert vlm["profiles"] == ["mineru"]
+    assert "ports" not in api
+    assert "ports" not in vlm
+    assert api["networks"] == ["ocr-internal"]
+    assert vlm["networks"] == ["ocr-internal"]
+    assert compose["networks"]["ocr-internal"] == {"internal": True}
+    assert api["environment"] == {
+        "MINERU_FIXED_BACKEND": "vlm-http-client",
+        "MINERU_FIXED_VLM_URL": "http://mineru-vlm:30000",
+        "MINERU_UPSTREAM_URL": "http://127.0.0.1:8001",
+    }
+    assert "/models/mineru-vlm:ro" in vlm["volumes"][0]
+    assert vlm["shm_size"] == "4gb"
+    assert vlm.get("ipc") != "host"
+    assert vlm["deploy"]["resources"]["reservations"]["devices"] == [
+        {"driver": "nvidia", "count": 1, "capabilities": ["gpu"]}
+    ]
+    for service in (api, vlm):
+        assert service.get("privileged") is not True
+        assert service.get("network_mode") != "host"
+        assert "/var/run/docker.sock" not in str(service)
+    assert "--allow-public-http-client" not in str(api)
+
+
 def test_compose_grants_only_the_gpu_profile_one_nvidia_device() -> None:
     services = _compose_config()["services"]
     gpu_gateway = services["ocr-gateway-ppstructure-gpu"]
@@ -228,7 +280,7 @@ def test_compose_grants_only_the_gpu_profile_one_nvidia_device() -> None:
         assert gateway.get("privileged") is not True
         assert gateway.get("network_mode") != "host"
         assert "/var/run/docker.sock" not in str(gateway)
-        if name != "ocr-gateway-ppstructure-gpu":
+        if name not in {"ocr-gateway-ppstructure-gpu", "mineru-vlm"}:
             assert "gpus" not in gateway
             assert "devices" not in gateway
             assert "deploy" not in gateway

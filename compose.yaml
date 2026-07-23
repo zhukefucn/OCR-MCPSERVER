@@ -62,5 +62,61 @@ services:
     init: true
     restart: unless-stopped
 
+  mineru-api:
+    profiles:
+      - mineru
+    build:
+      context: .
+      dockerfile: docker/mineru-api.Dockerfile
+    image: ocr-mcp-server:mineru-api-dev
+    environment:
+      MINERU_FIXED_BACKEND: vlm-http-client
+      MINERU_FIXED_VLM_URL: http://mineru-vlm:30000
+      MINERU_UPSTREAM_URL: http://127.0.0.1:8001
+    networks:
+      - ocr-internal
+    depends_on:
+      mineru-vlm:
+        condition: service_healthy
+    init: true
+    restart: unless-stopped
+
+  mineru-vlm:
+    profiles:
+      - mineru
+    build:
+      context: .
+      dockerfile: docker/mineru-vlm.Dockerfile
+    image: ocr-mcp-server:mineru-vlm-dev
+    volumes:
+      - ./models/mineru-vlm:/models/mineru-vlm:ro
+    shm_size: 4gb
+    networks:
+      - ocr-internal
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:30000/health', timeout=3).read()"
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 10
+    init: true
+    restart: unless-stopped
+
 volumes:
   ocr-data:
+
+networks:
+  ocr-internal:
+    internal: true
