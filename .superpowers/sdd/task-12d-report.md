@@ -454,5 +454,34 @@ untouched by the app.
 - `pip check` reports no broken requirements, `compileall` exits 0, and
   `git diff --check` exits 0 with informational Windows LF/CRLF notices only.
 
+## REST route-test lifespan isolation
+
+The REST contract tests previously used `with TestClient(...)` for each route
+assertion, so every small test entered and exited the complete FastMCP lifespan.
+That topology is unlike production and could leave pytest teardown waiting on
+FastMCP after the test itself had already passed on Ubuntu.
+
+The shared route client is now a context manager that constructs and closes the
+TestClient transport without invoking its lifespan context. All route, auth,
+validation, observability, and exception-containment assertions use this helper;
+the two exception-containment tests retain `raise_server_exceptions=True`.
+Exactly one REST integration test deliberately enters a real app lifespan and
+executes 100 representative upload, parse, status, and orientation-reparse
+requests before exiting.
+
+### Regression and verification evidence
+
+- RED: the helper regression observed `entered is True` under the old helper,
+  proving that a route-only request started the app lifespan.
+- GREEN: the same regression passes with `entered is False`.
+- REST file: `16 passed in 2.28s` using basetemp
+  `.pytest-tmp/rest-route-only`.
+- Updated Task 12 focused set: `294 passed in 11.38s` using basetemp
+  `.pytest-tmp/rest-refactor-focused`.
+- Updated complete isolated suite: `1017 passed, 20 skipped in 21.61s` using
+  basetemp `.pytest-tmp/rest-refactor-full`.
+- `pip check` reports no broken requirements, `compileall` exits 0, and
+  `git diff --check` exits 0 with informational Windows LF/CRLF notices only.
+
 No push, sync, image build, deployment, production fault control, heavy dependency,
 or new telemetry backend was added.

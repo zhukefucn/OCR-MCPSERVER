@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -114,11 +115,52 @@ class FakeGateway:
         return OrientationReparseSubmission(batch_id=str(uuid4()), status="queued")
 
 
-def client(gateway: object, *, max_size: int = 30 * 1024 * 1024) -> TestClient:
+@contextmanager
+def client(
+    gateway: object,
+    *,
+    max_size: int = 30 * 1024 * 1024,
+    raise_server_exceptions: bool = False,
+) -> Iterator[TestClient]:
     settings = AppSettings(
         auth={"api_keys": [KEY]}, limits={"max_file_size_bytes": max_size}
     )
-    return TestClient(create_app(settings, gateway=gateway), raise_server_exceptions=False)
+    api = TestClient(
+        create_app(settings, gateway=gateway),
+        raise_server_exceptions=raise_server_exceptions,
+    )
+    try:
+        yield api
+    finally:
+        api.close()
+
+
+def test_route_client_helper_does_not_enter_app_lifespan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = False
+    original_create_app = create_app
+
+    def instrumented_create_app(*args, **kwargs):
+        nonlocal entered
+        app = original_create_app(*args, **kwargs)
+
+        @asynccontextmanager
+        async def observed_lifespan(application):
+            nonlocal entered
+            del application
+            entered = True
+            yield
+
+        app.router.lifespan_context = observed_lifespan
+        return app
+
+    monkeypatch.setattr(f"{__name__}.create_app", instrumented_create_app)
+    with client(FakeGateway()) as api:
+        response = api.get("/health/live")
+
+    assert response.status_code == 200
+    assert entered is False
 
 
 def test_binary_upload_streams_to_gateway_and_returns_receipt() -> None:
@@ -309,16 +351,8 @@ def test_gateway_failures_map_to_stable_safe_http_errors() -> None:
 
 
 def test_unexpected_gateway_exception_is_contained_at_the_route_boundary() -> None:
-    settings = AppSettings(auth={"api_keys": [KEY]})
-    api = TestClient(
-        create_app(
-            settings,
-            gateway=FakeGateway(
-                failure=RuntimeError("recognized private business text")
-            ),
-        )
-    )
-    with api:
+    gateway = FakeGateway(failure=RuntimeError("recognized private business text"))
+    with client(gateway, raise_server_exceptions=True) as api:
         response = api.get(f"/v1/tasks/{uuid4()}", headers=AUTH)
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "internal_error"
@@ -340,8 +374,7 @@ def test_gateway_response_validation_is_contained_before_fastapi_serialization()
                 "recognized_text": "SENSITIVE_GATEWAY_OUTPUT",
             }
 
-    settings = AppSettings(auth={"api_keys": [KEY]})
-    with TestClient(create_app(settings, gateway=LeakyGateway())) as api:
+    with client(LeakyGateway(), raise_server_exceptions=True) as api:
         response = api.get(f"/v1/tasks/{uuid4()}", headers=AUTH)
     assert response.status_code == 500
     assert response.json()["error"] == {
@@ -365,3 +398,43 @@ def test_rest_reparse_rejects_non_integer_page_types_before_gateway(
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "invalid_request"
     assert gateway.reparse_request is None
+
+
+def test_one_real_lifespan_handles_many_representative_rest_requests() -> None:
+    gateway = FakeGateway()
+    settings = AppSettings(auth={"api_keys": [KEY]})
+
+    with TestClient(
+        create_app(settings, gateway=gateway),
+        raise_server_exceptions=False,
+    ) as api:
+        for index in range(25):
+            file_id = str(uuid4())
+            responses = (
+                api.post(
+                    "/v1/uploads",
+                    headers={
+                        **AUTH,
+                        "Content-Type": "application/pdf",
+                        "X-Document-Name": f"statement-{index}.pdf",
+                    },
+                    content=b"%PDF-safe-test",
+                ),
+                api.post(
+                    "/v1/tasks",
+                    headers=AUTH,
+                    json={"sources": [{"file_id": file_id}]},
+                ),
+                api.get(f"/v1/tasks/{uuid4()}", headers=AUTH),
+                api.post(
+                    "/v1/orientation-reparse",
+                    headers=AUTH,
+                    json={"recovery_token": "opaque-token_123", "pages": [1]},
+                ),
+            )
+            assert tuple(response.status_code for response in responses) == (
+                201,
+                202,
+                200,
+                202,
+            )
