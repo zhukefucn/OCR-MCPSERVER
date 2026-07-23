@@ -300,6 +300,9 @@ async def test_gateway_projects_internal_artifact_id_to_public_uuid() -> None:
     )
     status = await gateway.get_task_status(batch_id)
     assert str(uuid4()).count("-") == status.artifacts[0].artifact_id.count("-")
+    assert str(status.artifacts[0].download_url).endswith(
+        f"/{status.artifacts[0].artifact_id}"
+    )
 
 
 async def _async_value(value):

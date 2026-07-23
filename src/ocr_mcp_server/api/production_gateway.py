@@ -202,7 +202,8 @@ class ProductionDocumentGateway:
                     ArtifactReference(
                         artifact_id=public_artifact_id(item.artifact_id),
                         download_url=(
-                            f"{self._artifact_base_url}/{item.artifact_id}"
+                            f"{self._artifact_base_url}/"
+                            f"{public_artifact_id(item.artifact_id)}"
                         ),
                         expires_at=item.expires_at,
                     )
