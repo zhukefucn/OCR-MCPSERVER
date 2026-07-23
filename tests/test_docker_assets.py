@@ -217,6 +217,7 @@ def test_mineru_images_are_pinned_fixed_and_offline() -> None:
     assert '["python", "/app/scripts/mineru_fixed_api.py"]' in api
     assert "vllm/vllm-openai:v0.11.2" in vlm
     assert "mineru[core]==3.2.0" in vlm
+    assert "python3 -m pip install" in vlm
     assert "mineru-openai-server" in vlm
     assert "--engine" in vlm and "vllm" in vlm
     assert "--gpu-memory-utilization" in vlm and "0.45" in vlm

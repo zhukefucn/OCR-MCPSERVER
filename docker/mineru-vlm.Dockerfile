@@ -14,7 +14,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python -m pip install --index-url https://pypi.org/simple "mineru[core]==3.2.0"
+    python3 -m pip install --index-url https://pypi.org/simple "mineru[core]==3.2.0"
 
 COPY scripts/smoke_mineru.py /app/scripts/smoke_mineru.py
 
