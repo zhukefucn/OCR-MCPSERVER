@@ -243,12 +243,19 @@ class OrientationAssessmentRecord(Base):
         ),
         CheckConstraint(
             "(state = 'ready' AND length(suspected_pages) > 0 "
-            "AND error_code IS NULL) OR "
+            "AND error_code IS NULL AND claim_token IS NULL "
+            "AND lease_expires_at IS NULL) OR "
             "(state IN ('detecting', 'no_suspicion') "
-            "AND suspected_pages = '' AND error_code IS NULL) OR "
+            "AND suspected_pages = '' AND error_code IS NULL "
+            "AND ((state = 'detecting' AND claim_token IS NOT NULL "
+            "AND lease_expires_at IS NOT NULL) OR "
+            "(state = 'no_suspicion' AND claim_token IS NULL "
+            "AND lease_expires_at IS NULL))) OR "
             "(state = 'failed' AND suspected_pages = '' "
-            "AND error_code IS NOT NULL)"
+            "AND error_code IS NOT NULL AND claim_token IS NULL "
+            "AND lease_expires_at IS NULL)"
         ),
+        CheckConstraint("attempt_count >= 0"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -263,6 +270,11 @@ class OrientationAssessmentRecord(Base):
     state: Mapped[str] = mapped_column(String(24), nullable=False)
     suspected_pages: Mapped[str] = mapped_column(String(2048), nullable=False)
     error_code: Mapped[str | None] = mapped_column(String(64))
+    claim_token: Mapped[str | None] = mapped_column(String(64), unique=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )

@@ -49,6 +49,8 @@ def test_settings_defaults_match_domain_constraints() -> None:
         settings.secondary_ocr.orientation_model_name
         == "PP-LCNet_x1_0_doc_ori"
     )
+    assert settings.secondary_ocr.orientation_assessment_timeout_seconds == 90
+    assert settings.secondary_ocr.orientation_assessment_lease_seconds == 100
     assert settings.structured_content.max_utf8_bytes >= settings.structured_content.max_characters
     assert settings.structured_content.max_html_elements >= settings.structured_content.max_table_cells
     assert settings.structured_content.max_artifact_bytes >= settings.structured_content.max_utf8_bytes
@@ -341,7 +343,9 @@ def test_secondary_ocr_settings_load_from_yaml_and_environment(
         "  paddlex_config: /models/pipeline.yaml\n"
         "  formula_model_name: PP-FormulaNet_plus-M\n"
         "  orientation_model_dir: /models/doc-orientation\n"
-        "  orientation_model_name: Trusted-Doc-Ori\n",
+        "  orientation_model_name: Trusted-Doc-Ori\n"
+        "  orientation_assessment_timeout_seconds: 40\n"
+        "  orientation_assessment_lease_seconds: 50\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("OCR_SECONDARY_OCR__DEVICE", "gpu")
@@ -356,6 +360,8 @@ def test_secondary_ocr_settings_load_from_yaml_and_environment(
     assert settings.formula_model_name == "PP-FormulaNet_plus-M"
     assert settings.orientation_model_dir == Path("/models/doc-orientation")
     assert settings.orientation_model_name == "Trusted-Doc-Ori"
+    assert settings.orientation_assessment_timeout_seconds == 40
+    assert settings.orientation_assessment_lease_seconds == 50
 
 
 def test_secondary_ocr_settings_accept_explicit_first_gpu() -> None:
@@ -378,6 +384,8 @@ def test_secondary_ocr_settings_accept_explicit_first_gpu() -> None:
         ("classification_threshold", float("nan")),
         ("formula_model_name", ""),
         ("orientation_model_name", ""),
+        ("orientation_assessment_timeout_seconds", 0),
+        ("orientation_assessment_lease_seconds", 0),
         ("unexpected_runtime_option", True),
     ],
 )
@@ -399,6 +407,26 @@ def test_example_yaml_documents_secondary_ocr_deployment_defaults() -> None:
     assert settings.formula_model_name == "PP-FormulaNet_plus-S"
     assert settings.orientation_model_dir is None
     assert settings.orientation_model_name == "PP-LCNet_x1_0_doc_ori"
+    assert settings.orientation_assessment_timeout_seconds == 90
+    assert settings.orientation_assessment_lease_seconds == 100
+
+
+def test_orientation_assessment_timeout_lease_and_task_lease_are_ordered() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(
+            secondary_ocr={
+                "orientation_assessment_timeout_seconds": 10,
+                "orientation_assessment_lease_seconds": 10,
+            }
+        )
+    with pytest.raises(ValidationError):
+        AppSettings(
+            secondary_ocr={
+                "orientation_assessment_timeout_seconds": 10,
+                "orientation_assessment_lease_seconds": 30,
+            },
+            orchestration={"lease_seconds": 30, "heartbeat_seconds": 5},
+        )
 
 
 @pytest.mark.parametrize(

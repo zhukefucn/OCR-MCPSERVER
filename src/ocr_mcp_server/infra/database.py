@@ -48,6 +48,7 @@ async def initialize_schema(engine: AsyncEngine) -> None:
         await connection.run_sync(Base.metadata.create_all)
         await connection.run_sync(_migrate_batch_source_fingerprint)
         await connection.run_sync(_migrate_orientation_takeover_columns)
+        await connection.run_sync(_migrate_orientation_assessment_claim_columns)
 
 
 def _migrate_batch_source_fingerprint(connection) -> None:
@@ -86,3 +87,31 @@ def _migrate_orientation_takeover_columns(connection) -> None:
             connection.exec_driver_sql(
                 f"ALTER TABLE orientation_recoveries ADD COLUMN {name} {column_type}"
             )
+
+
+def _migrate_orientation_assessment_claim_columns(connection) -> None:
+    """Add bounded claim ownership to databases created before Task 13E."""
+
+    existing = {
+        row[1]
+        for row in connection.exec_driver_sql(
+            "PRAGMA table_info(orientation_assessments)"
+        )
+    }
+    additions = {
+        "claim_token": "VARCHAR(64)",
+        "lease_expires_at": "DATETIME",
+        "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, column_type in additions.items():
+        if name not in existing:
+            connection.exec_driver_sql(
+                f"ALTER TABLE orientation_assessments "
+                f"ADD COLUMN {name} {column_type}"
+            )
+    connection.exec_driver_sql(
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "ux_orientation_assessment_claim_token "
+        "ON orientation_assessments(claim_token) "
+        "WHERE claim_token IS NOT NULL"
+    )

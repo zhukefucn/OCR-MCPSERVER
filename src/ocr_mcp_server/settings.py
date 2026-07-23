@@ -195,8 +195,16 @@ class SecondaryOCRSettings(_SettingsSection):
     formula_model_name: str = "PP-FormulaNet_plus-S"
     orientation_model_dir: Path | None = None
     orientation_model_name: str = "PP-LCNet_x1_0_doc_ori"
+    orientation_assessment_timeout_seconds: float = Field(default=90, gt=0)
+    orientation_assessment_lease_seconds: int = Field(default=100, ge=1)
 
-    @field_validator("queue_capacity", "classification_threshold", mode="before")
+    @field_validator(
+        "queue_capacity",
+        "classification_threshold",
+        "orientation_assessment_timeout_seconds",
+        "orientation_assessment_lease_seconds",
+        mode="before",
+    )
     @classmethod
     def reject_boolean_numeric_values(cls, value: object) -> object:
         if isinstance(value, bool):
@@ -210,6 +218,18 @@ class SecondaryOCRSettings(_SettingsSection):
         if not identity:
             raise ValueError("model identity is required")
         return identity
+
+    @model_validator(mode="after")
+    def validate_orientation_assessment_bounds(self) -> SecondaryOCRSettings:
+        if (
+            not math.isfinite(self.orientation_assessment_timeout_seconds)
+            or self.orientation_assessment_timeout_seconds
+            >= self.orientation_assessment_lease_seconds
+        ):
+            raise ValueError(
+                "orientation assessment timeout must be shorter than its lease"
+            )
+        return self
 
 
 class StructuredContentSettings(_SettingsSection):
@@ -372,6 +392,17 @@ class AppSettings(BaseSettings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     orchestration: OrchestrationSettings = Field(default_factory=OrchestrationSettings)
     health: HealthSettings = Field(default_factory=HealthSettings)
+
+    @model_validator(mode="after")
+    def validate_orientation_lease_below_task_lease(self) -> AppSettings:
+        if (
+            self.secondary_ocr.orientation_assessment_lease_seconds
+            >= self.orchestration.lease_seconds
+        ):
+            raise ValueError(
+                "orientation assessment lease must be shorter than task lease"
+            )
+        return self
 
     @classmethod
     def settings_customise_sources(

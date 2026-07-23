@@ -791,6 +791,7 @@ async def test_metadata_remains_until_exact_30_day_boundary_then_purges_all_task
         result_version=2,
         page_count=1,
         now=NOW,
+        lease_seconds=10,
     )
     await _insert_artifact(sessions, batch_id, file_id, with_audit=True)
     assert await tasks.claim_next("pipeline", now=NOW, lease_seconds=60) is not None

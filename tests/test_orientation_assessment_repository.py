@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import text
 
 from ocr_mcp_server.api.production_gateway import ProductionDocumentGateway
 from ocr_mcp_server.domain.models import (
@@ -54,14 +55,15 @@ async def test_assessment_is_claimed_once_and_survives_repository_restart(
                     result_version=2,
                     page_count=4,
                     now=NOW,
+                    lease_seconds=10,
                 )
                 for _ in range(4)
             )
         )
-        assert claims.count(True) == 1
+        claimed = [claim for claim in claims if claim is not None]
+        assert len(claimed) == 1
         await first.complete(
-            file_id=file_id,
-            result_version=2,
+            claimed[0],
             suspected_pages=(4, 2),
             now=NOW,
         )
@@ -78,8 +80,9 @@ async def test_assessment_is_claimed_once_and_survives_repository_restart(
                 result_version=2,
                 page_count=4,
                 now=NOW,
+                lease_seconds=10,
             )
-            is False
+            is None
         )
 
         class Issuer:
@@ -150,29 +153,31 @@ async def test_no_suspicion_and_failure_are_content_free_terminal_states(
     first_id, second_id = str(uuid4()), str(uuid4())
     created = await tasks.create_batch(str(uuid4()), [first_id, second_id])
     try:
-        assert await repo.begin(
+        first_claim = await repo.begin(
             file_id=first_id,
             batch_id=created.batch.id,
             result_version=2,
             page_count=1,
             now=NOW,
+            lease_seconds=10,
         )
+        assert first_claim is not None
         await repo.complete(
-            file_id=first_id,
-            result_version=2,
+            first_claim,
             suspected_pages=(),
             now=NOW,
         )
-        assert await repo.begin(
+        second_claim = await repo.begin(
             file_id=second_id,
             batch_id=created.batch.id,
             result_version=2,
             page_count=1,
             now=NOW,
+            lease_seconds=10,
         )
+        assert second_claim is not None
         await repo.fail(
-            file_id=second_id,
-            result_version=2,
+            second_claim,
             error_code="orientation_detection_failed",
             now=NOW,
         )
@@ -186,5 +191,130 @@ async def test_no_suspicion_and_failure_are_content_free_terminal_states(
         assert failed.state is OrientationAssessmentState.FAILED
         assert failed.suspected_pages == ()
         assert "secret" not in repr((no_suspicion, failed))
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stale_detection_is_taken_over_and_old_worker_cannot_write(
+    tmp_path: Path,
+) -> None:
+    engine = create_database_engine(_database_url(tmp_path / "takeover.sqlite3"))
+    await initialize_schema(engine)
+    sessions = create_session_factory(engine)
+    tasks = TaskRepository(sessions)
+    file_id = str(uuid4())
+    created = await tasks.create_batch(str(uuid4()), [file_id])
+    first_process = OrientationAssessmentRepository(sessions)
+    restarted = OrientationAssessmentRepository(create_session_factory(engine))
+    try:
+        old_claim = await first_process.begin(
+            file_id=file_id,
+            batch_id=created.batch.id,
+            result_version=2,
+            page_count=2,
+            now=NOW,
+            lease_seconds=5,
+        )
+        assert old_claim is not None
+        assert (
+            await restarted.begin(
+                file_id=file_id,
+                batch_id=created.batch.id,
+                result_version=2,
+                page_count=2,
+                now=NOW + timedelta(seconds=4),
+                lease_seconds=5,
+            )
+            is None
+        )
+        new_claim = await restarted.begin(
+            file_id=file_id,
+            batch_id=created.batch.id,
+            result_version=2,
+            page_count=2,
+            now=NOW + timedelta(seconds=5),
+            lease_seconds=5,
+        )
+        assert new_claim is not None
+        assert new_claim.claim_token != old_claim.claim_token
+        with pytest.raises(Exception) as stale:
+            await first_process.complete(
+                old_claim,
+                suspected_pages=(1,),
+                now=NOW + timedelta(seconds=5),
+            )
+        assert getattr(stale.value, "code", None) == "orientation_request_conflict"
+        completed = await restarted.complete(
+            new_claim,
+            suspected_pages=(2,),
+            now=NOW + timedelta(seconds=6),
+        )
+        assert completed.suspected_pages == (2,)
+        assert completed.attempt_count == 2
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_legacy_assessment_schema_adds_claim_columns_and_null_claim_is_stale(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-assessment.sqlite3"
+    engine = create_database_engine(_database_url(path))
+    await initialize_schema(engine)
+    sessions = create_session_factory(engine)
+    tasks = TaskRepository(sessions)
+    file_id = str(uuid4())
+    created = await tasks.create_batch(str(uuid4()), [file_id])
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text("DROP TABLE orientation_assessments"))
+            await connection.execute(
+                text(
+                    "CREATE TABLE orientation_assessments ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "file_id VARCHAR(512) NOT NULL,"
+                    "batch_id VARCHAR(36) NOT NULL,"
+                    "result_version INTEGER NOT NULL,"
+                    "page_count INTEGER NOT NULL,"
+                    "state VARCHAR(24) NOT NULL,"
+                    "suspected_pages VARCHAR(2048) NOT NULL,"
+                    "error_code VARCHAR(64),"
+                    "created_at DATETIME NOT NULL,"
+                    "updated_at DATETIME NOT NULL,"
+                    "UNIQUE(file_id, result_version))"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO orientation_assessments "
+                    "(file_id,batch_id,result_version,page_count,state,"
+                    "suspected_pages,error_code,created_at,updated_at) "
+                    "VALUES (:file_id,:batch_id,2,1,'detecting','',NULL,:now,:now)"
+                ),
+                {"file_id": file_id, "batch_id": created.batch.id, "now": NOW},
+            )
+        await initialize_schema(engine)
+        async with engine.connect() as connection:
+            columns = {
+                row[1]
+                for row in (
+                    await connection.exec_driver_sql(
+                        "PRAGMA table_info(orientation_assessments)"
+                    )
+                )
+            }
+        assert {"claim_token", "lease_expires_at", "attempt_count"} <= columns
+        claim = await OrientationAssessmentRepository(sessions).begin(
+            file_id=file_id,
+            batch_id=created.batch.id,
+            result_version=2,
+            page_count=1,
+            now=NOW + timedelta(seconds=1),
+            lease_seconds=5,
+        )
+        assert claim is not None
+        assert claim.attempt == 1
     finally:
         await engine.dispose()

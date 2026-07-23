@@ -199,6 +199,12 @@ def build_runtime(
         result_retention_hours=settings.retention.result_hours,
         orientation_detector=recovery_detector,
         orientation_assessments=orientation_assessments,
+        orientation_assessment_timeout_seconds=(
+            settings.secondary_ocr.orientation_assessment_timeout_seconds
+        ),
+        orientation_assessment_lease_seconds=(
+            settings.secondary_ocr.orientation_assessment_lease_seconds
+        ),
     )
     orchestration = OrchestrationService(
         tasks,

@@ -35,6 +35,29 @@ class OrientationAssessmentState(StrEnum):
     FAILED = "failed"
 
 
+@dataclass(frozen=True, slots=True)
+class OrientationAssessmentClaim:
+    file_id: str
+    result_version: int
+    claim_token: str
+    lease_expires_at: datetime
+    attempt: int
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.file_id, str)
+            or _IDENTIFIER.fullmatch(self.file_id) is None
+            or not _positive(self.result_version)
+            or not isinstance(self.claim_token, str)
+            or _IDENTIFIER.fullmatch(self.claim_token) is None
+            or not _positive(self.attempt)
+        ):
+            raise ValueError("invalid orientation assessment claim")
+        object.__setattr__(
+            self, "lease_expires_at", _aware_utc(self.lease_expires_at)
+        )
+
+
 class OrientationErrorCode(StrEnum):
     TOKEN_INVALID = "orientation_token_invalid"
     REQUEST_INVALID = "orientation_request_invalid"
@@ -183,6 +206,7 @@ class OrientationAssessmentSnapshot:
     state: OrientationAssessmentState
     suspected_pages: tuple[int, ...]
     error_code: str | None
+    attempt_count: int
     created_at: datetime
     updated_at: datetime
 
@@ -194,6 +218,11 @@ class OrientationAssessmentSnapshot:
             or not _positive(self.result_version)
             or not _positive(self.page_count)
             or not isinstance(self.state, OrientationAssessmentState)
+            or (
+                isinstance(self.attempt_count, bool)
+                or not isinstance(self.attempt_count, int)
+                or self.attempt_count < 0
+            )
         ):
             raise ValueError("invalid orientation assessment")
         pages = tuple(self.suspected_pages)

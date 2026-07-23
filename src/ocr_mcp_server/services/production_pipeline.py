@@ -44,10 +44,24 @@ class ProductionFilePipeline:
         result_retention_hours: int,
         orientation_detector=None,
         orientation_assessments=None,
+        orientation_assessment_timeout_seconds: float = 90,
+        orientation_assessment_lease_seconds: int = 100,
         collect_candidates=collect_image_candidates,
         merge_publication=merge_and_publish,
         now_factory=utc_now,
     ) -> None:
+        if (
+            isinstance(orientation_assessment_timeout_seconds, bool)
+            or not isinstance(
+                orientation_assessment_timeout_seconds, (int, float)
+            )
+            or orientation_assessment_timeout_seconds <= 0
+            or type(orientation_assessment_lease_seconds) is not int
+            or orientation_assessment_lease_seconds < 1
+            or orientation_assessment_timeout_seconds
+            >= orientation_assessment_lease_seconds
+        ):
+            raise ValueError("invalid orientation assessment bounds")
         self._uploads = uploads
         self._storage = storage
         self._mineru = mineru
@@ -61,6 +75,12 @@ class ProductionFilePipeline:
         self._result_retention_hours = result_retention_hours
         self._orientation_detector = orientation_detector
         self._orientation_assessments = orientation_assessments
+        self._orientation_assessment_timeout_seconds = (
+            orientation_assessment_timeout_seconds
+        )
+        self._orientation_assessment_lease_seconds = (
+            orientation_assessment_lease_seconds
+        )
         self._collect_candidates = collect_candidates
         self._merge_publication = merge_publication
         self._now_factory = now_factory
@@ -119,18 +139,13 @@ class ProductionFilePipeline:
                 max_image_pixels=self._max_image_pixels,
             )
             candidates = tuple(collection.candidates)
-            warned = await self._assess_orientation_once(
-                file=file,
-                page_count=upload.page_count,
-                progress=progress,
-            )
-            cancellation.checkpoint()
             await progress.report(ProcessingStage.CLASSIFYING_IMAGES)
             await progress.report(
                 ProcessingStage.RECOGNIZING_IMAGES,
                 ProgressCounters(0, len(candidates), ProgressUnit.ITEMS),
             )
             recognized = {}
+            warned = False
             for index, candidate in enumerate(candidates, start=1):
                 cancellation.checkpoint()
                 value = await self._paddle.recognize(candidate)
@@ -166,6 +181,12 @@ class ProductionFilePipeline:
                 progress=progress,
                 cancellation=cancellation,
             )
+            orientation_warning = await self._assess_orientation_once(
+                file=file,
+                page_count=upload.page_count,
+            )
+            warned = warned or orientation_warning
+            cancellation.checkpoint()
             return (
                 PipelineResult.success_with_warnings()
                 if warned
@@ -183,7 +204,7 @@ class ProductionFilePipeline:
             ) from None
 
     async def _assess_orientation_once(
-        self, *, file, page_count: int, progress
+        self, *, file, page_count: int
     ) -> bool:
         """Best-effort one-time assessment; never withhold the primary artifact."""
 
@@ -192,54 +213,53 @@ class ProductionFilePipeline:
             or self._orientation_assessments is None
         ):
             return False
-        claimed = False
+        claim = None
+        error_code = "orientation_detection_failed"
         try:
-            claimed = await self._orientation_assessments.begin(
+            claim = await self._orientation_assessments.begin(
                 file_id=file.file_id,
                 batch_id=file.batch_id,
                 result_version=2,
                 page_count=page_count,
                 now=self._now_factory(),
+                lease_seconds=self._orientation_assessment_lease_seconds,
             )
-            if not claimed:
+            if claim is None:
                 return False
-            await progress.report(
-                ProcessingStage.DETECTING_ORIENTATION,
-                ProgressCounters(0, page_count, ProgressUnit.PAGES),
-            )
-            decisions = await self._orientation_detector.detect(
-                OrientationDetectionRequest(
-                    batch_id=file.batch_id,
-                    file_id=file.file_id,
-                    page_count=page_count,
-                    pages=tuple(range(1, page_count + 1)),
-                )
-            )
+            try:
+                async with asyncio.timeout(
+                    self._orientation_assessment_timeout_seconds
+                ):
+                    decisions = await self._orientation_detector.detect(
+                        OrientationDetectionRequest(
+                            batch_id=file.batch_id,
+                            file_id=file.file_id,
+                            page_count=page_count,
+                            pages=tuple(range(1, page_count + 1)),
+                        )
+                    )
+            except TimeoutError:
+                error_code = "orientation_detection_timeout"
+                raise
             suspected_pages = tuple(
                 decision.page_number
                 for decision in decisions
                 if decision.credible and int(decision.angle) != 0
             )
             await self._orientation_assessments.complete(
-                file_id=file.file_id,
-                result_version=2,
+                claim,
                 suspected_pages=suspected_pages,
                 now=self._now_factory(),
-            )
-            await progress.report(
-                ProcessingStage.DETECTING_ORIENTATION,
-                ProgressCounters(page_count, page_count, ProgressUnit.PAGES),
             )
             return False
         except asyncio.CancelledError:
             raise
         except Exception:
-            if claimed:
+            if claim is not None:
                 try:
                     await self._orientation_assessments.fail(
-                        file_id=file.file_id,
-                        result_version=2,
-                        error_code="orientation_detection_failed",
+                        claim,
+                        error_code=error_code,
                         now=self._now_factory(),
                     )
                 except Exception:
