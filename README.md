@@ -73,6 +73,31 @@ link-local, and reserved networks.
 Build, deployment, and remote Ubuntu verification are controller-owned release
 gates; feature tasks run local tests only and do not push, sync, build, or deploy.
 
+## PP-StructureV3 CPU image
+
+The `ppstructure-cpu` profile builds a Python 3.11 gateway with exactly
+`paddlepaddle==3.3.0` and `paddleocr[doc-parser]==3.5.0`. It contains no GPU,
+vLLM, or PaddleOCR-VL runtime. Place the verified PP-StructureV3 model bundle in
+`models/pp-structure-v3/`, including `pp-structure-v3.yaml`; Compose mounts that
+directory at `/models` read-only. Record and verify the bundle manifest and its
+SHA-256 before startup. The container does not download models during startup.
+
+The controller-owned Ubuntu delivery gate uses:
+
+```bash
+docker compose --profile ppstructure-cpu build ocr-gateway-ppstructure-cpu
+docker compose --profile ppstructure-cpu up -d ocr-gateway-ppstructure-cpu
+curl -fsS http://127.0.0.1:8000/health/live
+docker compose --profile ppstructure-cpu exec ocr-gateway-ppstructure-cpu \
+  python /app/scripts/smoke_pp_structure.py --device cpu \
+  --fixture /app/scripts/fixtures/pp_structure_smoke.ppm
+```
+
+The smoke command checks exact package versions, confirms a CPU-only Paddle
+build, validates the supplied model configuration, runs one real prediction,
+and prints only version, device, and result-count fields. Remote build and
+startup validation remain a separate release step after local review.
+
 ## 远程 Ubuntu 容器验证
 
 当前容器镜像仅包含 FastAPI 网关，不包含 MinerU 或 Paddle 推理依赖。本机只运行测试，不执行 Docker 镜像构建；尚未在远程 Ubuntu 完成构建和启动验证。

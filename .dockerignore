@@ -3,6 +3,8 @@
 !README.md
 !src
 !src/**
+!scripts
+!scripts/**
 
 .git
 .github

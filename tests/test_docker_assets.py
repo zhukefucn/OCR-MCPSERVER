@@ -62,10 +62,13 @@ def _dockerfile_instructions(dockerfile: str) -> list[str]:
     return instructions
 
 
-def test_compose_defines_only_the_minimal_gateway_service() -> None:
+def test_compose_keeps_the_minimal_gateway_and_adds_the_cpu_profile() -> None:
     compose = _compose_config()
 
-    assert set(compose["services"]) == {"ocr-gateway"}
+    assert set(compose["services"]) == {
+        "ocr-gateway",
+        "ocr-gateway-ppstructure-cpu",
+    }
     assert set(compose["volumes"]) == {"ocr-data"}
 
     gateway = compose["services"]["ocr-gateway"]
@@ -83,15 +86,89 @@ def test_compose_defines_only_the_minimal_gateway_service() -> None:
     assert gateway["restart"] == "unless-stopped"
     assert "healthcheck" not in gateway
 
+    cpu_gateway = compose["services"]["ocr-gateway-ppstructure-cpu"]
+    assert cpu_gateway["profiles"] == ["ppstructure-cpu"]
+    assert cpu_gateway["build"] == {
+        "context": ".",
+        "dockerfile": "docker/ocr-gateway-ppstructure.Dockerfile",
+        "target": "ppstructure-cpu",
+    }
+    assert cpu_gateway["volumes"] == [
+        "ocr-data:/data",
+        "./config/example.yaml:/app/config/example.yaml:ro",
+        "./models/pp-structure-v3:/models:ro",
+    ]
+    assert cpu_gateway["environment"] == {
+        "OCR_SECONDARY_OCR__DEVICE": "cpu",
+        "OCR_SECONDARY_OCR__PADDLEX_CONFIG": "/models/pp-structure-v3.yaml",
+    }
+    assert cpu_gateway["ports"] == ["${OCR_GATEWAY_PORT:-8000}:8000"]
+    assert cpu_gateway["init"] is True
+    assert cpu_gateway["restart"] == "unless-stopped"
+
 
 def test_compose_does_not_grant_unneeded_host_or_gpu_access() -> None:
-    gateway = _compose_config()["services"]["ocr-gateway"]
+    for gateway in _compose_config()["services"].values():
+        assert gateway.get("privileged") is not True
+        assert gateway.get("network_mode") != "host"
+        assert "gpus" not in gateway
+        assert "devices" not in gateway
+        assert "deploy" not in gateway
+        assert "/var/run/docker.sock" not in str(gateway)
 
-    assert gateway.get("privileged") is not True
-    assert gateway.get("network_mode") != "host"
-    assert "gpus" not in gateway
-    assert "devices" not in gateway
-    assert "/var/run/docker.sock" not in str(gateway)
+
+def test_ppstructure_cpu_requirements_are_exact_and_cpu_only() -> None:
+    requirements = _read_text("docker/requirements/pp-structure-v3.txt")
+    dockerfile = _read_text("docker/ocr-gateway-ppstructure.Dockerfile")
+    combined = f"{requirements}\n{dockerfile}".lower()
+
+    assert re.search(r"^paddleocr\[doc-parser\]==3\.5\.0\s*$", requirements, re.MULTILINE)
+    assert "paddlepaddle==3.3.0" in dockerfile
+    assert "https://www.paddlepaddle.org.cn/packages/stable/cpu/" in dockerfile
+    assert "https://pypi.org/simple" in dockerfile
+    assert ">=" not in requirements
+    assert "paddlepaddle-gpu" not in combined
+    for forbidden in ("paddleocr-vl", "paddleocr_vl", "vllm", "cuda", "torch"):
+        assert forbidden not in combined
+
+
+def test_ppstructure_cpu_dockerfile_is_a_bounded_non_root_gateway_image() -> None:
+    dockerfile = _read_text("docker/ocr-gateway-ppstructure.Dockerfile")
+    normalized = dockerfile.lower()
+
+    assert re.search(
+        r"^from python:3\.11-slim-bookworm as ppstructure-cpu\s*$",
+        normalized,
+        re.MULTILINE,
+    )
+    assert "COPY pyproject.toml README.md ./" in dockerfile
+    assert "COPY src ./src" in dockerfile
+    assert "COPY scripts/smoke_pp_structure.py ./scripts/smoke_pp_structure.py" in dockerfile
+    assert "COPY scripts/fixtures/pp_structure_smoke.ppm ./scripts/fixtures/pp_structure_smoke.ppm" in dockerfile
+    assert "python -m pip install --no-cache-dir ." in dockerfile
+    assert ".[dev]" not in dockerfile
+    assert re.search(r"(?:--gid|-g)\s+10001\b", normalized)
+    assert re.search(r"(?:--uid|-u)\s+10001\b", normalized)
+    assert re.search(r"\bmkdir\s+-p\s+/data\s+/models\b", normalized)
+    assert re.findall(r"^user\s+(.+?)\s*$", normalized, re.MULTILINE)[-1] == "10001:10001"
+    assert re.search(r"^expose 8000\s*$", normalized, re.MULTILINE)
+    assert "--interval=30s" in normalized
+    assert "--timeout=5s" in normalized
+    assert "--start-period=5s" in normalized
+    assert "--retries=3" in normalized
+    healthcheck = normalized[normalized.index("healthcheck") :]
+    assert "urllib.request" in healthcheck
+    assert "http://127.0.0.1:8000/health/live" in healthcheck
+    assert "curl" not in healthcheck
+    assert "wget" not in healthcheck
+
+
+def test_ppstructure_cpu_profile_has_no_public_paddle_endpoint() -> None:
+    cpu_gateway = _compose_config()["services"]["ocr-gateway-ppstructure-cpu"]
+
+    assert cpu_gateway["ports"] == ["${OCR_GATEWAY_PORT:-8000}:8000"]
+    assert "expose" not in cpu_gateway
+    assert "30000" not in str(cpu_gateway)
 
 
 def test_gateway_dockerfile_builds_the_installed_package_as_non_root() -> None:
@@ -324,6 +401,8 @@ def test_dockerignore_excludes_local_state_and_keeps_build_inputs() -> None:
         "!README.md",
         "!src",
         "!src/**",
+        "!scripts",
+        "!scripts/**",
     ):
         assert included in patterns
 
