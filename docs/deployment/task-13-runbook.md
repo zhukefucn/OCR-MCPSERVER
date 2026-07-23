@@ -21,10 +21,9 @@ if [ -z "${OCR_VERIFY_API_KEY:-}" ]; then
   printf '\n'
 fi
 GIT_SHA="$(git rev-parse HEAD)"
-PRODUCTION_IMAGE_ID="$(
-  docker image inspect ocr-mcp-server:production-dev --format '{{.Id}}'
+RUN_ID="$(
+  python scripts/verify_deployment.py --derive-run-id --git-sha "$GIT_SHA"
 )"
-RUN_ID="${GIT_SHA}-sha256-${PRODUCTION_IMAGE_ID#sha256:}"
 python scripts/verify_deployment.py --phase static --run-id "$RUN_ID"
 python scripts/verify_deployment.py --phase runtime --run-id "$RUN_ID"
 python scripts/verify_deployment.py --phase e2e --run-id "$RUN_ID"
@@ -35,10 +34,11 @@ end-to-end, and `4` safety-boundary failure. Output is compact content-free
 JSON. The verifier never prints HTTP bodies, document text, logs, filenames,
 URLs, credentials, or OCR output and never tags an image.
 
-`RUN_ID` binds the exact Git commit and production image ID. Reuse it when
-retrying the same candidate so REST idempotency is stable. Recompute it after
-either the commit or image changes. The verifier rejects a run ID that does not
-match the currently selected production image.
+`RUN_ID` binds the exact Git commit and the canonical, sorted IDs of all three
+production Compose images (`ocr-production`, `mineru-api`, and `mineru-vlm`).
+Reuse it when retrying the same candidate so REST idempotency is stable.
+Recompute it after the commit or any image changes. The verifier rejects a run
+ID that does not match the currently selected three-image candidate.
 
 On failure, retain only the finite failure code, stop the candidate, fix it
 locally, and repeat the delivery sequence. Do not tag.

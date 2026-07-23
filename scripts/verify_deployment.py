@@ -9,13 +9,14 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Mapping
 from urllib.parse import urlsplit
 from zipfile import BadZipFile, ZipFile
 
@@ -38,7 +39,9 @@ MAX_HTTP_JSON = 2 * 1024**2
 MAX_ARTIFACT = 64 * 1024**2
 MAX_MANIFEST = 2 * 1024**2
 MAX_MEMBERS = 20_000
-RUN_ID_PATTERN = re.compile(r"^[a-f0-9]{7,40}-sha256-[a-f0-9]{64}$")
+RUN_ID_PATTERN = re.compile(r"^[a-f0-9]{7,40}-images-[a-f0-9]{64}$")
+IMAGE_ID_PATTERN = re.compile(r"^(?:sha256:)?([a-f0-9]{64})$")
+GIT_SHA_PATTERN = re.compile(r"^[a-f0-9]{7,40}$")
 EXIT_OK, EXIT_CONFIG, EXIT_RUNTIME, EXIT_E2E, EXIT_SAFETY = range(5)
 
 
@@ -62,18 +65,30 @@ def safe_event(stage: str, ok: bool, **fields: int | str | bool) -> str:
     return encoded
 
 
-def make_run_id(git_sha: str, image_id: str) -> str:
-    normalized_image = image_id.removeprefix("sha256:")
-    run_id = f"{git_sha}-sha256-{normalized_image}"
-    if not RUN_ID_PATTERN.fullmatch(run_id):
+def _candidate_digest(image_ids: Mapping[str, str]) -> str:
+    if set(image_ids) != set(DEFAULT_IMAGES):
         raise VerificationFailure("run_id", EXIT_CONFIG)
+    normalized: dict[str, str] = {}
+    for service, image_id in image_ids.items():
+        match = IMAGE_ID_PATTERN.fullmatch(image_id)
+        if match is None:
+            raise VerificationFailure("run_id", EXIT_CONFIG)
+        normalized[service] = match.group(1)
+    canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return sha256(canonical.encode("ascii")).hexdigest()
+
+
+def make_run_id(git_sha: str, image_ids: Mapping[str, str]) -> str:
+    if not GIT_SHA_PATTERN.fullmatch(git_sha):
+        raise VerificationFailure("run_id", EXIT_CONFIG)
+    run_id = f"{git_sha}-images-{_candidate_digest(image_ids)}"
     return run_id
 
 
-def validate_run_id(run_id: str, image_id: str) -> None:
+def validate_run_id(run_id: str, image_ids: Mapping[str, str]) -> None:
     if not RUN_ID_PATTERN.fullmatch(run_id):
         raise VerificationFailure("run_id", EXIT_CONFIG)
-    if run_id.rsplit("-sha256-", 1)[1] != image_id.removeprefix("sha256:"):
+    if run_id.rsplit("-images-", 1)[1] != _candidate_digest(image_ids):
         raise VerificationFailure("run_id_candidate", EXIT_CONFIG)
 
 
@@ -86,14 +101,93 @@ def idempotency_keys(run_id: str) -> tuple[str, str]:
     return upload_key, task_key
 
 
-def _stop_process(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
-    process.terminate()
+def _create_windows_job(process: subprocess.Popen[bytes]) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    class BasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", BasicLimitInformation),
+            ("IoInfo", IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise OSError(ctypes.get_last_error())
+    limits = ExtendedLimitInformation()
+    limits.BasicLimitInformation.LimitFlags = 0x00002000
+    configured = kernel32.SetInformationJobObject(
+        job, 9, ctypes.byref(limits), ctypes.sizeof(limits)
+    )
+    assigned = configured and kernel32.AssignProcessToJobObject(
+        job, wintypes.HANDLE(process._handle)
+    )
+    if not assigned:
+        kernel32.CloseHandle(job)
+        raise OSError(ctypes.get_last_error())
+    return int(job)
+
+
+def _stop_process_tree(
+    process: subprocess.Popen[bytes], windows_job: list[int]
+) -> None:
+    if os.name == "nt":
+        if windows_job:
+            import ctypes
+
+            ctypes.windll.kernel32.CloseHandle(windows_job.pop())
+        elif process.poll() is None:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
     try:
         process.wait(timeout=1)
     except subprocess.TimeoutExpired:
-        process.kill()
+        if os.name != "nt":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            process.kill()
         process.wait(timeout=1)
 
 
@@ -103,15 +197,30 @@ def _run(
     timeout: float = 30,
     max_output: int = MAX_COMMAND_OUTPUT,
 ) -> str:
+    popen_options: dict[str, Any]
+    if os.name == "nt":
+        popen_options = {
+            "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        }
+    else:
+        popen_options = {"start_new_session": True}
     try:
         process = subprocess.Popen(
             args,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            **popen_options,
         )
     except OSError:
         raise VerificationFailure("command_failed") from None
+    windows_job: list[int] = []
+    if os.name == "nt":
+        try:
+            windows_job.append(_create_windows_job(process))
+        except OSError:
+            _stop_process_tree(process, windows_job)
+            raise VerificationFailure("command_isolation") from None
 
     stdout = bytearray()
     stderr = bytearray()
@@ -143,17 +252,23 @@ def _run(
     for thread in threads:
         thread.start()
     deadline = time.monotonic() + timeout
+    failure: str | None = None
     try:
         while process.poll() is None:
             if exceeded.is_set():
-                _stop_process(process)
-                raise VerificationFailure("command_output")
+                failure = "command_output"
+                break
             if time.monotonic() >= deadline:
-                _stop_process(process)
-                raise VerificationFailure("command_timeout")
+                failure = "command_timeout"
+                break
             time.sleep(0.01)
+        _stop_process_tree(process, windows_job)
         for thread in threads:
-            thread.join(timeout=1)
+            thread.join(timeout=2)
+        if any(thread.is_alive() for thread in threads):
+            raise VerificationFailure("command_reader")
+        if failure is not None:
+            raise VerificationFailure(failure)
         if exceeded.is_set():
             raise VerificationFailure("command_output")
         if process.returncode != 0:
@@ -163,9 +278,11 @@ def _run(
         except UnicodeDecodeError:
             raise VerificationFailure("command_encoding") from None
     finally:
-        _stop_process(process)
+        _stop_process_tree(process, windows_job)
         for thread in threads:
-            thread.join(timeout=1)
+            thread.join(timeout=2)
+        if any(thread.is_alive() for thread in threads):
+            raise VerificationFailure("command_reader")
 
 
 def json_rows(text: str) -> list[dict[str, Any]]:
@@ -356,7 +473,8 @@ def validate_result_zip(
             if not infos or len(infos) > max_members:
                 raise VerificationFailure("artifact_members", EXIT_E2E)
             markdown = 0
-            total = 0
+            declared_total = 0
+            read_total = 0
             for info in infos:
                 member = PurePosixPath(info.filename)
                 if (
@@ -365,17 +483,35 @@ def validate_result_zip(
                     or info.file_size > max_bytes
                 ):
                     raise VerificationFailure("artifact_path", EXIT_E2E)
-                total += info.file_size
-                if total > max_bytes:
+                if info.is_dir():
+                    continue
+                mode = info.external_attr >> 16
+                file_type = stat.S_IFMT(mode)
+                if file_type not in (0, stat.S_IFREG):
+                    raise VerificationFailure("artifact_path", EXIT_E2E)
+                declared_total += info.file_size
+                if declared_total > max_bytes:
                     raise VerificationFailure("artifact_bound", EXIT_E2E)
+                member_total = 0
+                with archive.open(info) as member_stream:
+                    while True:
+                        chunk = member_stream.read(64 * 1024)
+                        if not chunk:
+                            break
+                        member_total += len(chunk)
+                        read_total += len(chunk)
+                        if member_total > max_bytes or read_total > max_bytes:
+                            raise VerificationFailure("artifact_bound", EXIT_E2E)
+                if member_total != info.file_size:
+                    raise VerificationFailure("artifact_zip", EXIT_E2E)
                 if member.suffix.lower() == ".md":
-                    if info.file_size <= 0:
+                    if member_total <= 0:
                         raise VerificationFailure("artifact_markdown", EXIT_E2E)
                     markdown += 1
             if markdown < 1:
                 raise VerificationFailure("artifact_markdown", EXIT_E2E)
             return markdown
-    except (BadZipFile, OSError):
+    except (BadZipFile, OSError, RuntimeError):
         raise VerificationFailure("artifact_zip", EXIT_E2E) from None
 
 
@@ -742,7 +878,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--phase", choices=("static", "runtime", "e2e", "all"), default="all"
     )
-    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--run-id")
+    parser.add_argument("--derive-run-id", action="store_true")
+    parser.add_argument("--git-sha")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument(
         "--manifest",
@@ -769,7 +907,14 @@ def main(argv: list[str] | None = None) -> int:
     api_key = os.environ.get("OCR_VERIFY_API_KEY", "")
     try:
         image_ids = candidate_image_ids(expected_images)
-        validate_run_id(args.run_id, image_ids["ocr-production"])
+        if args.derive_run_id:
+            if args.run_id is not None or args.git_sha is None:
+                raise VerificationFailure("run_id", EXIT_CONFIG)
+            print(make_run_id(args.git_sha, image_ids))
+            return EXIT_OK
+        if args.run_id is None or args.git_sha is not None:
+            raise VerificationFailure("run_id", EXIT_CONFIG)
+        validate_run_id(args.run_id, image_ids)
         if args.phase in ("static", "all"):
             digest = verify_static(args.manifest, expected_images)
             print(safe_event("static", True, sha256=digest, image_count=3))

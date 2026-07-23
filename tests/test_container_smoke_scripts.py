@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import ctypes
 import importlib.util
 from hashlib import sha256
 from io import BytesIO
 import json
+import os
 from pathlib import Path
+import signal
+import subprocess
 import sys
+import time
 from types import ModuleType, SimpleNamespace
 from zipfile import ZipFile
 
@@ -93,18 +98,45 @@ def test_deployment_verifier_output_is_finite_and_secret_free() -> None:
 def test_deployment_verifier_run_id_binds_candidate_and_is_stable() -> None:
     verifier = _load_deployment_verifier()
     git_sha = "a" * 40
-    image_id = "sha256:" + "b" * 64
-    run_id = verifier.make_run_id(git_sha, image_id)
+    image_ids = {
+        "ocr-production": "sha256:" + "b" * 64,
+        "mineru-api": "sha256:" + "c" * 64,
+        "mineru-vlm": "sha256:" + "d" * 64,
+    }
+    run_id = verifier.make_run_id(git_sha, image_ids)
 
-    assert run_id == f"{git_sha}-sha256-{'b' * 64}"
+    assert run_id.startswith(f"{git_sha}-images-")
+    assert len(run_id) <= 126
     assert verifier.idempotency_keys(run_id) == (
         f"u-{run_id}",
         f"t-{run_id}",
     )
-    assert verifier.make_run_id(git_sha, image_id) == run_id
-    assert verifier.make_run_id("c" * 40, image_id) != run_id
+    assert verifier.make_run_id(git_sha, dict(reversed(image_ids.items()))) == run_id
+    assert verifier.make_run_id("e" * 40, image_ids) != run_id
+    changed = {**image_ids, "mineru-vlm": "sha256:" + "f" * 64}
+    assert verifier.make_run_id(git_sha, changed) != run_id
+    verifier.validate_run_id(run_id, image_ids)
     with pytest.raises(verifier.VerificationFailure):
-        verifier.make_run_id("not-a-sha", image_id)
+        verifier.validate_run_id(run_id, changed)
+    with pytest.raises(verifier.VerificationFailure):
+        verifier.make_run_id("not-a-sha", image_ids)
+
+
+def test_deployment_verifier_cli_derives_run_id_from_compose_images(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    verifier = _load_deployment_verifier()
+    git_sha = "a" * 40
+    image_ids = {
+        "ocr-production": "sha256:" + "b" * 64,
+        "mineru-api": "sha256:" + "c" * 64,
+        "mineru-vlm": "sha256:" + "d" * 64,
+    }
+    monkeypatch.setattr(verifier, "candidate_image_ids", lambda _: image_ids)
+
+    assert verifier.main(["--derive-run-id", "--git-sha", git_sha]) == 0
+    assert capsys.readouterr().out.strip() == verifier.make_run_id(git_sha, image_ids)
 
 
 def test_deployment_verifier_terminates_unbounded_subprocess() -> None:
@@ -119,6 +151,73 @@ def test_deployment_verifier_terminates_unbounded_subprocess() -> None:
             timeout=5,
             max_output=1024,
         )
+
+
+def _pid_exists(pid: int) -> bool:
+    if os.name == "nt":
+        handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, pid)
+        if not handle:
+            return False
+        try:
+            return ctypes.windll.kernel32.WaitForSingleObject(handle, 0) == 258
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _force_kill_test_process(pid: int) -> None:
+    if not _pid_exists(pid):
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        os.kill(pid, signal.SIGKILL)
+
+
+def test_deployment_verifier_reaps_grandchild_holding_output_pipe(
+    tmp_path: Path,
+) -> None:
+    verifier = _load_deployment_verifier()
+    pid_file = tmp_path / "grandchild.pid"
+    grandchild = (
+        "import os,sys,time;"
+        "open(sys.argv[1],'w',encoding='ascii').write(str(os.getpid()));"
+        "time.sleep(30)"
+    )
+    parent = (
+        "import subprocess,sys,time,pathlib;"
+        "subprocess.Popen([sys.executable,'-c',sys.argv[2],sys.argv[1]],"
+        "stdout=sys.stdout,stderr=sys.stderr);"
+        "p=pathlib.Path(sys.argv[1]);"
+        "deadline=time.monotonic()+5;"
+        "\nwhile not p.exists() and time.monotonic()<deadline: time.sleep(.01)"
+    )
+    pid = 0
+    try:
+        assert verifier._run(
+            [sys.executable, "-c", parent, str(pid_file), grandchild],
+            timeout=8,
+        ) == ""
+        pid = int(pid_file.read_text(encoding="ascii"))
+        deadline = time.monotonic() + 3
+        while _pid_exists(pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not _pid_exists(pid)
+    finally:
+        if not pid and pid_file.exists():
+            pid = int(pid_file.read_text(encoding="ascii"))
+        if pid:
+            _force_kill_test_process(pid)
 
 
 def test_deployment_verifier_uses_bounded_manifest_and_zip_files(tmp_path: Path) -> None:
@@ -136,8 +235,17 @@ def test_deployment_verifier_uses_bounded_manifest_and_zip_files(tmp_path: Path)
 
     artifact = tmp_path / "result.zip"
     with ZipFile(artifact, "w") as archive:
-        archive.writestr("result.md", "bounded")
+        archive.writestr("result.md", "bounded markdown")
+        archive.writestr("payload.bin", "bounded-crc-canary")
     assert verifier.validate_result_zip(artifact, max_bytes=1024) == 1
+
+    corrupted = tmp_path / "corrupted.zip"
+    damaged = artifact.read_bytes().replace(
+        b"bounded-crc-canary", b"damaged-crc-canary", 1
+    )
+    corrupted.write_bytes(damaged)
+    with pytest.raises(verifier.VerificationFailure, match="artifact_zip"):
+        verifier.validate_result_zip(corrupted, max_bytes=1024)
 
 
 def test_deployment_verifier_stream_parsers_are_bounded_and_match_mcp_id() -> None:
