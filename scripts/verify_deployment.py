@@ -545,10 +545,32 @@ def _row_image(row: dict[str, Any]) -> str:
     return ""
 
 
+def _image_row_service(
+    row: dict[str, Any], expected_services: set[str]
+) -> str | None:
+    service = row.get("Service")
+    if isinstance(service, str):
+        return service
+    container_name = row.get("ContainerName")
+    if not isinstance(container_name, str):
+        return None
+    matches = [
+        candidate
+        for candidate in expected_services
+        if container_name.endswith(f"-{candidate}-1")
+        and len(container_name) > len(candidate) + 3
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def validate_image_rows(
     rows: list[dict[str, Any]], expected_images: dict[str, str]
 ) -> dict[str, str]:
-    by_service = {row.get("Service"): row for row in rows}
+    expected_services = set(expected_images)
+    by_service = {
+        _image_row_service(row, expected_services): row
+        for row in rows
+    }
     if len(by_service) != len(rows) or set(by_service) != set(expected_images):
         raise VerificationFailure("image_ids", EXIT_CONFIG)
     ids: dict[str, str] = {}

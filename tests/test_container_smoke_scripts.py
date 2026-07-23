@@ -289,6 +289,29 @@ def test_deployment_verifier_binds_exact_services_images_and_health() -> None:
     verifier.validate_image_rows(image_rows, expected)
     with pytest.raises(verifier.VerificationFailure):
         verifier.validate_image_rows(image_rows[:-1], expected)
+    compose_v239_image_rows = [
+        {
+            "ID": f"sha256:{index:064x}",
+            "ContainerName": f"ocr-mcp-server-{service}-1",
+            "Repository": image.rsplit(":", 1)[0],
+            "Tag": image.rsplit(":", 1)[1],
+            "Platform": "linux/amd64",
+            "Size": 1,
+            "LastTagTime": "2026-07-23T00:00:00Z",
+        }
+        for index, (service, image) in enumerate(expected.items(), start=1)
+    ]
+    assert verifier.validate_image_rows(compose_v239_image_rows, expected) == {
+        service: f"sha256:{index:064x}"
+        for index, service in enumerate(expected, start=1)
+    }
+    malformed_rows = [dict(row) for row in compose_v239_image_rows]
+    malformed_rows[1]["ContainerName"] = "ocr-mcp-server-mineru-api-shadow-1"
+    with pytest.raises(verifier.VerificationFailure, match="image_ids"):
+        verifier.validate_image_rows(malformed_rows, expected)
+    malformed_rows[1]["ContainerName"] = "mineru-api-1"
+    with pytest.raises(verifier.VerificationFailure, match="image_ids"):
+        verifier.validate_image_rows(malformed_rows, expected)
 
     ps_rows = [
         {"Service": "ocr-production", "Image": expected["ocr-production"],
