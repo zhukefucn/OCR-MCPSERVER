@@ -347,6 +347,25 @@ def test_text_nodes_escape_html_metacharacters() -> None:
     assert rendered.content == b"&lt;b&gt;A&amp;B&lt;/b&gt;\n"
 
 
+def test_markdown_renderer_accepts_mineru_v2_paragraph_spans() -> None:
+    rendered = render_markdown(
+        [[{
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {"type": "text", "content": "A&B"},
+                    {"type": "equation_inline", "content": "x_i"},
+                ]
+            },
+        }]],
+        image_names={},
+        max_bytes=100,
+    )
+
+    assert rendered.content == b"A&amp;B$x_i$\n"
+    assert rendered.warning_codes == ()
+
+
 @pytest.mark.parametrize(
     "manifest",
     [

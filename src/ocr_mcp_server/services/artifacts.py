@@ -184,6 +184,38 @@ def _typed_string(content: object, names: tuple[str, ...]) -> str | None:
     return None
 
 
+def _typed_inline_markdown(
+    content: object,
+    names: tuple[str, ...],
+    limits: StructuredContentLimits,
+) -> tuple[str | None, bool]:
+    if not isinstance(content, Mapping):
+        return None, False
+    for name in names:
+        value = content.get(name)
+        if isinstance(value, str):
+            return _markdown_escape(value), False
+        if not isinstance(value, list):
+            continue
+        parts: list[str] = []
+        warned = False
+        for span in value:
+            if not isinstance(span, Mapping):
+                _fail(ArtifactErrorCode.INVALID_INPUT)
+            span_type = span.get("type")
+            span_content = span.get("content")
+            if not isinstance(span_type, str) or not isinstance(span_content, str):
+                _fail(ArtifactErrorCode.INVALID_INPUT)
+            if span_type in {"text", "phonetic"}:
+                parts.append(_markdown_escape(span_content))
+            elif span_type == "equation_inline":
+                parts.append(f"${validate_formula_latex(span_content, limits)}$")
+            else:
+                warned = True
+        return "".join(parts), warned
+    return None, False
+
+
 def _structured_limits(max_bytes: int) -> StructuredContentLimits:
     utf8 = min(40_000_000, max_bytes)
     characters = min(10_000_000, utf8)
@@ -234,15 +266,25 @@ def render_markdown(
                     _fail(ArtifactErrorCode.INVALID_INPUT)
                 block: str | None
                 if node_type in _TITLE_TYPES:
-                    value = _typed_string(content, ("text", "text_content"))
+                    value, inline_warning = _typed_inline_markdown(
+                        content,
+                        ("text", "text_content", "title_content"),
+                        limits,
+                    )
                     if value is None:
                         _fail(ArtifactErrorCode.INVALID_INPUT)
-                    block = "# " + _markdown_escape(value)
+                    warned = warned or inline_warning
+                    block = "# " + value
                 elif node_type in _TEXT_TYPES:
-                    value = _typed_string(content, ("text", "text_content"))
+                    value, inline_warning = _typed_inline_markdown(
+                        content,
+                        ("text", "text_content", "paragraph_content"),
+                        limits,
+                    )
                     if value is None:
                         _fail(ArtifactErrorCode.INVALID_INPUT)
-                    block = _markdown_escape(value)
+                    warned = warned or inline_warning
+                    block = value
                 elif node_type in _LIST_TYPES:
                     value = _typed_string(content, ("text", "text_content"))
                     if value is None:
