@@ -10,11 +10,10 @@ description: Use when local PDF or image paths must be processed through OCR MCP
 ## 固定工作流
 
 1. 执行输入分类和容量预检。
-   - 接受 1 至 20 个本地路径、已批准的 HTTPS URL 或 `file_id`，允许混合；把已有
-     `batch_id` 作为恢复输入。
+   - 确认本地路径、已批准的 HTTPS URL 和已有 `file_id` 三类 `sources` 合计 1 至 20 个，
+     允许混合；把已有 `batch_id` 作为恢复输入。
    - 确认本地文件存在且为普通文件，扩展名为 `.pdf`、`.png`、`.jpg` 或 `.jpeg`，
-     单文件不超过 60 MiB；确认本地文件和 URL 合计不超过 20 个、可预先计算的本地
-     文件总量不超过 1 GiB。
+     单文件不超过 60 MiB；确认可预先计算的本地文件总量不超过 1 GiB。
    - 不自行读取 PDF 页数、加密状态或 URL 内容；把这些检查交给服务器。
 2. 为每个本地文件运行上传动作并收集返回的 `file_id`：
 
@@ -25,7 +24,9 @@ description: Use when local PDF or image paths must be processed through OCR MCP
    只让脚本从 `OCR_MCP_API_KEY` 环境变量读取凭据。任一上传失败时停止创建新批次，
    保留已经取得的安全回执并报告稳定错误类别。
 3. 将上传得到的 `file_id`、输入的 `file_id` 和已批准的 HTTPS URL 构造成一个
-   `sources`，使用同一逻辑重试可复用的幂等键调用一次 `parse_documents`。
+   `sources`。使用无内容随机标识作为幂等键；幂等键不得包含文件名，不得包含路径，
+   不得包含业务正文，不得包含 OCR 正文。同一逻辑提交重试必须复用原幂等键。使用
+   这个幂等键调用一次 `parse_documents`。
 4. 保存 `batch_id`，立即按“已提交”契约汇报；后续任何中断都返回这个值。
 5. 每 15 秒调用一次 `get_task_status`，直到状态成为 `completed`、
    `completed_with_errors`、`failed` 或 `cancelled`。只汇报变化：批次状态、批次
