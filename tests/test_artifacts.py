@@ -482,6 +482,33 @@ def test_markdown_renderer_accepts_mineru_v2_paragraph_spans() -> None:
     assert rendered.warning_codes == ()
 
 
+def test_render_markdown_supports_mineru_v2_text_list() -> None:
+    manifest = [[{
+        "type": "list",
+        "content": {
+            "list_type": "text_list",
+            "list_items": [
+                {
+                    "item_type": "text",
+                    "item_content": [{"type": "text", "content": "first"}],
+                },
+                {
+                    "item_type": "text",
+                    "item_content": [
+                        {"type": "text", "content": "ratio "},
+                        {"type": "equation_inline", "content": r"12.5\%"},
+                    ],
+                },
+            ],
+        },
+    }]]
+
+    rendered = render_markdown(manifest, image_names={}, max_bytes=10_000)
+
+    assert rendered.content == b"- first\n- ratio $12.5\\%$\n"
+    assert rendered.warning_codes == ()
+
+
 @pytest.mark.parametrize(
     "manifest",
     [

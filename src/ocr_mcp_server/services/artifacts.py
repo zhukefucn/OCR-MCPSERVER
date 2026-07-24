@@ -216,6 +216,32 @@ def _typed_inline_markdown(
     return None, False
 
 
+def _typed_v2_list_markdown(
+    content: Mapping[str, object],
+    limits: StructuredContentLimits,
+) -> tuple[str | None, bool]:
+    if content.get("list_type") != "text_list":
+        return None, False
+    items = content.get("list_items")
+    if not isinstance(items, list) or not items:
+        _fail(ArtifactErrorCode.INVALID_INPUT)
+    rendered_items: list[str] = []
+    warned = False
+    for item in items:
+        if not isinstance(item, Mapping) or item.get("item_type") != "text":
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        value, item_warning = _typed_inline_markdown(
+            item,
+            ("item_content",),
+            limits,
+        )
+        if value is None:
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        rendered_items.append("- " + value)
+        warned = warned or item_warning
+    return "\n".join(rendered_items), warned
+
+
 def _structured_limits(max_bytes: int) -> StructuredContentLimits:
     utf8 = min(40_000_000, max_bytes)
     characters = min(10_000_000, utf8)
@@ -288,8 +314,12 @@ def render_markdown(
                 elif node_type in _LIST_TYPES:
                     value = _typed_string(content, ("text", "text_content"))
                     if value is None:
-                        _fail(ArtifactErrorCode.INVALID_INPUT)
-                    block = "- " + _markdown_escape(value)
+                        block, inline_warning = _typed_v2_list_markdown(content, limits)
+                        if block is None:
+                            _fail(ArtifactErrorCode.INVALID_INPUT)
+                        warned = warned or inline_warning
+                    else:
+                        block = "- " + _markdown_escape(value)
                 elif node_type in _CODE_TYPES:
                     value = _typed_string(content, ("code", "text", "text_content"))
                     if value is None:
