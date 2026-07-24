@@ -343,8 +343,13 @@ def normalize_pp_structure_v3_result(
             for label, score in evidence
             if label in _STRUCTURED_LAYOUT_LABELS
         ]
+        high_confidence_structured = [
+            (label, score)
+            for label, score in structured_evidence
+            if score >= threshold
+        ]
         structured_confidence = max(
-            (score for _, score in structured_evidence),
+            (score for _, score in high_confidence_structured),
             default=0.0,
         )
         other_labels = {
@@ -358,9 +363,9 @@ def normalize_pp_structure_v3_result(
             )
         }
 
-        if structured_evidence or raw_target_result_count:
+        if high_confidence_structured or raw_target_result_count:
             if (
-                structured_evidence
+                high_confidence_structured
                 and plain_text is not None
                 and char_count >= policy.min_characters
             ):
@@ -481,6 +486,9 @@ def _recognized_plain_text(
 
     retained_lines: list[str] = []
     retained_scores: list[float] = []
+    raw_character_count = 0
+    raw_utf8_bytes = 0
+    raw_line_count = 0
     for raw_text, raw_score, raw_box in zip(
         texts,
         scores,
@@ -489,7 +497,18 @@ def _recognized_plain_text(
     ):
         if not isinstance(raw_text, str) or not _finite_score(raw_score):
             raise ValueError
-        raw_text.encode("utf-8", errors="strict")
+        if len(raw_text) > policy.max_characters:
+            raise ValueError
+        raw_encoded = raw_text.encode("utf-8", errors="strict")
+        separator_size = 1 if raw_line_count else 0
+        raw_character_count += separator_size + len(raw_text)
+        raw_utf8_bytes += separator_size + len(raw_encoded)
+        raw_line_count += 1
+        if (
+            raw_character_count > policy.max_characters
+            or raw_utf8_bytes > policy.max_utf8_bytes
+        ):
+            raise ValueError
         if (
             not isinstance(raw_box, list)
             or len(raw_box) != 4

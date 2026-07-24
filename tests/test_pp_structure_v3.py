@@ -580,6 +580,57 @@ def test_normalizer_classifies_plain_and_mixed_image_text(
     assert result.confidence == confidence
 
 
+def test_low_confidence_structured_evidence_cannot_publish_text_fallback() -> None:
+    from ocr_mcp_server.infra.pp_structure_v3 import (
+        normalize_pp_structure_v3_result,
+    )
+
+    result = normalize_pp_structure_v3_result(
+        _response(
+            boxes=[{"label": "table", "score": 0.79}],
+            overall_ocr={
+                "rec_texts": ["Balance Sheet"],
+                "rec_scores": [0.96],
+                "rec_boxes": [[1, 2, 100, 20]],
+            },
+        ),
+        threshold=0.8,
+        model_versions={"pipeline": "PP-StructureV3"},
+    )
+
+    assert result.kind is SecondaryResultKind.UNCERTAIN
+    assert result.state is SecondaryResultState.UNCERTAIN
+    assert result.content is None
+    assert result.text_origin is None
+
+
+def test_low_confidence_structured_noise_does_not_block_strong_text() -> None:
+    from ocr_mcp_server.infra.pp_structure_v3 import (
+        normalize_pp_structure_v3_result,
+    )
+
+    result = normalize_pp_structure_v3_result(
+        _response(
+            boxes=[
+                {"label": "table", "score": 0.79},
+                {"label": "doc_title", "score": 0.93},
+            ],
+            overall_ocr={
+                "rec_texts": ["Balance Sheet"],
+                "rec_scores": [0.96],
+                "rec_boxes": [[1, 2, 100, 20]],
+            },
+        ),
+        threshold=0.8,
+        model_versions={"pipeline": "PP-StructureV3"},
+    )
+
+    assert result.kind is SecondaryResultKind.TEXT
+    assert result.state is SecondaryResultState.VALID
+    assert result.text_origin is SecondaryTextOrigin.TEXT_DOMINANT
+    assert result.content == "Balance Sheet"
+
+
 def test_valid_table_result_precedes_malformed_plain_ocr() -> None:
     from ocr_mcp_server.infra.pp_structure_v3 import (
         normalize_pp_structure_v3_result,
@@ -666,6 +717,11 @@ def test_malformed_plain_ocr_returns_content_free_invalid_result(
         {
             "rec_texts": ["abcdef"],
             "rec_scores": [0.9],
+            "rec_boxes": [[0, 0, 1, 1]],
+        },
+        {
+            "rec_texts": ["abcdef"],
+            "rec_scores": [0.1],
             "rec_boxes": [[0, 0, 1, 1]],
         },
     ],
