@@ -225,6 +225,8 @@ def _manifest_entries(
             path = image_source.get("path")
             if not isinstance(path, str) or not path:
                 _fail(CandidateCollectionErrorCode.INVALID_MANIFEST)
+            if path == "images/":
+                continue
             node_type = node.get("type")
             if not isinstance(node_type, str) or not node_type:
                 _fail(CandidateCollectionErrorCode.INVALID_MANIFEST)

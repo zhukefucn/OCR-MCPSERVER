@@ -152,6 +152,44 @@ def test_collects_all_structured_candidate_types_and_preserves_references(
     assert collection.total_reference_count == 5
 
 
+def test_skips_exact_mineru_empty_image_reference_and_keeps_valid_candidates(
+    tmp_path: Path,
+) -> None:
+    manifest = [[
+        {
+            "type": "table",
+            "content": {
+                "image_source": {"path": "images/"},
+                "html": "<table></table>",
+            },
+            "bbox": [166, 120, 843, 256],
+        },
+        {
+            "type": "image",
+            "content": {"image_source": {"path": "images/valid.png"}},
+        },
+    ]]
+    result = _published_result(tmp_path, manifest)
+    _write_image(result.images_directory / "valid.png")
+    _write_image(result.images_directory / "orphan.png")
+
+    collection = _collect(result)
+
+    assert len(collection.candidates) == 1
+    assert collection.candidates[0].primary_path == (
+        result.images_directory / "valid.png"
+    )
+    assert [
+        (reference.page_index, reference.node_index, reference.json_pointer)
+        for reference in collection.candidates[0].references
+    ] == [(0, 1, "/0/1")]
+    assert collection.total_reference_count == 1
+    assert all(
+        result.images_directory / "orphan.png" not in candidate.alias_paths
+        for candidate in collection.candidates
+    )
+
+
 def test_deduplicates_repeated_paths_and_identical_bytes_preserving_alias_order(
     tmp_path: Path,
 ) -> None:
