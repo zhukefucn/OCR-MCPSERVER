@@ -5,7 +5,9 @@ description: Use when local PDF or image paths must be processed through OCR MCP
 
 # 使用 OCR MCP Server
 
-严格按以下顺序执行。使用 `scripts/ocr-transfer.ps1` 完成本地字节上传和产物下载。
+严格按以下顺序执行。从会话技能清单取得本技能 `SKILL.md` 的绝对路径，将
+`SKILL.md 所在目录`记为 `SKILL_ROOT`。不要假设当前工作目录包含 `scripts/`。
+始终使用本技能自带的 `ocr-transfer.ps1` 完成本地字节上传和产物下载。
 
 ## 固定工作流
 
@@ -18,7 +20,7 @@ description: Use when local PDF or image paths must be processed through OCR MCP
 2. 为每个本地文件运行上传动作并收集返回的 `file_id`：
 
    ```powershell
-   & 'scripts/ocr-transfer.ps1' -Action upload -Path '<本地路径>'
+   & "$SKILL_ROOT/scripts/ocr-transfer.ps1" -Action upload -Path '<本地路径>'
    ```
 
    只让脚本从 `OCR_MCP_API_KEY` 环境变量读取凭据。任一上传失败时停止创建新批次，
@@ -34,7 +36,7 @@ description: Use when local PDF or image paths must be processed through OCR MCP
 6. 进入终态后，收集响应中所有 `artifact_id`，逐个运行下载动作：
 
    ```powershell
-   & 'scripts/ocr-transfer.ps1' -Action download `
+   & "$SKILL_ROOT/scripts/ocr-transfer.ps1" -Action download `
      -ArtifactId '<artifact_id>' `
      -OutputRoot '<输出根目录>/ocr-results/<batch_id>/'
    ```

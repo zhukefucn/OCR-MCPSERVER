@@ -76,6 +76,14 @@ def test_skill_encodes_complete_workflow_and_security_rules() -> None:
     assert "ocr-results/<batch_id>/" in text
 
 
+def test_skill_resolves_bundled_script_from_its_own_directory() -> None:
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    assert "SKILL_ROOT" in text
+    assert "SKILL.md 所在目录" in text
+    assert "不要假设当前工作目录包含 `scripts/`" in text
+    assert "& \"$SKILL_ROOT/scripts/ocr-transfer.ps1\"" in text
+
+
 def test_skill_counts_every_source_type_toward_batch_limit() -> None:
     text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
     assert (

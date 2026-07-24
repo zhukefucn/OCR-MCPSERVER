@@ -184,3 +184,13 @@ git push origin feat/repository-skeleton
 使用通过回归的 Git 短 SHA 作为不可变镜像标签，并记录镜像 ID。
 
 预期：生产 Compose 指向已验证标签，重启后仍健康。
+
+## 执行结果与发布线修正
+
+- TDD 已完成：安全转义百分号测试先失败，最小实现后通过；裸百分号仍被拒绝。
+- 最新主线已经包含 MinerU V2 列表渲染、图片文字回填、空图片引用和 60 MiB 上限修复。
+- 最终发布分支必须从 `cf8bd14` 之后创建，不使用较早的
+  `fix/mineru-empty-image-reference` checkout 作为定型基线。
+- 462 页真实回归已经成功完成并下载产物。
+- 最终不可变镜像标签以发布分支的实际候选提交为准，部署记录写入
+  `deployments/ocr-mcp-server/<git-sha>.env`。

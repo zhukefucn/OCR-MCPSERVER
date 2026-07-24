@@ -437,7 +437,7 @@ def test_ppstructure_gpu_target_is_exact_blackwell_cuda129_runtime() -> None:
 def test_readme_documents_blackwell_gpu_build_start_and_real_smoke() -> None:
     readme = _read_text("README.md")
 
-    assert "## PP-StructureV3 GPU image" in readme
+    assert "## PP-StructureV3 GPU 镜像" in readme
     assert "CUDA 12.9" in readme
     assert "paddlepaddle-gpu==3.3.0" in readme
     assert "ppstructure-gpu" in readme
@@ -809,6 +809,6 @@ def test_readme_documents_remote_ubuntu_container_verification() -> None:
     assert "docker compose up -d ocr-gateway" in readme
     assert "docker compose ps" in readme
     assert "http://127.0.0.1:8000/health/live" in readme
-    assert "尚未在远程 Ubuntu 完成构建和启动验证" in readme
+    assert "已在远程 Ubuntu 完成构建和启动验证" in readme
     assert "仅包含 FastAPI 网关" in readme
     assert "不包含 MinerU 或 Paddle 推理依赖" in readme

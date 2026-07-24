@@ -1,61 +1,72 @@
-# Task 9B Marker Recovery and Purge Design
+# 批次锁标记恢复与元数据清理设计
 
-## Goal
+## 目标
 
-Close the two remaining Task 9B lifecycle gaps without weakening the six previously verified ownership and locking protections: recover after a crash between creating a fresh batch-lock marker and committing its first registry binding, and remove per-task marker registry metadata at the existing 30-day purge boundary.
+在不削弱既有所有权和锁保护的前提下处理两类生命周期问题：
 
-## Recovery invariant
+1. 新建批次锁标记后、首次登记提交前进程崩溃。
+2. 到达 30 天元数据清理边界时删除每任务标记登记。
 
-An unregistered on-disk marker may be adopted only when every one of these conditions is proven while holding the same open descriptor and OS batch lock:
+## 新鲜标记恢复不变量
 
-- the requested batch ID and marker filename are the canonical lowercase UUID form;
-- the marker is a non-reparse regular file with link count exactly one;
-- its complete contents are exactly the one-byte fresh marker `0x00`;
-- the configured data root, `.locks` parent, marker name, and open descriptor retain the same identities before and after validation;
-- the registry transaction finds no `batch_lock_markers` row for the batch.
+只有在持有同一个打开描述符和操作系统批次锁期间，全部条件成立时，才能接管未登记的
+磁盘标记：
 
-`FileStorage` owns the filesystem proof and passes an explicit recovery authorization into `RetentionRepository.bind_lock_marker`. The repository performs a `BEGIN IMMEDIATE` transaction and inserts only if the row is still absent. If a row exists, only its exact stored identity is accepted; recovery authorization never overrides or rewrites a mismatch.
+- 批次 ID 和标记文件名是规范小写 UUID。
+- 标记是非重解析点普通文件，链接数恰好为 1。
+- 完整内容严格等于单字节新鲜标记 `0x00`。
+- 数据根目录、`.locks` 父目录、标记名称和打开描述符在验证前后身份稳定。
+- 登记事务确认该批次不存在 `batch_lock_markers` 记录。
 
-The retired marker remains the distinct one-byte value `0x01`. It is therefore not eligible for unbound recovery after registry metadata is purged. Empty, oversized, malformed, linked, reparse, renamed, parent-swapped, and same-name replacement objects are rejected without mutation.
+`FileStorage` 负责文件系统证明，并向
+`RetentionRepository.bind_lock_marker` 传递显式恢复授权。仓储在
+`BEGIN IMMEDIATE` 事务中只在记录仍不存在时插入；已有记录时只接受其精确身份，
+恢复授权不得覆盖或重写不匹配记录。
 
-## Crash behavior
+已退役标记固定为 `0x01`。登记元数据清理后，它仍不能被当作新鲜标记接管。空、超长、
+格式错误、多链接、重解析、重命名、父目录替换和同名替换对象均不得被修改。
 
-The recoverable failure boundary is after exclusive marker creation and durable write of `0x00`, but before the first registry commit. A retry opens that marker once without following links, acquires its OS lock, proves the recovery invariant, and atomically registers its identity.
+## 空标记创建崩溃
 
-A failure after the registry commit already has durable identity state. Retry follows the normal exact-identity path and does not use adoption. No filesystem bytes are normalized before authorization.
+如果进程在独占创建零长度文件后、写入 `0x00` 前崩溃，后续打开者只有在持有该对象的
+操作系统锁时，才能通过 `bind_empty_lock_marker` 初始化。
 
-### Empty-marker creation crash
+仓储在 `BEGIN IMMEDIATE` 中确认保留期记录允许操作且不存在标记登记，再调用窄范围
+同步初始化回调。回调重新证明稳定名称、数据根、父目录、描述符身份、普通文件类型、
+单链接和零长度；通过同一描述符写入 `0x00`、执行 `fsync`，再重复完整证明。回调成功
+后才插入身份并提交。
 
-Canonical exclusive creation has an earlier crash boundary: the process can exit after publishing the zero-length file but before acquiring its OS lock and writing `0x00`. A later opener may initialize that exact empty marker only while holding its OS lock and only through `RetentionRepository.bind_empty_lock_marker`.
+如果写入前崩溃，事务回滚且空标记仍可重试；如果 `fsync` 后、提交前崩溃，事务回滚，
+下一次重试走已初始化标记恢复路径。
 
-That repository method holds `BEGIN IMMEDIATE`, verifies the retention row is allowed and no `BatchLockMarkerRecord` exists, then invokes a narrow synchronous initializer callback. The callback re-proves the stable canonical name, data root, `.locks` parent, open descriptor identity, regular non-reparse type, single-link count, and exact zero length; writes `0x00` through that descriptor; fsyncs; and repeats the full proof with exact one-byte contents. Only after the callback returns does the repository insert the identity and commit.
+## 元数据清理
 
-Any existing registry row rejects the empty marker before the callback, including a row with the same identity. A mismatched, retired, linked, reparse, renamed, parent-swapped, or non-empty marker is never initialized. If the process exits before the callback write, the transaction rolls back and the empty marker remains retryable. If it exits after fsync but before commit, the transaction rolls back and the existing initialized-marker recovery path binds the exact `0x00` object on retry.
+`RetentionRepository.purge_metadata` 在既有清理事务中删除批次标记登记。删除顺序为：
 
-## Metadata purge
+1. 审计、产物、事件和文件依赖项。
+2. 独立标记记录和保留期记录。
+3. 批次记录。
 
-`RetentionRepository.purge_metadata` deletes the batch's marker registry row inside the existing metadata-purge transaction. Deletion remains referentially ordered: audit/artifact/event/file dependents first, then the independent marker row and retention row, then the batch row. The ordinary exactly-30-day path and immediate early-delete path use the same repository method.
+正常 30 天路径和提前删除路径使用同一仓储方法。磁盘上的 `0x01` 退役标记可以保留，
+但在没有登记时必须拒绝接管和修改。
 
-The content-free on-disk retired marker may remain after DB purge. Because its byte is `0x01`, a later operation with no registry row rejects it as non-fresh and cannot adopt or mutate it.
+## 错误处理
 
-## Error handling
+- 文件系统证明失败只返回稳定的不安全路径或所有权错误。
+- 错误中不包含路径或内容。
+- SQL 失败映射为声明冲突或元数据清理失败。
+- 恢复失败不得修改标记字节或不匹配的登记记录。
 
-Filesystem proof failures continue to surface as the existing stable unsafe-path/cleanup-ownership errors with no path or content disclosure. SQL failures remain claim conflicts or metadata-purge failures through the existing repository mappings. Failed recovery leaves both the marker bytes and any mismatched registry row unchanged.
+## 测试
 
-## Test strategy
+- 首次绑定失败后重试，登记同一新鲜标记身份。
+- 格式错误、同名替换和身份不匹配均不修改对象。
+- 提交后故障重试走精确登记身份路径。
+- 30 天边界和提前清理都删除标记登记。
+- 空标记崩溃后完成句柄绑定初始化。
+- 两个打开者并发时不能抢占仍存活的创建者。
+- 已登记、多链接或名称/父目录失稳的空标记不得初始化。
 
-Strict RED/GREEN tests will cover:
+## 范围
 
-1. injected first-bind failure after a fresh marker is durably created, followed by a successful retry that registers the same identity;
-2. rejection without mutation for malformed unbound marker bytes and same-name replacement/identity mismatch;
-3. retry after a simulated post-commit failure using the existing exact registry identity, proving the adoption path is not needed;
-4. presence of the batch's `batch_lock_markers` row before the 30-day boundary and deletion exactly at it, while the retired on-disk byte remains `0x01` and non-adoptable;
-5. the same row deletion for immediate early metadata purge;
-6. all six prior closure regressions, focused lifecycle suites, and the repository-wide gate.
-7. an injected crash immediately after empty canonical creation, followed by handle-bound initialization and binding of the same identity;
-8. a live two-opener handoff in which an existing opener encounters the creator's empty marker but cannot initialize or race the still-live creator;
-9. rejection without mutation when an empty marker already has registry state, is multi-link, or loses stable name/parent binding.
-
-## Scope
-
-No schema beyond the existing `batch_lock_markers` table is added. Canonical artifact placement, metadata-phase resume, deletion timing, external APIs, Task 10 work, push, and deployment remain unchanged.
+不新增 `batch_lock_markers` 之外的表，不修改产物放置、删除时机、外部 API 或部署。

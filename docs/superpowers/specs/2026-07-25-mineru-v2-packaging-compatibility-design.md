@@ -6,7 +6,10 @@
 
 ## 根因
 
-1. MinerU V2 的列表节点使用 `content.list_type = "text_list"`，列表项位于 `content.list_items[*].item_content`，其中内容仍是标准行内 span 列表。现有渲染器只接受列表节点的 `text` 或 `text_content` 字符串。
+1. 失败任务的旧打包路径不能处理 MinerU V2 的
+   `content.list_type = "text_list"` 和
+   `content.list_items[*].item_content`。最新发布主线已经通过既有提交
+   `cd949a3` 修复该列表契约，本次最终发布必须以该主线为基线，不能从较早分支重新构建。
 2. MinerU 输出的百分数公式使用合法的转义百分号 `\%`。现有 LaTeX 校验器只要发现任意 `%` 就拒绝，因而把安全输入误判为非法内容。
 
 ## 方案比较
@@ -14,7 +17,8 @@
 ### 方案一：在消费边界显式兼容（采用）
 
 - `validate_formula_latex` 允许奇数个反斜杠转义的 `%`，继续拒绝裸 `%`。
-- `render_markdown` 显式识别 MinerU V2 的 `text_list/list_items/item_content`，复用现有行内 span 渲染和校验逻辑。
+- 保留发布主线既有的 MinerU V2
+  `text_list/list_items/item_content` 渲染实现和测试，不重复引入第二套列表适配器。
 - 旧版 `text/text_content` 列表继续兼容。
 
 优点是保留安全边界、原始审计 JSON 不变，改动范围最小。
@@ -43,6 +47,18 @@
 4. 本机运行目标测试和全量测试。
 5. 推送后在 Ubuntu 5090 构建新镜像，启动并检查健康状态。
 6. 用 `462pages.pdf` 重新执行端到端任务，要求产物成功生成、可下载且 Markdown 页数结构完整。
+
+## 2026-07-25 验证结果
+
+- 输入：462 页、56,767,563 字节、未加密 PDF。
+- MinerU 与 Paddle 完成全部 811 个图片候选处理。
+- 批次 `2e73bbfd-5727-4ef6-b80e-48bb456198c1` 完成，成功 1、失败 0。
+- 任务成功越过 88% 合并、94% 打包和 99% 发布阶段。
+- ZIP 包含 817 个文件；`final.md` 为 1,235,786 字节；
+  `content_list_v2.json` 保持 462 页。
+- 回归 ZIP SHA-256 为
+  `F90D21BB6C71CEAA621EF65DBBA10BF80F8AAB547F08C596B59DCB9547D1659D`。
+- 验证和文档不记录业务正文或 OCR 文本。
 
 ## 范围外事项
 
