@@ -303,8 +303,11 @@ def _is_escaped(value: str, index: int) -> bool:
 
 def validate_formula_latex(value: object, limits: StructuredContentLimits) -> str:
     selected = _validate_text(value, limits, allow_empty=False)
-    if _DANGEROUS_TEX.search(selected) or "^^" in selected or "%" in selected:
+    if _DANGEROUS_TEX.search(selected) or "^^" in selected:
         raise StructuredContentInvalid() from None
+    for index, character in enumerate(selected):
+        if character == "%" and not _is_escaped(selected, index):
+            raise StructuredContentInvalid() from None
     for command_match in _TEX_COMMAND.finditer(selected):
         command = command_match.group(1)
         if command.isalpha() and command not in _SAFE_TEX_COMMANDS:

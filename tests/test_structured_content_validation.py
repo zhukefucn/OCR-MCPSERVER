@@ -121,6 +121,15 @@ def test_valid_formula_is_returned_trimmed(value, limits):
     assert validate_formula_latex(f" {value}\n", limits) == value
 
 
+def test_formula_accepts_escaped_percent(limits):
+    assert validate_formula_latex(r"12.5\%", limits) == r"12.5\%"
+
+
+def test_formula_rejects_unescaped_percent(limits):
+    with pytest.raises(StructuredContentInvalid):
+        validate_formula_latex("12.5%", limits)
+
+
 @pytest.mark.parametrize(
     "value",
     [
