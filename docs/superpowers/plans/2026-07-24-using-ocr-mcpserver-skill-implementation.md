@@ -221,6 +221,10 @@ $creator = "$env:USERPROFILE\.codex\skills\.system\skill-creator"
 ```
 
 Expected: 创建 `SKILL.md`、`agents/openai.yaml` 和 `scripts/`，目录中没有示例占位文件。
+立即把 `SKILL.md` 收敛为满足 Task 1 初始契约测试的最小版本：保留正确
+frontmatter，并明确列出 `parse_documents`、`get_task_status` 和
+`reparse_with_page_orientation` 三个既有 MCP 工具。完整编排、安全规则和恢复说明
+仍在 Task 4 通过新增 RED 测试后补齐。
 
 - [ ] **Step 2: 扩展上传失败测试**
 
@@ -355,7 +359,7 @@ Run:
   tests/skill/test_using_ocr_mcpserver_contract.py -q
 ```
 
-Expected: 上传测试 PASS；Skill 文字契约测试仍可因 `SKILL.md` 尚未完成而失败。
+Expected: 上传测试和当前 Skill 文字契约测试全部 PASS；Task 2 不带已知红灯提交。
 
 - [ ] **Step 6: 提交上传实现**
 
