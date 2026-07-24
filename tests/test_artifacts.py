@@ -573,6 +573,115 @@ def test_markdown_renderer_rejects_malformed_mineru_v2_list(content) -> None:
     assert caught.value.__cause__ is None
 
 
+def test_markdown_renderer_preserves_mineru_table_and_image_captions() -> None:
+    rendered = render_markdown(
+        [[
+            {
+                "type": "table",
+                "content": {
+                    "table_caption": [
+                        {"type": "text", "content": "Balance & Sheet"},
+                        {"type": "text", "content": "page 1"},
+                    ],
+                    "html": "<table><tr><td>x</td></tr></table>",
+                    "table_footnote": [
+                        {"type": "equation_inline", "content": "x_i"}
+                    ],
+                },
+            },
+            {
+                "type": "image",
+                "content": {
+                    "image_caption": [
+                        {"type": "text", "content": "Figure"}
+                    ],
+                    "image_source": {"path": "images/a.png"},
+                    "image_footnote": [
+                        {"type": "text", "content": "source"}
+                    ],
+                },
+            },
+        ]],
+        image_names={"images/a.png": "images/000000.png"},
+        max_bytes=10_000,
+    )
+
+    assert rendered.content == (
+        "Balance &amp; Sheet\npage 1\n\n"
+        "<table><tr><td>x</td></tr></table>\n\n"
+        "$x_i$\n\n"
+        "Figure\n\n"
+        "![](images/000000.png)\n\n"
+        "source\n"
+    ).encode()
+    assert rendered.warning_codes == ()
+
+
+@pytest.mark.parametrize(
+    ("node_type", "field", "value"),
+    [
+        ("table", "table_caption", "not-a-list"),
+        ("table", "table_footnote", [1]),
+        ("image", "image_caption", [{"type": "text", "content": 1}]),
+        (
+            "image",
+            "image_footnote",
+            [{"type": "equation_inline", "content": r"\input{x}"}],
+        ),
+    ],
+)
+def test_markdown_renderer_rejects_malformed_caption_or_footnote(
+    node_type,
+    field,
+    value,
+) -> None:
+    content = (
+        {"html": "<table><tr><td>x</td></tr></table>"}
+        if node_type == "table"
+        else {"image_source": {"path": "images/a.png"}}
+    )
+    content[field] = value
+    with pytest.raises(ArtifactFailure) as caught:
+        render_markdown(
+            [[{"type": node_type, "content": content}]],
+            image_names={"images/a.png": "images/000000.png"},
+            max_bytes=10_000,
+        )
+    assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
+    assert caught.value.__cause__ is None
+
+
+def test_markdown_renderer_ignores_empty_caption_and_footnote_lists() -> None:
+    rendered = render_markdown(
+        [[
+            {
+                "type": "table",
+                "content": {
+                    "table_caption": [],
+                    "html": "<table><tr><td>x</td></tr></table>",
+                    "table_footnote": [],
+                },
+            },
+            {
+                "type": "image",
+                "content": {
+                    "image_caption": [],
+                    "image_source": {"path": "images/a.png"},
+                    "image_footnote": [],
+                },
+            },
+        ]],
+        image_names={"images/a.png": "images/000000.png"},
+        max_bytes=10_000,
+    )
+
+    assert rendered.content == (
+        "<table><tr><td>x</td></tr></table>\n\n"
+        "![](images/000000.png)\n"
+    ).encode()
+    assert rendered.warning_codes == ()
+
+
 @pytest.mark.parametrize(
     "manifest",
     [

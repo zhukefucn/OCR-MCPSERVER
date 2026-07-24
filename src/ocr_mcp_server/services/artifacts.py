@@ -249,6 +249,36 @@ def _typed_v2_list_markdown(
     return "\n".join(lines), warned
 
 
+def _typed_v2_auxiliary_markdown(
+    content: Mapping[str, object],
+    name: str,
+    limits: StructuredContentLimits,
+) -> tuple[str | None, bool]:
+    if name not in content:
+        return None, False
+    spans = content.get(name)
+    if not isinstance(spans, list):
+        _fail(ArtifactErrorCode.INVALID_INPUT)
+    if not spans:
+        return None, False
+    lines: list[str] = []
+    warned = False
+    for span in spans:
+        if not isinstance(span, Mapping):
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        span_type = span.get("type")
+        span_content = span.get("content")
+        if not isinstance(span_type, str) or not isinstance(span_content, str):
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        if span_type in {"text", "phonetic"}:
+            lines.append(_markdown_escape(span_content))
+        elif span_type == "equation_inline":
+            lines.append(f"${validate_formula_latex(span_content, limits)}$")
+        else:
+            warned = True
+    return ("\n".join(lines) if lines else None), warned
+
+
 def _structured_limits(max_bytes: int) -> StructuredContentLimits:
     utf8 = min(40_000_000, max_bytes)
     characters = min(10_000_000, utf8)
@@ -336,6 +366,11 @@ def render_markdown(
                         _fail(ArtifactErrorCode.INVALID_INPUT)
                     block = "\n".join("    " + line for line in value.split("\n"))
                 elif node_type == "image":
+                    caption, caption_warning = _typed_v2_auxiliary_markdown(
+                        content,
+                        "image_caption",
+                        limits,
+                    )
                     image_source = content.get("image_source")
                     raw_path = image_source.get("path") if isinstance(image_source, Mapping) else None
                     if _safe_logical_path(raw_path) is None or raw_path not in image_names:
@@ -343,10 +378,25 @@ def render_markdown(
                     logical = image_names[raw_path]
                     if _safe_logical_path(logical) is None or not logical.startswith("images/"):
                         _fail(ArtifactErrorCode.UNSAFE_IMAGE)
-                    block = f"![]({logical})"
+                    footnote, footnote_warning = _typed_v2_auxiliary_markdown(
+                        content,
+                        "image_footnote",
+                        limits,
+                    )
+                    warned = warned or caption_warning or footnote_warning
+                    block = "\n\n".join(
+                        part
+                        for part in (caption, f"![]({logical})", footnote)
+                        if part is not None
+                    )
                 elif node_type == "table":
+                    caption, caption_warning = _typed_v2_auxiliary_markdown(
+                        content,
+                        "table_caption",
+                        limits,
+                    )
                     try:
-                        block = validate_table_html(content.get("html"), limits)
+                        table = validate_table_html(content.get("html"), limits)
                     except StructuredContentInvalid:
                         image_source = content.get("image_source")
                         raw_path = (
@@ -357,7 +407,19 @@ def render_markdown(
                         if raw_path != "images/":
                             raise
                         warned = True
-                        block = None
+                        table = None
+                    footnote, footnote_warning = _typed_v2_auxiliary_markdown(
+                        content,
+                        "table_footnote",
+                        limits,
+                    )
+                    warned = warned or caption_warning or footnote_warning
+                    parts = [
+                        part
+                        for part in (caption, table, footnote)
+                        if part is not None
+                    ]
+                    block = "\n\n".join(parts) if parts else None
                 elif node_type == "equation_interline":
                     if content.get("math_type") != "latex":
                         _fail(ArtifactErrorCode.INVALID_INPUT)
