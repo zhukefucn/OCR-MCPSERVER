@@ -6,9 +6,11 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 from threading import Thread
 from types import SimpleNamespace
+import warnings
 import zipfile
 
 import pytest
@@ -57,12 +59,42 @@ def make_crc_damaged_zip() -> bytes:
     return bytes(payload)
 
 
-def run_transfer(*args: str, api_key: str | None = "test-key"):
+def make_zip_from_entries(entries: list[tuple[str, bytes]]) -> bytes:
+    buffer = BytesIO()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, content in entries:
+                archive.writestr(name, content)
+    return buffer.getvalue()
+
+
+def patch_central_uncompressed_size(
+    payload: bytes,
+    declared_size: int,
+    entry_index: int = 0,
+) -> bytes:
+    patched = bytearray(payload)
+    offset = -1
+    for _ in range(entry_index + 1):
+        offset = patched.find(b"PK\x01\x02", offset + 1)
+        assert offset >= 0
+    patched[offset + 24 : offset + 28] = declared_size.to_bytes(4, "little")
+    return bytes(patched)
+
+
+def run_transfer(
+    *args: str,
+    api_key: str | None = "test-key",
+    extra_env: dict[str, str] | None = None,
+):
     env = os.environ.copy()
     if api_key is None:
         env.pop("OCR_MCP_API_KEY", None)
     else:
         env["OCR_MCP_API_KEY"] = api_key
+    if extra_env is not None:
+        env.update(extra_env)
     result = subprocess.run(
         [
             "powershell.exe",
@@ -84,6 +116,19 @@ def run_transfer(*args: str, api_key: str | None = "test-key"):
     )
     payload = json.loads(result.stdout)
     return result, payload
+
+
+def create_junction(link: Path, target: Path) -> None:
+    result = subprocess.run(
+        ["cmd.exe", "/c", "mklink", "/J", str(link), str(target)],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_missing_api_key_fails_without_echoing_secrets(tmp_path: Path) -> None:
@@ -159,6 +204,8 @@ def artifact_server():
         request_count=0,
         received=[],
         fail_if_requested=False,
+        omit_content_length=False,
+        declared_content_length=None,
     )
 
     class ArtifactHandler(BaseHTTPRequestHandler):
@@ -177,7 +224,11 @@ def artifact_server():
                 body = state.payload
                 self.send_response(200)
                 self.send_header("Content-Type", "application/zip")
-            self.send_header("Content-Length", str(len(body)))
+            if not state.omit_content_length:
+                content_length = state.declared_content_length
+                if content_length is None:
+                    content_length = len(body)
+                self.send_header("Content-Length", str(content_length))
             self.end_headers()
             self.wfile.write(body)
 
@@ -194,6 +245,106 @@ def artifact_server():
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+@pytest.fixture
+def cross_origin_redirect_servers():
+    state = SimpleNamespace(
+        source_request_count=0,
+        target_request_count=0,
+        target_requests=[],
+        source_body_token="source-redirect-body-secret",
+        target_body_token="target-redirect-body-secret",
+    )
+    upload_receipt = json.dumps(
+        {
+            "file_id": "11111111-1111-4111-8111-111111111111",
+            "size_bytes": 9,
+            "media_type": "application/pdf",
+            "unknown_body": state.target_body_token,
+        }
+    ).encode("utf-8")
+    artifact_payload = make_zip(
+        {
+            "final.md": state.target_body_token.encode("utf-8"),
+            "artifact_manifest.json": b"{}",
+        }
+    )
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def record_and_respond(self) -> None:
+            state.target_request_count += 1
+            state.target_requests.append(
+                {
+                    "method": self.command,
+                    "path": self.path,
+                    "api_keys": self.headers.get_all("X-API-Key"),
+                }
+            )
+            if self.path.startswith("/upload-target"):
+                body = upload_receipt
+                content_type = "application/json"
+            else:
+                body = artifact_payload
+                content_type = "application/zip"
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            self.record_and_respond()
+
+        def do_POST(self) -> None:
+            self.record_and_respond()
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    target_server = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    target_thread = Thread(target=target_server.serve_forever, daemon=True)
+    target_thread.start()
+    target_base_url = f"http://127.0.0.1:{target_server.server_port}"
+
+    class SourceHandler(BaseHTTPRequestHandler):
+        def redirect(self, target_path: str) -> None:
+            state.source_request_count += 1
+            body = state.source_body_token.encode("utf-8")
+            location = (
+                f"{target_base_url}/{target_path}"
+                "?opaque-location-token=do-not-log"
+            )
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            self.redirect("upload-target")
+
+        def do_GET(self) -> None:
+            self.redirect("download-target")
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    source_server = ThreadingHTTPServer(("127.0.0.1", 0), SourceHandler)
+    source_thread = Thread(target=source_server.serve_forever, daemon=True)
+    source_thread.start()
+    state.source_base_url = f"http://127.0.0.1:{source_server.server_port}"
+    state.location_token = "opaque-location-token=do-not-log"
+    try:
+        yield state
+    finally:
+        source_server.shutdown()
+        source_server.server_close()
+        source_thread.join(timeout=5)
+        target_server.shutdown()
+        target_server.server_close()
+        target_thread.join(timeout=5)
 
 
 def test_upload_rejects_unsupported_extension(tmp_path: Path) -> None:
@@ -254,6 +405,34 @@ def test_upload_streams_file_and_returns_safe_receipt(
     assert "test-key" not in result.stdout + result.stderr
 
 
+def test_upload_rejects_cross_origin_redirect_without_forwarding_key(
+    tmp_path: Path, cross_origin_redirect_servers
+) -> None:
+    source = tmp_path / "document.pdf"
+    source.write_bytes(b"%PDF-test")
+    api_key = "redirect-secret-key"
+
+    result, payload = run_transfer(
+        "-Action",
+        "upload",
+        "-Path",
+        str(source),
+        "-BaseUrl",
+        cross_origin_redirect_servers.source_base_url,
+        api_key=api_key,
+    )
+
+    output = result.stdout + result.stderr
+    assert cross_origin_redirect_servers.source_request_count == 1
+    assert cross_origin_redirect_servers.target_request_count == 0
+    assert result.returncode != 0
+    assert payload["error"]["code"] == "upload_failed"
+    assert api_key not in output
+    assert cross_origin_redirect_servers.location_token not in output
+    assert cross_origin_redirect_servers.source_body_token not in output
+    assert cross_origin_redirect_servers.target_body_token not in output
+
+
 def test_download_keeps_zip_and_extracts_final_markdown(
     tmp_path: Path, artifact_server
 ) -> None:
@@ -295,6 +474,35 @@ def test_download_keeps_zip_and_extracts_final_markdown(
             "api_keys": ["test-key"],
         }
     ]
+
+
+def test_download_rejects_cross_origin_redirect_without_forwarding_key(
+    tmp_path: Path, cross_origin_redirect_servers
+) -> None:
+    api_key = "redirect-secret-key"
+
+    result, payload = run_transfer(
+        "-Action",
+        "download",
+        "-ArtifactId",
+        ARTIFACT_ID,
+        "-OutputRoot",
+        str(tmp_path),
+        "-BaseUrl",
+        cross_origin_redirect_servers.source_base_url,
+        api_key=api_key,
+    )
+
+    output = result.stdout + result.stderr
+    assert cross_origin_redirect_servers.source_request_count == 1
+    assert cross_origin_redirect_servers.target_request_count == 0
+    assert result.returncode != 0
+    assert payload["error"]["code"] == "download_failed"
+    assert api_key not in output
+    assert cross_origin_redirect_servers.location_token not in output
+    assert cross_origin_redirect_servers.source_body_token not in output
+    assert cross_origin_redirect_servers.target_body_token not in output
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_download_requires_exact_root_final_markdown(
@@ -488,3 +696,337 @@ def test_download_reuses_valid_zip_and_extract_without_http(
     assert second_payload["zip_path"] == first_payload["zip_path"]
     assert second_payload["extract_path"] == first_payload["extract_path"]
     assert artifact_server.request_count == 1
+
+
+def test_download_reuse_rebuilds_stale_extract_without_http(
+    tmp_path: Path, artifact_server
+) -> None:
+    artifact_server.payload = make_zip(
+        {
+            "final.md": b"# current ZIP",
+            "artifact_manifest.json": b"{}",
+        }
+    )
+    first_result, first_payload = run_transfer(
+        "-Action",
+        "download",
+        "-ArtifactId",
+        ARTIFACT_ID,
+        "-OutputRoot",
+        str(tmp_path),
+        "-BaseUrl",
+        artifact_server.base_url,
+    )
+    assert first_result.returncode == 0
+    extract_path = Path(first_payload["extract_path"])
+    (extract_path / "final.md").write_text("# stale extract", encoding="utf-8")
+    (extract_path / "stale-only.txt").write_text("stale", encoding="utf-8")
+    artifact_server.fail_if_requested = True
+
+    second_result, second_payload = run_transfer(
+        "-Action",
+        "download",
+        "-ArtifactId",
+        ARTIFACT_ID,
+        "-OutputRoot",
+        str(tmp_path),
+        "-BaseUrl",
+        artifact_server.base_url,
+    )
+
+    assert second_result.returncode == 0
+    assert second_payload["reused"] is True
+    assert artifact_server.request_count == 1
+    assert (extract_path / "final.md").read_bytes() == b"# current ZIP"
+    assert not (extract_path / "stale-only.txt").exists()
+
+
+def test_download_reuse_replaces_junction_without_touching_external_target(
+    tmp_path: Path, artifact_server
+) -> None:
+    artifact_server.payload = make_zip(
+        {
+            "final.md": b"# current ZIP",
+            "artifact_manifest.json": b"{}",
+        }
+    )
+    first_result, first_payload = run_transfer(
+        "-Action",
+        "download",
+        "-ArtifactId",
+        ARTIFACT_ID,
+        "-OutputRoot",
+        str(tmp_path),
+        "-BaseUrl",
+        artifact_server.base_url,
+    )
+    assert first_result.returncode == 0
+    extract_path = Path(first_payload["extract_path"])
+    shutil.rmtree(extract_path)
+    external_path = tmp_path.parent / f"{tmp_path.name}-external"
+    external_path.mkdir()
+    external_marker = external_path / "marker.txt"
+    external_marker.write_text("outside marker", encoding="utf-8")
+    (external_path / "final.md").write_text("# outside", encoding="utf-8")
+    create_junction(extract_path, external_path)
+    assert os.path.samefile(extract_path, external_path)
+    artifact_server.fail_if_requested = True
+
+    try:
+        second_result, second_payload = run_transfer(
+            "-Action",
+            "download",
+            "-ArtifactId",
+            ARTIFACT_ID,
+            "-OutputRoot",
+            str(tmp_path),
+            "-BaseUrl",
+            artifact_server.base_url,
+        )
+
+        assert second_result.returncode == 0
+        assert second_payload["reused"] is True
+        assert artifact_server.request_count == 1
+        assert not os.path.samefile(extract_path, external_path)
+        assert (extract_path / "final.md").read_bytes() == b"# current ZIP"
+        assert external_marker.read_text(encoding="utf-8") == "outside marker"
+        assert (external_path / "final.md").read_text(encoding="utf-8") == "# outside"
+    finally:
+        if extract_path.exists():
+            try:
+                if os.path.samefile(extract_path, external_path):
+                    os.rmdir(extract_path)
+            except FileNotFoundError:
+                pass
+        shutil.rmtree(external_path, ignore_errors=True)
+
+
+def test_download_rejects_content_length_over_configured_limit(
+    tmp_path: Path, artifact_server
+) -> None:
+    artifact_server.payload = make_zip(
+        {
+            "final.md": b"# result",
+            "artifact_manifest.json": b"{}",
+        }
+    )
+    assert len(artifact_server.payload) > 64
+
+    result, payload = run_transfer(
+        "-Action",
+        "download",
+        "-ArtifactId",
+        ARTIFACT_ID,
+        "-OutputRoot",
+        str(tmp_path),
+        "-BaseUrl",
+        artifact_server.base_url,
+        extra_env={"OCR_MCP_MAX_DOWNLOAD_BYTES": "64"},
+    )
+
+    assert result.returncode != 0
+    assert payload["error"]["code"] == "download_failed"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_rejects_stream_over_limit_without_content_length(
+    tmp_path: Path, artifact_server
+) -> None:
+    artifact_server.payload = b"x" * 65
+    artifact_server.omit_content_length = True
+
+    result, payload = run_transfer(
+        "-Action",
+        "download",
+        "-ArtifactId",
+        ARTIFACT_ID,
+        "-OutputRoot",
+        str(tmp_path),
+        "-BaseUrl",
+        artifact_server.base_url,
+        extra_env={"OCR_MCP_MAX_DOWNLOAD_BYTES": "64"},
+    )
+
+    assert result.returncode != 0
+    assert payload["error"]["code"] == "download_failed"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_rejects_declared_entry_size_over_limit(
+    tmp_path: Path, artifact_server
+) -> None:
+    artifact_server.payload = patch_central_uncompressed_size(
+        make_zip(
+            {
+                "final.md": b"small",
+                "artifact_manifest.json": b"{}",
+            }
+        ),
+        declared_size=17,
+    )
+
+    result, payload = run_transfer(
+        "-Action",
+        "download",
+        "-ArtifactId",
+        ARTIFACT_ID,
+        "-OutputRoot",
+        str(tmp_path),
+        "-BaseUrl",
+        artifact_server.base_url,
+        extra_env={"OCR_MCP_MAX_ENTRY_BYTES": "16"},
+    )
+
+    assert result.returncode != 0
+    assert payload["error"]["code"] == "invalid_artifact"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_rejects_actual_entry_stream_over_limit(
+    tmp_path: Path, artifact_server
+) -> None:
+    artifact_server.payload = patch_central_uncompressed_size(
+        make_zip(
+            {
+                "final.md": b"x" * 32,
+                "artifact_manifest.json": b"{}",
+            }
+        ),
+        declared_size=8,
+    )
+
+    result, payload = run_transfer(
+        "-Action",
+        "download",
+        "-ArtifactId",
+        ARTIFACT_ID,
+        "-OutputRoot",
+        str(tmp_path),
+        "-BaseUrl",
+        artifact_server.base_url,
+        extra_env={"OCR_MCP_MAX_ENTRY_BYTES": "16"},
+    )
+
+    assert result.returncode != 0
+    assert payload["error"]["code"] == "invalid_artifact"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_rejects_total_extracted_bytes_over_limit(
+    tmp_path: Path, artifact_server
+) -> None:
+    artifact_server.payload = make_zip(
+        {
+            "final.md": b"12345678",
+            "artifact_manifest.json": b"12345678",
+        }
+    )
+
+    result, payload = run_transfer(
+        "-Action",
+        "download",
+        "-ArtifactId",
+        ARTIFACT_ID,
+        "-OutputRoot",
+        str(tmp_path),
+        "-BaseUrl",
+        artifact_server.base_url,
+        extra_env={"OCR_MCP_MAX_EXTRACTED_BYTES": "12"},
+    )
+
+    assert result.returncode != 0
+    assert payload["error"]["code"] == "invalid_artifact"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_rejects_entry_count_over_limit(
+    tmp_path: Path, artifact_server
+) -> None:
+    artifact_server.payload = make_zip(
+        {
+            "final.md": b"# result",
+            "artifact_manifest.json": b"{}",
+        }
+    )
+
+    result, payload = run_transfer(
+        "-Action",
+        "download",
+        "-ArtifactId",
+        ARTIFACT_ID,
+        "-OutputRoot",
+        str(tmp_path),
+        "-BaseUrl",
+        artifact_server.base_url,
+        extra_env={"OCR_MCP_MAX_ARCHIVE_ENTRIES": "1"},
+    )
+
+    assert result.returncode != 0
+    assert payload["error"]["code"] == "invalid_artifact"
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "unsafe_entries",
+    [
+        [
+            ("final.md", b"# first"),
+            ("final.md", b"# duplicate"),
+        ],
+        [
+            ("final.md", b"# result"),
+            ("FINAL.MD", b"# case conflict"),
+        ],
+        [
+            ("final.md", b"# result"),
+            ("folder/", b""),
+            ("folder", b"file conflict"),
+        ],
+    ],
+)
+def test_download_rejects_conflicting_targets_without_poisoning_cache(
+    tmp_path: Path,
+    artifact_server,
+    unsafe_entries: list[tuple[str, bytes]],
+) -> None:
+    artifact_server.payload = make_zip_from_entries(unsafe_entries)
+
+    first_result, first_payload = run_transfer(
+        "-Action",
+        "download",
+        "-ArtifactId",
+        ARTIFACT_ID,
+        "-OutputRoot",
+        str(tmp_path),
+        "-BaseUrl",
+        artifact_server.base_url,
+    )
+
+    assert first_result.returncode != 0
+    assert first_payload["error"]["code"] == "invalid_artifact"
+    assert list(tmp_path.iterdir()) == []
+    assert artifact_server.request_count == 1
+
+    artifact_server.payload = make_zip(
+        {
+            "final.md": b"# recovered",
+            "artifact_manifest.json": b"{}",
+        }
+    )
+    second_result, second_payload = run_transfer(
+        "-Action",
+        "download",
+        "-ArtifactId",
+        ARTIFACT_ID,
+        "-OutputRoot",
+        str(tmp_path),
+        "-BaseUrl",
+        artifact_server.base_url,
+    )
+
+    assert second_result.returncode == 0
+    assert second_payload["reused"] is False
+    assert artifact_server.request_count == 2
+    assert (
+        Path(second_payload["extract_path"]) / "final.md"
+    ).read_bytes() == b"# recovered"

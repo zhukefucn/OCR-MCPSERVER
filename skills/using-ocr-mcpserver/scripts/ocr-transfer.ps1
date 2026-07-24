@@ -23,14 +23,31 @@ namespace OcrTransfer
 {
     public sealed class ArchiveEntryMetadata
     {
-        public ArchiveEntryMetadata(uint crc32, bool containsBackslash)
+        public ArchiveEntryMetadata(
+            uint crc32,
+            uint uncompressedSize,
+            bool containsBackslash)
         {
             Crc32 = crc32;
+            UncompressedSize = uncompressedSize;
             ContainsBackslash = containsBackslash;
         }
 
         public uint Crc32 { get; private set; }
+        public uint UncompressedSize { get; private set; }
         public bool ContainsBackslash { get; private set; }
+    }
+
+    public sealed class StreamIntegrity
+    {
+        public StreamIntegrity(uint crc32, long length)
+        {
+            Crc32 = crc32;
+            Length = length;
+        }
+
+        public uint Crc32 { get; private set; }
+        public long Length { get; private set; }
     }
 
     public static class ArchiveIntegrity
@@ -54,19 +71,47 @@ namespace OcrTransfer
             return table;
         }
 
-        public static uint ReadCrc32(Stream stream)
+        public static StreamIntegrity ReadAndMeasureCrc32(
+            Stream stream,
+            long maximumBytes)
         {
             uint crc = 0xFFFFFFFFU;
+            long total = 0;
             var buffer = new byte[64 * 1024];
             int count;
             while ((count = stream.Read(buffer, 0, buffer.Length)) > 0)
             {
+                if (count > maximumBytes - total)
+                {
+                    throw new InvalidDataException("ZIP entry is too large.");
+                }
+                total += count;
                 for (var index = 0; index < count; index++)
                 {
                     crc = Table[(byte)(crc ^ buffer[index])] ^ (crc >> 8);
                 }
             }
-            return ~crc;
+            return new StreamIntegrity(~crc, total);
+        }
+
+        public static long CopyWithLimit(
+            Stream source,
+            Stream destination,
+            long maximumBytes)
+        {
+            long total = 0;
+            var buffer = new byte[64 * 1024];
+            int count;
+            while ((count = source.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                if (count > maximumBytes - total)
+                {
+                    throw new InvalidDataException("Stream is too large.");
+                }
+                destination.Write(buffer, 0, count);
+                total += count;
+            }
+            return total;
         }
 
         private static byte[] ReadExactly(Stream stream, int count)
@@ -85,7 +130,9 @@ namespace OcrTransfer
             return buffer;
         }
 
-        public static ArchiveEntryMetadata[] ReadCentralDirectory(Stream stream)
+        public static ArchiveEntryMetadata[] ReadCentralDirectory(
+            Stream stream,
+            int maximumEntries)
         {
             if (!stream.CanRead || !stream.CanSeek || stream.Length < 22)
             {
@@ -131,6 +178,7 @@ namespace OcrTransfer
                 if (diskNumber != 0 || directoryDisk != 0 ||
                     entriesOnDisk != entryCount || commentLength !=
                     tail.Length - endIndex - 22 ||
+                    entryCount > maximumEntries ||
                     entryCount == UInt16.MaxValue ||
                     directorySize == UInt32.MaxValue ||
                     directoryOffset == UInt32.MaxValue)
@@ -166,7 +214,7 @@ namespace OcrTransfer
                     reader.ReadUInt16();
                     var crc32 = reader.ReadUInt32();
                     reader.ReadUInt32();
-                    reader.ReadUInt32();
+                    var uncompressedSize = reader.ReadUInt32();
                     var nameLength = reader.ReadUInt16();
                     var extraLength = reader.ReadUInt16();
                     var entryCommentLength = reader.ReadUInt16();
@@ -189,7 +237,11 @@ namespace OcrTransfer
                         Array.IndexOf(nameBytes, (byte)'\\') >= 0;
                     stream.Position += extraLength + entryCommentLength;
                     metadata.Add(
-                        new ArchiveEntryMetadata(crc32, containsBackslash)
+                        new ArchiveEntryMetadata(
+                            crc32,
+                            uncompressedSize,
+                            containsBackslash
+                        )
                     );
                 }
                 if (stream.Position != directoryEnd)
@@ -206,6 +258,10 @@ namespace OcrTransfer
 '@
 
 $script:MaximumUploadBytes = 60L * 1024L * 1024L
+$script:MaximumDownloadBytes = 1L * 1024L * 1024L * 1024L
+$script:MaximumArchiveEntryBytes = 256L * 1024L * 1024L
+$script:MaximumExtractedBytes = 1L * 1024L * 1024L * 1024L
+$script:MaximumArchiveEntries = 20000
 
 function Write-SafeJson([hashtable]$Value, [int]$ExitCode) {
     $json = ConvertTo-Json -InputObject $Value -Compress -Depth 5
@@ -217,6 +273,23 @@ function New-TransferException([string]$Code) {
     $exception = [System.InvalidOperationException]::new('Transfer operation failed.')
     $exception.Data['TransferCode'] = $Code
     return $exception
+}
+
+function Get-ConfiguredMaximum(
+    [string]$EnvironmentName,
+    [long]$DefaultValue
+) {
+    $rawValue = [Environment]::GetEnvironmentVariable($EnvironmentName)
+    $configuredValue = 0L
+    if (
+        -not [string]::IsNullOrWhiteSpace($rawValue) -and
+        [long]::TryParse($rawValue, [ref]$configuredValue) -and
+        $configuredValue -gt 0 -and
+        $configuredValue -lt $DefaultValue
+    ) {
+        return $configuredValue
+    }
+    return $DefaultValue
 }
 
 function Get-ApiKey() {
@@ -300,6 +373,7 @@ function Invoke-Upload(
     $content = $null
     $request = $null
     $response = $null
+    $handler = $null
     $client = $null
     try {
         $fileStream = [System.IO.File]::OpenRead($File.FullName)
@@ -319,7 +393,9 @@ function Invoke-Upload(
             (Get-SafeDisplayName $File)
         )
 
-        $client = [System.Net.Http.HttpClient]::new()
+        $handler = [System.Net.Http.HttpClientHandler]::new()
+        $handler.AllowAutoRedirect = $false
+        $client = [System.Net.Http.HttpClient]::new($handler, $false)
         $response = $client.SendAsync(
             $request,
             [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
@@ -356,6 +432,7 @@ function Invoke-Upload(
         if ($null -ne $content) { $content.Dispose() }
         if ($null -ne $fileStream) { $fileStream.Dispose() }
         if ($null -ne $client) { $client.Dispose() }
+        if ($null -ne $handler) { $handler.Dispose() }
     }
 }
 
@@ -363,12 +440,14 @@ function Invoke-ArtifactDownload(
     [string]$ArtifactId,
     [string]$ApiKey,
     [uri]$Endpoint,
-    [string]$TemporaryPath
+    [string]$TemporaryPath,
+    [long]$MaximumBytes
 ) {
     $request = $null
     $response = $null
     $responseStream = $null
     $fileStream = $null
+    $handler = $null
     $client = $null
     try {
         $request = [System.Net.Http.HttpRequestMessage]::new(
@@ -377,12 +456,21 @@ function Invoke-ArtifactDownload(
         )
         [void]$request.Headers.TryAddWithoutValidation('X-API-Key', $ApiKey)
 
-        $client = [System.Net.Http.HttpClient]::new()
+        $handler = [System.Net.Http.HttpClientHandler]::new()
+        $handler.AllowAutoRedirect = $false
+        $client = [System.Net.Http.HttpClient]::new($handler, $false)
         $response = $client.SendAsync(
             $request,
             [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
         ).GetAwaiter().GetResult()
         if (-not $response.IsSuccessStatusCode) {
+            throw (New-TransferException 'download_failed')
+        }
+        $contentLength = $response.Content.Headers.ContentLength
+        if (
+            $null -ne $contentLength -and
+            [long]$contentLength -gt $MaximumBytes
+        ) {
             throw (New-TransferException 'download_failed')
         }
 
@@ -394,7 +482,11 @@ function Invoke-ArtifactDownload(
             [System.IO.FileAccess]::Write,
             [System.IO.FileShare]::None
         )
-        $responseStream.CopyTo($fileStream)
+        [void][OcrTransfer.ArchiveIntegrity]::CopyWithLimit(
+            $responseStream,
+            $fileStream,
+            $MaximumBytes
+        )
         $fileStream.Flush($true)
     } catch {
         if ($_.Exception.Data['TransferCode']) {
@@ -407,6 +499,7 @@ function Invoke-ArtifactDownload(
         if ($null -ne $response) { $response.Dispose() }
         if ($null -ne $request) { $request.Dispose() }
         if ($null -ne $client) { $client.Dispose() }
+        if ($null -ne $handler) { $handler.Dispose() }
     }
 }
 
@@ -456,7 +549,10 @@ function Get-SafeArchiveTarget(
 
 function Test-SafeArchive(
     [string]$ZipPath,
-    [string]$ExtractionRoot
+    [string]$ExtractionRoot,
+    [long]$MaximumEntryBytes,
+    [long]$MaximumExtractedBytes,
+    [int]$MaximumEntries
 ) {
     $fileStream = $null
     $metadataStream = $null
@@ -481,13 +577,36 @@ function Test-SafeArchive(
         )
         $centralDirectory =
             [OcrTransfer.ArchiveIntegrity]::ReadCentralDirectory(
-                $metadataStream
+                $metadataStream,
+                $MaximumEntries
             )
         if ($centralDirectory.Length -ne $archive.Entries.Count) {
             throw (New-TransferException 'invalid_artifact')
         }
         $entryCount = 0
         $hasFinalMarkdown = $false
+        $declaredTotal = 0L
+        $actualTotal = 0L
+        $entryTargets =
+            [System.Collections.Generic.HashSet[string]]::new(
+                [System.StringComparer]::OrdinalIgnoreCase
+            )
+        $fileTargets =
+            [System.Collections.Generic.HashSet[string]]::new(
+                [System.StringComparer]::OrdinalIgnoreCase
+            )
+        $directoryTargets =
+            [System.Collections.Generic.HashSet[string]]::new(
+                [System.StringComparer]::OrdinalIgnoreCase
+            )
+        $trimCharacters = [char[]]@(
+            [System.IO.Path]::DirectorySeparatorChar,
+            [System.IO.Path]::AltDirectorySeparatorChar
+        )
+        $extractionRootPath =
+            [System.IO.Path]::GetFullPath($ExtractionRoot).TrimEnd(
+                $trimCharacters
+            )
 
         foreach ($entry in $archive.Entries) {
             $metadata = $centralDirectory[$entryCount]
@@ -495,11 +614,49 @@ function Test-SafeArchive(
             if ($metadata.ContainsBackslash) {
                 throw (New-TransferException 'unsafe_archive')
             }
-            [void](Get-SafeArchiveTarget $entry.FullName $ExtractionRoot)
+            $target = Get-SafeArchiveTarget $entry.FullName $ExtractionRoot
+            $targetKey = $target.TrimEnd($trimCharacters)
             $isDirectory = $entry.FullName.EndsWith(
                 '/',
                 [System.StringComparison]::Ordinal
             )
+            if (-not $entryTargets.Add($targetKey)) {
+                throw (New-TransferException 'invalid_artifact')
+            }
+            if ($isDirectory) {
+                if (
+                    $fileTargets.Contains($targetKey) -or
+                    $metadata.UncompressedSize -ne 0
+                ) {
+                    throw (New-TransferException 'invalid_artifact')
+                }
+                [void]$directoryTargets.Add($targetKey)
+            } else {
+                if (
+                    $fileTargets.Contains($targetKey) -or
+                    $directoryTargets.Contains($targetKey)
+                ) {
+                    throw (New-TransferException 'invalid_artifact')
+                }
+                [void]$fileTargets.Add($targetKey)
+            }
+
+            $parentTarget = [System.IO.Path]::GetDirectoryName($targetKey)
+            while (
+                -not [string]::IsNullOrEmpty($parentTarget) -and
+                -not $parentTarget.Equals(
+                    $extractionRootPath,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            ) {
+                if ($fileTargets.Contains($parentTarget)) {
+                    throw (New-TransferException 'invalid_artifact')
+                }
+                [void]$directoryTargets.Add($parentTarget)
+                $parentTarget =
+                    [System.IO.Path]::GetDirectoryName($parentTarget)
+            }
+
             if (
                 -not $isDirectory -and
                 $entry.FullName -ceq 'final.md'
@@ -508,14 +665,32 @@ function Test-SafeArchive(
             }
 
             if (-not $isDirectory) {
+                if (
+                    [long]$metadata.UncompressedSize -gt $MaximumEntryBytes -or
+                    [long]$metadata.UncompressedSize -gt
+                        $MaximumExtractedBytes - $declaredTotal
+                ) {
+                    throw (New-TransferException 'invalid_artifact')
+                }
+                $declaredTotal += [long]$metadata.UncompressedSize
                 $entryStream = $null
                 try {
                     $entryStream = $entry.Open()
-                    $actualCrc =
-                        [OcrTransfer.ArchiveIntegrity]::ReadCrc32($entryStream)
-                    if ($actualCrc -ne $metadata.Crc32) {
+                    $integrity =
+                        [OcrTransfer.ArchiveIntegrity]::ReadAndMeasureCrc32(
+                            $entryStream,
+                            $MaximumEntryBytes
+                        )
+                    if (
+                        $integrity.Crc32 -ne $metadata.Crc32 -or
+                        $integrity.Length -ne
+                            [long]$metadata.UncompressedSize -or
+                        $integrity.Length -gt
+                            $MaximumExtractedBytes - $actualTotal
+                    ) {
                         throw (New-TransferException 'invalid_artifact')
                     }
+                    $actualTotal += $integrity.Length
                 } finally {
                     if ($null -ne $entryStream) { $entryStream.Dispose() }
                 }
@@ -541,7 +716,10 @@ function Test-SafeArchive(
 
 function Expand-SafeArchive(
     [string]$ZipPath,
-    [string]$ExtractionRoot
+    [string]$ExtractionRoot,
+    [long]$MaximumEntryBytes,
+    [long]$MaximumExtractedBytes,
+    [int]$MaximumEntries
 ) {
     $fileStream = $null
     $archive = $null
@@ -558,8 +736,14 @@ function Expand-SafeArchive(
             [System.IO.Compression.ZipArchiveMode]::Read,
             $false
         )
+        $entryCount = 0
+        $extractedTotal = 0L
 
         foreach ($entry in $archive.Entries) {
+            $entryCount += 1
+            if ($entryCount -gt $MaximumEntries) {
+                throw (New-TransferException 'invalid_artifact')
+            }
             $target = Get-SafeArchiveTarget $entry.FullName $ExtractionRoot
             $isDirectory = $entry.FullName.EndsWith(
                 '/',
@@ -582,7 +766,19 @@ function Expand-SafeArchive(
                     [System.IO.FileAccess]::Write,
                     [System.IO.FileShare]::None
                 )
-                $entryStream.CopyTo($targetStream)
+                $written =
+                    [OcrTransfer.ArchiveIntegrity]::CopyWithLimit(
+                        $entryStream,
+                        $targetStream,
+                        $MaximumEntryBytes
+                    )
+                if (
+                    $written -ne $entry.Length -or
+                    $written -gt $MaximumExtractedBytes - $extractedTotal
+                ) {
+                    throw (New-TransferException 'invalid_artifact')
+                }
+                $extractedTotal += $written
                 $targetStream.Flush($true)
             } finally {
                 if ($null -ne $targetStream) { $targetStream.Dispose() }
@@ -601,6 +797,70 @@ function Expand-SafeArchive(
     }
 }
 
+function Test-IsReparsePoint([string]$LiteralPath) {
+    if (
+        -not [System.IO.File]::Exists($LiteralPath) -and
+        -not [System.IO.Directory]::Exists($LiteralPath)
+    ) {
+        return $false
+    }
+    $attributes = [System.IO.File]::GetAttributes($LiteralPath)
+    return (
+        $attributes -band [System.IO.FileAttributes]::ReparsePoint
+    ) -ne 0
+}
+
+function Assert-NoReparseComponents([string]$LiteralPath) {
+    $fullPath = [System.IO.Path]::GetFullPath($LiteralPath)
+    $pathRoot = [System.IO.Path]::GetPathRoot($fullPath)
+    $separators = [char[]]@(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    )
+    $segments = $fullPath.Substring($pathRoot.Length).Split(
+        $separators,
+        [System.StringSplitOptions]::RemoveEmptyEntries
+    )
+    $current = $pathRoot
+    foreach ($segment in $segments) {
+        $current = [System.IO.Path]::Combine($current, $segment)
+        if (Test-IsReparsePoint $current) {
+            throw (New-TransferException 'download_failed')
+        }
+    }
+}
+
+function Remove-SafePath([string]$LiteralPath) {
+    if (
+        -not [System.IO.File]::Exists($LiteralPath) -and
+        -not [System.IO.Directory]::Exists($LiteralPath)
+    ) {
+        return
+    }
+
+    $attributes = [System.IO.File]::GetAttributes($LiteralPath)
+    $isDirectory =
+        ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+    $isReparsePoint =
+        ($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    if (-not $isDirectory) {
+        [System.IO.File]::Delete($LiteralPath)
+        return
+    }
+    if ($isReparsePoint) {
+        [System.IO.Directory]::Delete($LiteralPath, $false)
+        return
+    }
+
+    foreach (
+        $child in
+            [System.IO.Directory]::EnumerateFileSystemEntries($LiteralPath)
+    ) {
+        Remove-SafePath $child
+    }
+    [System.IO.Directory]::Delete($LiteralPath, $false)
+}
+
 function Invoke-Download(
     [string]$ArtifactId,
     [string]$OutputRoot,
@@ -614,7 +874,9 @@ function Invoke-Download(
 
     try {
         $root = [System.IO.Path]::GetFullPath($OutputRoot)
+        Assert-NoReparseComponents $root
         [void][System.IO.Directory]::CreateDirectory($root)
+        Assert-NoReparseComponents $root
     } catch {
         if ($_.Exception.Data['TransferCode']) {
             throw
@@ -634,6 +896,14 @@ function Invoke-Download(
     )
     $entryCount = 0
     $reusedZip = $false
+    $maximumDownloadBytes = Get-ConfiguredMaximum `
+        'OCR_MCP_MAX_DOWNLOAD_BYTES' $script:MaximumDownloadBytes
+    $maximumEntryBytes = Get-ConfiguredMaximum `
+        'OCR_MCP_MAX_ENTRY_BYTES' $script:MaximumArchiveEntryBytes
+    $maximumExtractedBytes = Get-ConfiguredMaximum `
+        'OCR_MCP_MAX_EXTRACTED_BYTES' $script:MaximumExtractedBytes
+    $maximumEntries = [int](Get-ConfiguredMaximum `
+        'OCR_MCP_MAX_ARCHIVE_ENTRIES' $script:MaximumArchiveEntries)
 
     try {
         if (
@@ -649,10 +919,18 @@ function Invoke-Download(
             throw (New-TransferException 'download_failed')
         }
 
-        if (Test-Path -LiteralPath $zipPath -PathType Leaf) {
+        if (
+            (Test-Path -LiteralPath $zipPath -PathType Leaf) -and
+            -not (Test-IsReparsePoint $zipPath)
+        ) {
             try {
                 $existingValidation =
-                    Test-SafeArchive $zipPath $extractingPath
+                    Test-SafeArchive `
+                        $zipPath `
+                        $extractingPath `
+                        $maximumEntryBytes `
+                        $maximumExtractedBytes `
+                        $maximumEntries
                 $entryCount = [int]$existingValidation.entry_count
                 $reusedZip = $true
             } catch {
@@ -660,51 +938,51 @@ function Invoke-Download(
             }
         }
 
-        if (
-            $reusedZip -and
-            (Test-Path -LiteralPath $extractPath -PathType Container) -and
-            (Test-Path -LiteralPath (
-                [System.IO.Path]::Combine($extractPath, 'final.md')
-            ) -PathType Leaf)
-        ) {
-            return @{
-                zip_path = $zipPath
-                extract_path = $extractPath
-                entry_count = $entryCount
-                reused = $true
-            }
-        }
-
         if (-not $reusedZip) {
             if (Test-Path -LiteralPath $partialPath) {
-                Remove-Item -LiteralPath $partialPath -Force
+                Remove-SafePath $partialPath
             }
             Invoke-ArtifactDownload `
-                $ArtifactId $ApiKey $Endpoint $partialPath
+                $ArtifactId `
+                $ApiKey `
+                $Endpoint `
+                $partialPath `
+                $maximumDownloadBytes
             $downloadValidation =
-                Test-SafeArchive $partialPath $extractingPath
+                Test-SafeArchive `
+                    $partialPath `
+                    $extractingPath `
+                    $maximumEntryBytes `
+                    $maximumExtractedBytes `
+                    $maximumEntries
             $entryCount = [int]$downloadValidation.entry_count
 
-            if (Test-Path -LiteralPath $zipPath -PathType Leaf) {
-                Remove-Item -LiteralPath $zipPath -Force
+            if (Test-Path -LiteralPath $zipPath) {
+                Remove-SafePath $zipPath
             }
             Move-Item -LiteralPath $partialPath -Destination $zipPath
         }
 
         if (Test-Path -LiteralPath $extractingPath) {
-            Remove-Item -LiteralPath $extractingPath -Recurse -Force
+            Remove-SafePath $extractingPath
         }
-        Expand-SafeArchive $zipPath $extractingPath
+        Expand-SafeArchive `
+            $zipPath `
+            $extractingPath `
+            $maximumEntryBytes `
+            $maximumExtractedBytes `
+            $maximumEntries
         if (-not (Test-Path -LiteralPath (
             [System.IO.Path]::Combine($extractingPath, 'final.md')
         ) -PathType Leaf)) {
             throw (New-TransferException 'invalid_artifact')
         }
 
-        if (Test-Path -LiteralPath $extractPath -PathType Container) {
-            Remove-Item -LiteralPath $extractPath -Recurse -Force
+        if (Test-Path -LiteralPath $extractPath) {
+            Remove-SafePath $extractPath
         }
         Move-Item -LiteralPath $extractingPath -Destination $extractPath
+        Assert-NoReparseComponents $extractPath
 
         return @{
             zip_path = $zipPath
@@ -713,11 +991,11 @@ function Invoke-Download(
             reused = $reusedZip
         }
     } finally {
-        if (Test-Path -LiteralPath $partialPath -PathType Leaf) {
-            Remove-Item -LiteralPath $partialPath -Force
+        if (Test-Path -LiteralPath $partialPath) {
+            Remove-SafePath $partialPath
         }
-        if (Test-Path -LiteralPath $extractingPath -PathType Container) {
-            Remove-Item -LiteralPath $extractingPath -Recurse -Force
+        if (Test-Path -LiteralPath $extractingPath) {
+            Remove-SafePath $extractingPath
         }
     }
 }
