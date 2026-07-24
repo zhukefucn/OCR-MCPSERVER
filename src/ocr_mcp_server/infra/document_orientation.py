@@ -8,7 +8,10 @@ from PIL import Image, ImageOps
 from pypdf import PdfReader, PdfWriter
 
 from ..domain.errors import FileIntakeFailure
-from ..domain.constants import DEFAULT_MAX_BATCH_SIZE_BYTES
+from ..domain.constants import (
+    DEFAULT_MAX_BATCH_SIZE_BYTES,
+    DEFAULT_MAX_FILE_SIZE_BYTES,
+)
 from ..domain.files import SupportedMediaType
 from ..domain.orientation import OrientationErrorCode, OrientationFailure
 from ..domain.secondary_ocr import OrthogonalAngle
@@ -24,7 +27,7 @@ class ImmutableDocumentCorrector:
         self,
         storage: FileStorage,
         *,
-        max_file_size_bytes: int = 30 * 1024 * 1024,
+        max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES,
         max_batch_size_bytes: int = DEFAULT_MAX_BATCH_SIZE_BYTES,
         max_pages: int = 500,
         max_image_pixels: int = 100_000_000,

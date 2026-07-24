@@ -106,6 +106,55 @@ async def test_schema_upgrade_adds_durable_takeover_proof_columns(
         await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_schema_upgrade_expands_recovery_file_limits_without_data_loss(
+    repository,
+) -> None:
+    repo, engine, batch_id, _ = repository
+    issue = await repo.issue(binding(batch_id), now=NOW)
+    digest = sha256(issue.token.encode("utf-8")).hexdigest()
+    path = Path(str(engine.url.database))
+    await engine.dispose()
+
+    with sqlite3.connect(path) as connection:
+        schema = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'orientation_recoveries'"
+        ).fetchone()[0]
+        if "62914560" in schema:
+            assert schema.count("62914560") == 2
+            connection.execute("PRAGMA writable_schema=ON")
+            connection.execute(
+                "UPDATE sqlite_master SET sql = replace(sql, '62914560', '31457280') "
+                "WHERE type = 'table' AND name = 'orientation_recoveries'"
+            )
+            connection.execute("PRAGMA writable_schema=OFF")
+
+    restarted = create_database_engine(database_url(path))
+    try:
+        await initialize_schema(restarted)
+        await initialize_schema(restarted)
+        async with restarted.connect() as connection:
+            schema = (
+                await connection.exec_driver_sql(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'orientation_recoveries'"
+                )
+            ).scalar_one()
+            retained = await connection.scalar(
+                text(
+                    "SELECT count(*) FROM orientation_recoveries "
+                    "WHERE token_digest = :digest"
+                ),
+                {"digest": digest},
+            )
+        assert schema.count("62914560") == 2
+        assert "31457280" not in schema
+        assert retained == 1
+    finally:
+        await restarted.dispose()
+
+
 @pytest_asyncio.fixture
 async def repository(tmp_path: Path):
     engine = create_database_engine(database_url(tmp_path / "recovery.sqlite3"))

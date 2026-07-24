@@ -17,6 +17,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.constants import PageLabelStyle
 from pypdf.generic import NameObject, NumberObject, TextStringObject
 
+from ocr_mcp_server.domain.constants import DEFAULT_MAX_FILE_SIZE_BYTES
 from ocr_mcp_server.domain.files import IncomingFile, SupportedMediaType
 from ocr_mcp_server.domain.orientation import OrientationDecision, OrientationFailure
 from ocr_mcp_server.domain.secondary_ocr import OrthogonalAngle
@@ -30,6 +31,11 @@ from ocr_mcp_server.services.orientation_recovery import OrientationCorrectionRe
 
 async def _chunks(payload: bytes) -> AsyncIterator[bytes]:
     yield payload
+
+
+def test_corrector_default_file_limit_tracks_service_contract(tmp_path: Path) -> None:
+    corrector = _ImmutableDocumentCorrector(FileStorage(tmp_path))
+    assert corrector._max_file_size_bytes == DEFAULT_MAX_FILE_SIZE_BYTES
 
 
 def _pdf_bytes() -> bytes:

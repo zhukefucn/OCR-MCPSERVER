@@ -18,6 +18,7 @@ from ocr_mcp_server.api.gateway import (
     GatewayOrientationUncertain,
     GatewayUnavailable,
 )
+from ocr_mcp_server.domain.constants import DEFAULT_MAX_FILE_SIZE_BYTES
 from ocr_mcp_server.domain.files import IncomingFile, StoredFile, SupportedMediaType
 from ocr_mcp_server.domain.errors import FileIntakeFailure
 from ocr_mcp_server.domain.models import BatchStatus
@@ -84,6 +85,14 @@ def test_pipeline_submission_requires_content_free_durable_takeover_proof():
     ):
         with pytest.raises(ValueError):
             pipeline_submission(**changes)
+
+
+def test_pipeline_submission_accepts_60mib_boundary_and_rejects_above():
+    boundary = pipeline_submission(accepted_input_size_bytes=60 * 1024 * 1024)
+    assert boundary.accepted_input_size_bytes == 60 * 1024 * 1024
+
+    with pytest.raises(ValueError):
+        pipeline_submission(accepted_input_size_bytes=60 * 1024 * 1024 + 1)
 
 
 def snapshot(state: RecoveryState = RecoveryState.ISSUED) -> RecoverySnapshot:
@@ -1036,7 +1045,7 @@ async def test_file_storage_resolve_rejects_oversized_otherwise_valid_pdf(tmp_pa
     writer = PdfWriter()
     writer.add_blank_page(width=100, height=100)
     writer.write(output)
-    payload = output.getvalue() + b"\0" * (30 * 1024 * 1024)
+    payload = output.getvalue() + b"\0" * DEFAULT_MAX_FILE_SIZE_BYTES
 
     async def chunks():
         yield payload

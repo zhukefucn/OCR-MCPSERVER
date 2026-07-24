@@ -16,6 +16,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from ..domain.constants import DEFAULT_MAX_FILE_SIZE_BYTES
+
 
 class Base(DeclarativeBase):
     pass
@@ -355,7 +357,8 @@ class OrientationRecoveryRecord(Base):
         ),
         CheckConstraint(
             "corrected_input_size_bytes IS NULL OR "
-            "(corrected_input_size_bytes >= 1 AND corrected_input_size_bytes <= 31457280)"
+            "(corrected_input_size_bytes >= 1 AND corrected_input_size_bytes <= "
+            f"{DEFAULT_MAX_FILE_SIZE_BYTES})"
         ),
         CheckConstraint("result_version IS NULL OR result_version >= 1"),
         CheckConstraint(
@@ -364,7 +367,8 @@ class OrientationRecoveryRecord(Base):
         ),
         CheckConstraint(
             "accepted_input_size_bytes IS NULL OR "
-            "(accepted_input_size_bytes >= 1 AND accepted_input_size_bytes <= 31457280)"
+            "(accepted_input_size_bytes >= 1 AND accepted_input_size_bytes <= "
+            f"{DEFAULT_MAX_FILE_SIZE_BYTES})"
         ),
         CheckConstraint("version >= 1"),
     )
