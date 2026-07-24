@@ -76,6 +76,27 @@ def test_skill_encodes_complete_workflow_and_security_rules() -> None:
     assert "ocr-results/<batch_id>/" in text
 
 
+def test_skill_counts_every_source_type_toward_batch_limit() -> None:
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    assert (
+        "本地路径、已批准的 HTTPS URL 和已有 `file_id` 三类 `sources` "
+        "合计 1 至 20 个"
+    ) in text
+
+
+def test_skill_requires_content_free_idempotency_keys_and_retry_reuse() -> None:
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    assert "使用无内容随机标识作为幂等键" in text
+    for forbidden_content in (
+        "不得包含文件名",
+        "不得包含路径",
+        "不得包含业务正文",
+        "不得包含 OCR 正文",
+    ):
+        assert forbidden_content in text
+    assert "同一逻辑提交重试必须复用原幂等键" in text
+
+
 def test_skill_encodes_resume_and_orientation_gate() -> None:
     text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
     assert "已有 `batch_id` 时，跳过上传和提交" in text
