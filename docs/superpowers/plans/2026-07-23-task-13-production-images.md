@@ -189,7 +189,7 @@ Keep `create_app()` dependency-injectable for tests. The CLI path creates real r
 
 - [ ] **Step 3: Write failing concrete gateway tests**
 
-Cover upload streaming/idempotency, approved local/HTTPS sources, 20-file/30MB/500-page/1GiB limits, durable batch creation, progress callbacks, safe exception mapping, status/artifact links, orientation decoration, and exact REST/MCP response equivalence. Assert no content-bearing values reach logs or errors.
+Cover upload streaming/idempotency, approved local/HTTPS sources, 20-file/60MiB/500-page/1GiB limits, durable batch creation, progress callbacks, safe exception mapping, status/artifact links, orientation decoration, and exact REST/MCP response equivalence. Assert no content-bearing values reach logs or errors.
 
 - [ ] **Step 4: Implement the minimal gateway facade**
 

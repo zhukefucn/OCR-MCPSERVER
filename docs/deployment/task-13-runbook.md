@@ -15,6 +15,8 @@ before creating immutable image tags.
 
 ```bash
 docker compose --profile production up -d mineru-vlm mineru-api ocr-production
+docker compose --profile production exec -T ocr-production \
+  python -c "from ocr_mcp_server.settings import load_settings; assert load_settings().limits.max_file_size_bytes == 62914560"
 if [ -z "${OCR_VERIFY_API_KEY:-}" ]; then
   read -rsp 'OCR verification API key: ' OCR_VERIFY_API_KEY
   export OCR_VERIFY_API_KEY
