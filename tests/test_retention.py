@@ -1,0 +1,1328 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import UTC, datetime, timedelta
+from io import BytesIO
+import os
+from pathlib import Path
+from uuid import uuid4
+
+import pytest
+import pytest_asyncio
+from pypdf import PdfWriter
+from sqlalchemy import func, select
+
+from ocr_mcp_server.domain.errors import (
+    FileIntakeFailure,
+    RetentionErrorCode,
+    RetentionFailure,
+)
+from ocr_mcp_server.domain.retention import RetentionPhase
+from ocr_mcp_server.infra.database import (
+    create_database_engine,
+    create_session_factory,
+    initialize_schema,
+)
+from ocr_mcp_server.infra.retention_repository import RetentionRepository
+from ocr_mcp_server.infra.orientation_assessment_repository import (
+    OrientationAssessmentRepository,
+)
+from ocr_mcp_server.infra.task_models import (
+    ArtifactRecord,
+    BatchLockMarkerRecord,
+    BatchRecord,
+    FileTaskRecord,
+    ReplacementAuditMetadataRecord,
+    RetentionRecord,
+    OrientationAssessmentRecord,
+    StageEventRecord,
+)
+from ocr_mcp_server.infra.task_repository import TaskRepository
+from ocr_mcp_server.domain.files import IncomingFile
+from ocr_mcp_server.services.file_intake import FileIntakeService
+from ocr_mcp_server.services.file_storage import BatchLockLease, FileStorage
+from ocr_mcp_server.services.file_validation import FileValidator
+from ocr_mcp_server.services.retention import OwnedBatchRootDeleter, RetentionService
+from ocr_mcp_server.settings import AppSettings
+
+
+NOW = datetime(2026, 1, 1, 12, tzinfo=UTC)
+
+
+def _pdf_bytes() -> bytes:
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
+def _intake_service(data_root: Path, guards) -> FileIntakeService:
+    return FileIntakeService(
+        storage=FileStorage(data_root),
+        content_write_guards=guards,
+        validator=FileValidator(max_pages=10, max_image_pixels=1_000),
+        max_files=20,
+        max_file_size_bytes=1_000_000,
+        max_batch_size_bytes=1_000_000,
+        now_factory=lambda: NOW,
+    )
+
+
+def _db_url(path: Path) -> str:
+    return f"sqlite+aiosqlite:///{path.as_posix()}"
+
+
+@pytest_asyncio.fixture
+async def retention_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from ocr_mcp_server.infra import task_repository as task_repository_module
+
+    monkeypatch.setattr(task_repository_module, "utc_now", lambda: NOW)
+    engine = create_database_engine(_db_url(tmp_path / "retention.sqlite3"))
+    await initialize_schema(engine)
+    sessions = create_session_factory(engine)
+    tasks = TaskRepository(sessions)
+    repository = RetentionRepository(sessions)
+    try:
+        yield repository, tasks, sessions, engine
+    finally:
+        await engine.dispose()
+
+
+async def _create_batch(tasks: TaskRepository, key: str):
+    file_id = str(uuid4())
+    created = await tasks.create_batch(
+        key,
+        [file_id],
+        input_retention_hours=24,
+        intermediate_retention_hours=12,
+        result_retention_hours=6,
+        audit_metadata_retention_days=30,
+    )
+    return created.batch.id, file_id
+
+
+@pytest.mark.asyncio
+async def test_content_cleanup_invalidates_orientation_tokens_before_tombstones_and_delete(
+    tmp_path: Path, retention_repository,
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "orientation-invalidation-order")
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    (data_root / batch_id).mkdir(parents=True)
+    (artifact_root / batch_id).mkdir(parents=True)
+    events: list[str] = []
+    original_invalidate = repository.invalidate_orientation_recoveries
+
+    async def invalidate(claim, *, now):
+        async with sessions() as session:
+            state = await session.get(RetentionRecord, claim.batch_id)
+            assert state.data_tombstone is None and state.artifact_tombstone is None
+        events.append("invalidate")
+        return await original_invalidate(claim, now=now)
+
+    repository.invalidate_orientation_recoveries = invalidate
+
+    class Deleter:
+        def __init__(self):
+            self.real = OwnedBatchRootDeleter()
+
+        def delete(self, root, selected_batch_id, *, tombstone_name=None):
+            events.append("delete-data" if root == data_root else "delete-artifact")
+            self.real.delete(
+                root, selected_batch_id, tombstone_name=tombstone_name
+            )
+
+    result = await RetentionService(
+        repository,
+        data_root,
+        artifact_root,
+        deleter=Deleter(),
+    ).run_once("worker", now=NOW + timedelta(hours=24), lease_seconds=60, limit=1)
+
+    assert (result.content_deleted, result.failed) == (1, 0)
+    assert events == ["invalidate", "delete-data", "delete-artifact"]
+
+
+@pytest.mark.asyncio
+async def test_orientation_invalidation_failure_aborts_content_deletion_safely(
+    tmp_path: Path, retention_repository,
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "orientation-invalidation-failure")
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    (data_root / batch_id).mkdir(parents=True)
+    (artifact_root / batch_id).mkdir(parents=True)
+
+    async def invalidation_failure(claim, *, now):
+        raise RuntimeError("private document text")
+
+    repository.invalidate_orientation_recoveries = invalidation_failure
+
+    class ForbiddenDeleter:
+        def delete(self, *args, **kwargs):
+            raise AssertionError("deletion must not start")
+
+    result = await RetentionService(
+        repository,
+        data_root,
+        artifact_root,
+        deleter=ForbiddenDeleter(),
+    ).run_once("worker", now=NOW + timedelta(hours=24), lease_seconds=60, limit=1)
+
+    assert (result.content_deleted, result.failed) == (0, 1)
+    assert "private" not in repr(result)
+    state = await repository.get(batch_id)
+    assert state.content_deleted_at is None
+    async with sessions() as session:
+        retained = await session.get(
+            RetentionRecord,
+            batch_id,
+        )
+        assert retained.data_tombstone is None and retained.artifact_tombstone is None
+        assert retained.last_error_code == RetentionErrorCode.CLEANUP_FAILED.value
+
+
+@pytest.mark.asyncio
+async def test_orientation_invalidation_without_rows_is_zero_and_retry_idempotent(
+    retention_repository,
+) -> None:
+    repository, tasks, _, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "orientation-invalidation-empty")
+    assert await repository.request_early_delete(batch_id, now=NOW)
+    claim = await repository.claim_batch(
+        batch_id, "cleanup", now=NOW, lease_seconds=60
+    )
+
+    assert await repository.invalidate_orientation_recoveries(claim, now=NOW) == 0
+    assert await repository.invalidate_orientation_recoveries(claim, now=NOW) == 0
+
+
+@pytest.mark.asyncio
+async def test_due_boundaries_are_exact_and_claims_are_bounded_and_deterministic(
+    retention_repository,
+) -> None:
+    repository, tasks, _, _ = retention_repository
+    first, _ = await _create_batch(tasks, "first")
+    second, _ = await _create_batch(tasks, "second")
+
+    state = await repository.get(first)
+    assert state.content_due_at == NOW + timedelta(hours=24)
+    assert state.metadata_due_at == NOW + timedelta(days=30)
+    assert await repository.claim_due(
+        "worker", now=state.content_due_at - timedelta(microseconds=1),
+        lease_seconds=60, limit=1,
+    ) == ()
+
+    claim = await repository.claim_due(
+        "worker", now=state.content_due_at, lease_seconds=60, limit=1
+    )
+    assert len(claim) == 1
+    assert claim[0].batch_id == min(first, second)
+    assert claim[0].phase is RetentionPhase.CONTENT
+    assert claim[0].lease_expires_at == state.content_due_at + timedelta(seconds=60)
+
+
+@pytest.mark.asyncio
+async def test_claim_is_exclusive_until_lease_expiry_then_recoverable(
+    retention_repository,
+) -> None:
+    repository, tasks, _, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "lease")
+    due = NOW + timedelta(hours=24)
+
+    first = (await repository.claim_due(
+        "one", now=due, lease_seconds=10, limit=1
+    ))[0]
+    assert await repository.claim_due(
+        "two", now=due + timedelta(seconds=9), lease_seconds=10, limit=1
+    ) == ()
+    reclaimed = (await repository.claim_due(
+        "two", now=due + timedelta(seconds=10), lease_seconds=10, limit=1
+    ))[0]
+
+    assert reclaimed.batch_id == batch_id
+    assert reclaimed.claim_token != first.claim_token
+    assert reclaimed.attempt == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cleanup_claims_select_a_batch_only_once(
+    retention_repository,
+) -> None:
+    repository, tasks, _, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "concurrent")
+    due = NOW + timedelta(hours=24)
+
+    claims = await asyncio.gather(
+        repository.claim_due("one", now=due, lease_seconds=60, limit=1),
+        repository.claim_due("two", now=due, lease_seconds=60, limit=1),
+    )
+
+    flattened = tuple(claim for group in claims for claim in group)
+    assert len(flattened) == 1
+    assert flattened[0].batch_id == batch_id
+
+
+async def _insert_artifact(
+    sessions, batch_id: str, file_id: str, *, with_audit: bool = False
+) -> None:
+    async with sessions() as session:
+        session.add(
+            ArtifactRecord(
+                id="artifact-" + "a" * 64,
+                file_id=file_id,
+                batch_id=batch_id,
+                source_version=1,
+                result_version=1,
+                storage_key=batch_id + "/artifact-" + "a" * 64 + ".zip",
+                media_type="application/zip",
+                size_bytes=1,
+                sha256="b" * 64,
+                manifest_sha256="c" * 64,
+                audit_metadata_sha256="d" * 64,
+                audit_record_count=1 if with_audit else 0,
+                created_at=NOW,
+                expires_at=NOW + timedelta(hours=24),
+                available=True,
+                deleted_at=None,
+                version=1,
+            )
+        )
+        if with_audit:
+            session.add(
+                ReplacementAuditMetadataRecord(
+                    audit_id="audit-" + "e" * 64,
+                    artifact_id="artifact-" + "a" * 64,
+                    record_id="secondary-" + "f" * 64,
+                    candidate_id="candidate-" + "1" * 64,
+                    file_id=file_id,
+                    batch_id=batch_id,
+                    source_version=1,
+                    output_version=1,
+                    image_sha256="2" * 64,
+                    decision="replaced",
+                    reason="replaced_table",
+                    kind="table",
+                    angle=0,
+                    confidence=0.9,
+                    engine="pp_structure_v3",
+                    model_versions_json="{}",
+                    timestamp=NOW,
+                )
+            )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_partial_content_failure_is_retryable_and_does_not_mark_db_unavailable(
+    tmp_path: Path, retention_repository,
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, file_id = await _create_batch(tasks, "partial")
+    await _insert_artifact(sessions, batch_id, file_id)
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    (data_root / batch_id / "input").mkdir(parents=True)
+    (data_root / batch_id / "input" / "source.bin").write_bytes(b"source")
+    (artifact_root / batch_id).mkdir(parents=True)
+    (artifact_root / batch_id / "result.zip").write_bytes(b"result")
+
+    class FailArtifactOnce:
+        def __init__(self) -> None:
+            self.failed = False
+            self.real = OwnedBatchRootDeleter()
+
+        def delete(
+            self, root: Path, selected_batch_id: str, *, tombstone_name=None
+        ) -> None:
+            if root == artifact_root and not self.failed:
+                self.failed = True
+                raise RetentionFailure(RetentionErrorCode.CLEANUP_FAILED)
+            self.real.delete(
+                root, selected_batch_id, tombstone_name=tombstone_name
+            )
+
+    service = RetentionService(repository, data_root, artifact_root, deleter=FailArtifactOnce())
+    result = await service.run_once(
+        "worker", now=NOW + timedelta(hours=24), lease_seconds=60, limit=1
+    )
+    assert result.failed == 1
+    assert not (data_root / batch_id).exists()
+    assert (artifact_root / batch_id).exists()
+    async with sessions() as session:
+        artifact = await session.get(ArtifactRecord, "artifact-" + "a" * 64)
+        assert artifact.available is True
+        assert artifact.deleted_at is None
+
+    retried = await service.run_once(
+        "worker", now=NOW + timedelta(hours=24), lease_seconds=60, limit=1
+    )
+    assert (retried.content_deleted, retried.failed) == (1, 0)
+    assert not (artifact_root / batch_id).exists()
+    async with sessions() as session:
+        artifact = await session.get(ArtifactRecord, "artifact-" + "a" * 64)
+        assert artifact.available is False
+        assert artifact.deleted_at == (NOW + timedelta(hours=24)).replace(tzinfo=None)
+    published_archives = list(artifact_root.rglob("*.zip"))
+    assert published_archives
+    assert all(path.stat().st_size == 0 for path in published_archives)
+
+
+@pytest.mark.asyncio
+async def test_content_cleanup_retires_the_batch_lock_with_a_content_free_marker(
+    tmp_path: Path, retention_repository,
+) -> None:
+    repository, tasks, _, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "lock-placeholder")
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    (data_root / batch_id).mkdir(parents=True)
+    (artifact_root / batch_id).mkdir(parents=True)
+    lock_path = data_root / ".locks" / f"{batch_id}.lock"
+
+    result = await RetentionService(repository, data_root, artifact_root).run_once(
+        "worker", now=NOW + timedelta(hours=24), lease_seconds=60, limit=1
+    )
+
+    assert (result.content_deleted, result.failed) == (1, 0)
+    assert lock_path.exists()
+    assert lock_path.read_bytes() == b"\x01"
+
+
+@pytest.mark.asyncio
+async def test_retired_lock_name_swap_preserves_replacement_and_fails_closed(
+    tmp_path: Path, retention_repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, tasks, _, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "lock-name-swap")
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    (data_root / batch_id).mkdir(parents=True)
+    (artifact_root / batch_id).mkdir(parents=True)
+    lock_path = data_root / ".locks" / f"{batch_id}.lock"
+    moved = lock_path.with_name("moved-original.lock")
+    original_retire = BatchLockLease.retire
+
+    def swap_before_retire(lease):
+        __import__("os").rename(lock_path, moved)
+        lock_path.write_bytes(b"replacement")
+        original_retire(lease)
+
+    monkeypatch.setattr(BatchLockLease, "retire", swap_before_retire)
+    with pytest.raises(RetentionFailure):
+        await RetentionService(repository, data_root, artifact_root).delete_task(
+            batch_id, now=NOW, worker_id="cleanup"
+        )
+
+    assert lock_path.read_bytes() == b"replacement"
+    assert moved.read_bytes() == b"\x01"
+    assert (await repository.get(batch_id)).content_deleted_at is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_retry_never_adopts_or_mutates_a_lock_name_replacement(
+    tmp_path: Path, retention_repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, tasks, _, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "lock-retry-name-swap")
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    (data_root / batch_id).mkdir(parents=True)
+    (artifact_root / batch_id).mkdir(parents=True)
+    lock_path = data_root / ".locks" / f"{batch_id}.lock"
+    moved = lock_path.with_name("moved-original.lock")
+    original_retire = BatchLockLease.retire
+    swapped = False
+
+    def swap_once(lease):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            __import__("os").rename(lock_path, moved)
+            lock_path.write_bytes(b"\x00")
+        original_retire(lease)
+
+    monkeypatch.setattr(BatchLockLease, "retire", swap_once)
+    service = RetentionService(repository, data_root, artifact_root)
+    with pytest.raises(RetentionFailure):
+        await service.delete_task(batch_id, now=NOW, worker_id="cleanup")
+    assert lock_path.read_bytes() == b"\x00"
+
+    monkeypatch.setattr(BatchLockLease, "retire", original_retire)
+    with pytest.raises(RetentionFailure):
+        await service.delete_task(
+            batch_id, now=NOW + timedelta(seconds=1), worker_id="cleanup"
+        )
+    assert lock_path.read_bytes() == b"\x00"
+    assert (await repository.get(batch_id)).content_deleted_at is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_rejects_an_unknown_preexisting_lock_without_mutation(
+    tmp_path: Path, retention_repository,
+) -> None:
+    repository, tasks, _, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "unknown-lock")
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    (data_root / batch_id).mkdir(parents=True)
+    (artifact_root / batch_id).mkdir(parents=True)
+    lock_path = data_root / ".locks" / f"{batch_id}.lock"
+    lock_path.parent.mkdir()
+    planted = b"unknown preexisting marker"
+    lock_path.write_bytes(planted)
+
+    with pytest.raises(RetentionFailure):
+        await RetentionService(repository, data_root, artifact_root).delete_task(
+            batch_id, now=NOW, worker_id="cleanup"
+        )
+
+    assert lock_path.read_bytes() == planted
+    assert (await repository.get(batch_id)).content_deleted_at is None
+
+
+@pytest.mark.asyncio
+async def test_fresh_marker_survives_pre_bind_crash_and_is_recovered(
+    tmp_path: Path, retention_repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "pre-bind-crash")
+    data_root = (tmp_path / "data").absolute()
+    storage = FileStorage(data_root)
+    lock_path = data_root / ".locks" / f"{batch_id}.lock"
+    original_bind = repository.bind_lock_marker
+    attempts = 0
+
+    async def fail_before_first_commit(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT)
+        return await original_bind(*args, **kwargs)
+
+    monkeypatch.setattr(repository, "bind_lock_marker", fail_before_first_commit)
+    with pytest.raises(RetentionFailure) as first:
+        async with storage.batch_lock(batch_id, marker_registry=repository):
+            raise AssertionError("the injected bind failure must prevent entry")
+    assert first.value.code == RetentionErrorCode.CLAIM_CONFLICT.value
+    assert lock_path.read_bytes() == b"\x00"
+    async with sessions() as session:
+        assert await session.get(BatchLockMarkerRecord, batch_id) is None
+
+    async with storage.batch_lock(batch_id, marker_registry=repository):
+        pass
+
+    info = lock_path.stat()
+    async with sessions() as session:
+        marker = await session.get(BatchLockMarkerRecord, batch_id)
+        assert marker.identity == f"{info.st_dev:x}:{info.st_ino:x}"
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_empty_marker_survives_pre_lock_crash_and_is_recovered(
+    tmp_path: Path, retention_repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "pre-lock-crash")
+    data_root = (tmp_path / "data").absolute()
+    crashed_storage = FileStorage(data_root)
+    lock_path = data_root / ".locks" / f"{batch_id}.lock"
+
+    def crash_before_first_lock(_descriptor: int) -> bool:
+        raise RuntimeError("simulated crash before marker initialization")
+
+    monkeypatch.setattr(crashed_storage, "_try_batch_lock", crash_before_first_lock)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        async with crashed_storage.batch_lock(
+            batch_id, marker_registry=repository
+        ):
+            raise AssertionError("the injected crash must prevent entry")
+
+    original = lock_path.stat()
+    assert original.st_nlink == 1
+    assert lock_path.read_bytes() == b""
+    async with sessions() as session:
+        assert await session.get(BatchLockMarkerRecord, batch_id) is None
+
+    async with FileStorage(data_root).batch_lock(
+        batch_id, marker_registry=repository
+    ):
+        pass
+
+    current = lock_path.stat()
+    assert (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino)
+    assert lock_path.read_bytes() == b"\x00"
+    async with sessions() as session:
+        marker = await session.get(BatchLockMarkerRecord, batch_id)
+        assert marker.identity == f"{current.st_dev:x}:{current.st_ino:x}"
+
+
+@pytest.mark.asyncio
+async def test_post_bind_failure_retries_only_the_registered_marker_identity(
+    tmp_path: Path, retention_repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "post-bind-crash")
+    data_root = (tmp_path / "data").absolute()
+    storage = FileStorage(data_root)
+    lock_path = data_root / ".locks" / f"{batch_id}.lock"
+    original_bind = repository.bind_lock_marker
+    attempts = 0
+
+    async def fail_after_first_commit(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        await original_bind(*args, **kwargs)
+        if attempts == 1:
+            raise RetentionFailure(RetentionErrorCode.CLAIM_CONFLICT)
+
+    monkeypatch.setattr(repository, "bind_lock_marker", fail_after_first_commit)
+    with pytest.raises(RetentionFailure):
+        async with storage.batch_lock(batch_id, marker_registry=repository):
+            raise AssertionError("the injected post-bind failure must prevent entry")
+
+    original = lock_path.stat()
+    async with sessions() as session:
+        marker = await session.get(BatchLockMarkerRecord, batch_id)
+        assert marker.identity == f"{original.st_dev:x}:{original.st_ino:x}"
+
+    async with storage.batch_lock(batch_id, marker_registry=repository):
+        pass
+    current = lock_path.stat()
+    assert (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino)
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", [b"\x01", b"\x00extra"])
+async def test_malformed_unbound_marker_is_rejected_without_mutation(
+    tmp_path: Path, retention_repository, malformed: bytes
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, f"malformed-{malformed.hex()}")
+    data_root = (tmp_path / "data").absolute()
+    lock_path = data_root / ".locks" / f"{batch_id}.lock"
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_bytes(malformed)
+
+    with pytest.raises((FileIntakeFailure, RetentionFailure)):
+        async with FileStorage(data_root).batch_lock(
+            batch_id, marker_registry=repository, allow_retired=True
+        ):
+            raise AssertionError("an unbound malformed marker must not be entered")
+
+    assert lock_path.read_bytes() == malformed
+    async with sessions() as session:
+        assert await session.get(BatchLockMarkerRecord, batch_id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("contents", [b"", b"\x00"])
+async def test_hardlinked_unbound_marker_is_rejected_without_mutation(
+    tmp_path: Path, retention_repository, contents: bytes,
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, f"hardlinked-marker-{contents.hex()}")
+    data_root = (tmp_path / "data").absolute()
+    lock_path = data_root / ".locks" / f"{batch_id}.lock"
+    lock_path.parent.mkdir(parents=True)
+    external = tmp_path / "external-marker"
+    external.write_bytes(contents)
+    lock_path.hardlink_to(external)
+
+    with pytest.raises((FileIntakeFailure, RetentionFailure)):
+        async with FileStorage(data_root).batch_lock(
+            batch_id, marker_registry=repository
+        ):
+            raise AssertionError("a multi-link marker must not be entered")
+
+    assert external.read_bytes() == contents
+    assert lock_path.read_bytes() == contents
+    async with sessions() as session:
+        assert await session.get(BatchLockMarkerRecord, batch_id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("matching_identity", [True, False])
+async def test_registered_empty_marker_is_never_initialized(
+    tmp_path: Path, retention_repository, matching_identity: bool,
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, _ = await _create_batch(
+        tasks, f"registered-empty-{matching_identity}"
+    )
+    data_root = (tmp_path / "data").absolute()
+    lock_path = data_root / ".locks" / f"{batch_id}.lock"
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_bytes(b"")
+    info = lock_path.stat()
+    encoded = (
+        f"{info.st_dev:x}:{info.st_ino:x}"
+        if matching_identity
+        else f"{info.st_dev:x}:{info.st_ino + 1:x}"
+    )
+    async with sessions() as session:
+        session.add(BatchLockMarkerRecord(batch_id=batch_id, identity=encoded))
+        await session.commit()
+
+    with pytest.raises((FileIntakeFailure, RetentionFailure)):
+        async with FileStorage(data_root).batch_lock(
+            batch_id, marker_registry=repository
+        ):
+            raise AssertionError("registered empty markers must not be entered")
+
+    assert lock_path.read_bytes() == b""
+    async with sessions() as session:
+        marker = await session.get(BatchLockMarkerRecord, batch_id)
+        assert marker.identity == encoded
+
+
+@pytest.mark.asyncio
+async def test_live_creator_lock_prevents_a_second_opener_from_initializing(
+    tmp_path: Path, retention_repository,
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "live-empty-creator")
+    data_root = (tmp_path / "data").absolute()
+    lock_path = data_root / ".locks" / f"{batch_id}.lock"
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_bytes(b"")
+    creator_descriptor = os.open(
+        lock_path, os.O_RDWR | getattr(os, "O_BINARY", 0)
+    )
+    storage = FileStorage(data_root)
+    assert storage._try_batch_lock(creator_descriptor) is True
+
+    async def open_after_creator() -> None:
+        async with storage.batch_lock(batch_id, marker_registry=repository):
+            pass
+
+    opener = asyncio.create_task(open_after_creator())
+    try:
+        await asyncio.sleep(0.03)
+        assert not opener.done()
+        assert os.fstat(creator_descriptor).st_size == 0
+        os.lseek(creator_descriptor, 0, os.SEEK_SET)
+        os.write(creator_descriptor, b"\x00")
+        os.fsync(creator_descriptor)
+        storage._release_batch_lock(creator_descriptor)
+        os.close(creator_descriptor)
+        creator_descriptor = -1
+        await asyncio.wait_for(opener, timeout=1)
+    finally:
+        if creator_descriptor >= 0:
+            storage._release_batch_lock(creator_descriptor)
+            os.close(creator_descriptor)
+        if not opener.done():
+            opener.cancel()
+            await asyncio.gather(opener, return_exceptions=True)
+
+    assert lock_path.read_bytes() == b"\x00"
+    async with sessions() as session:
+        assert await session.get(BatchLockMarkerRecord, batch_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_partial_scrub_resumes_the_persisted_tombstone_before_db_unavailable(
+    tmp_path: Path, retention_repository,
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, file_id = await _create_batch(tasks, "scrub-resume")
+    await _insert_artifact(sessions, batch_id, file_id)
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    batch = data_root / batch_id
+    batch.mkdir(parents=True)
+    (batch / "one.bin").write_bytes(b"one-private")
+    (batch / "two.bin").write_bytes(b"two-private")
+    (artifact_root / batch_id).mkdir(parents=True)
+
+    class FailSecondScrub(OwnedBatchRootDeleter):
+        calls = 0
+
+        def _scrub_open_regular(
+            self, descriptor, expected, path, *, parent_descriptor, name
+        ):
+            self.calls += 1
+            if self.calls == 2:
+                raise RetentionFailure(RetentionErrorCode.CLEANUP_FAILED)
+            return super()._scrub_open_regular(
+                descriptor,
+                expected,
+                path,
+                parent_descriptor=parent_descriptor,
+                name=name,
+            )
+
+    failed = RetentionService(
+        repository, data_root, artifact_root, deleter=FailSecondScrub()
+    )
+    assert (await failed.run_once(
+        "worker", now=NOW + timedelta(hours=24), lease_seconds=60, limit=1
+    )).failed == 1
+
+    async with sessions() as session:
+        artifact = await session.get(ArtifactRecord, "artifact-" + "a" * 64)
+        assert artifact.available is True
+    remaining = [path for path in data_root.rglob("*.bin")]
+    assert any(path.stat().st_size > 0 for path in remaining)
+
+    recovered = RetentionService(repository, data_root, artifact_root)
+    assert (await recovered.run_once(
+        "worker", now=NOW + timedelta(hours=24), lease_seconds=60, limit=1
+    )).content_deleted == 1
+    assert all(path.stat().st_size == 0 for path in data_root.rglob("*.bin"))
+
+
+@pytest.mark.asyncio
+async def test_metadata_remains_until_exact_30_day_boundary_then_purges_all_task_rows(
+    tmp_path: Path, retention_repository,
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, file_id = await _create_batch(tasks, "purge")
+    assessments = OrientationAssessmentRepository(sessions)
+    assert await assessments.begin(
+        file_id=file_id,
+        batch_id=batch_id,
+        result_version=2,
+        page_count=1,
+        now=NOW,
+        lease_seconds=10,
+    )
+    await _insert_artifact(sessions, batch_id, file_id, with_audit=True)
+    assert await tasks.claim_next("pipeline", now=NOW, lease_seconds=60) is not None
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    (data_root / batch_id).mkdir(parents=True)
+    (artifact_root / batch_id).mkdir(parents=True)
+    service = RetentionService(repository, data_root, artifact_root)
+    lock_path = data_root / ".locks" / f"{batch_id}.lock"
+
+    await service.run_once(
+        "worker", now=NOW + timedelta(hours=24), lease_seconds=60, limit=1
+    )
+    async with sessions() as session:
+        assert await session.scalar(
+            select(func.count()).select_from(ReplacementAuditMetadataRecord)
+        ) == 1
+        assert await session.scalar(
+            select(func.count()).select_from(StageEventRecord)
+        ) == 1
+        assert await session.get(BatchLockMarkerRecord, batch_id) is not None
+    assert lock_path.read_bytes() == b"\x01"
+    assert await repository.claim_due(
+        "worker", now=NOW + timedelta(days=30) - timedelta(microseconds=1),
+        lease_seconds=60, limit=1,
+    ) == ()
+    purged = await service.run_once(
+        "worker", now=NOW + timedelta(days=30), lease_seconds=60, limit=1
+    )
+    assert purged.metadata_purged == 1
+
+    async with sessions() as session:
+        assert await session.get(BatchRecord, batch_id) is None
+        assert await session.get(FileTaskRecord, file_id) is None
+        assert await session.get(ArtifactRecord, "artifact-" + "a" * 64) is None
+        assert await session.scalar(
+            select(func.count()).select_from(ReplacementAuditMetadataRecord)
+        ) == 0
+        assert await session.scalar(
+            select(func.count()).select_from(StageEventRecord)
+        ) == 0
+        assert await session.get(BatchLockMarkerRecord, batch_id) is None
+        assert await session.scalar(
+            select(func.count()).select_from(OrientationAssessmentRecord)
+        ) == 0
+    assert lock_path.read_bytes() == b"\x01"
+
+
+@pytest.mark.asyncio
+async def test_early_deletion_runs_both_phases_and_is_idempotent(
+    tmp_path: Path, retention_repository,
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, file_id = await _create_batch(tasks, "early")
+    await _insert_artifact(sessions, batch_id, file_id)
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    (data_root / batch_id).mkdir(parents=True)
+    (artifact_root / batch_id).mkdir(parents=True)
+    service = RetentionService(repository, data_root, artifact_root)
+    lock_path = data_root / ".locks" / f"{batch_id}.lock"
+
+    deleted = await service.delete_task(batch_id, now=NOW, worker_id="trusted")
+    repeated = await service.delete_task(batch_id, now=NOW, worker_id="trusted")
+
+    assert deleted is True
+    assert repeated is False
+    assert not (data_root / batch_id).exists()
+    assert not (artifact_root / batch_id).exists()
+    assert lock_path.read_bytes() == b"\x01"
+    async with sessions() as session:
+        for model in (
+            ArtifactRecord,
+            FileTaskRecord,
+            BatchLockMarkerRecord,
+            BatchRecord,
+        ):
+            assert await session.scalar(select(func.count()).select_from(model)) == 0
+
+    with pytest.raises(RetentionFailure) as retired:
+        async with FileStorage(data_root).batch_lock(
+            batch_id,
+            marker_registry=repository,
+            allow_missing_marker=True,
+            allow_retired=True,
+        ):
+            raise AssertionError("a purged retired marker must not be adopted")
+    assert retired.value.code == RetentionErrorCode.CLEANUP_OWNERSHIP.value
+    assert lock_path.read_bytes() == b"\x01"
+
+
+@pytest.mark.asyncio
+async def test_early_deletion_resumes_metadata_after_first_purge_failure(
+    tmp_path: Path, retention_repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, file_id = await _create_batch(tasks, "early-resume")
+    await _insert_artifact(sessions, batch_id, file_id)
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    (data_root / batch_id).mkdir(parents=True)
+    (artifact_root / batch_id).mkdir(parents=True)
+    service = RetentionService(repository, data_root, artifact_root)
+    original_purge = repository.purge_metadata
+    attempts = 0
+
+    async def fail_first_purge(claim, *, now):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RetentionFailure(RetentionErrorCode.METADATA_PURGE_FAILED)
+        return await original_purge(claim, now=now)
+
+    monkeypatch.setattr(repository, "purge_metadata", fail_first_purge)
+    with pytest.raises(RetentionFailure) as first:
+        await service.delete_task(batch_id, now=NOW, worker_id="trusted")
+    assert first.value.code == RetentionErrorCode.METADATA_PURGE_FAILED.value
+    assert (await repository.get(batch_id)).content_deleted_at == NOW
+
+    assert await service.delete_task(
+        batch_id, now=NOW + timedelta(seconds=1), worker_id="trusted"
+    ) is True
+    assert attempts == 2
+    assert await repository.get(batch_id) is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_barrier_wins_before_intake_and_no_new_bytes_land(
+    tmp_path: Path, retention_repository,
+) -> None:
+    repository, tasks, _, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "cleanup-wins")
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    (data_root / batch_id).mkdir(parents=True)
+    (artifact_root / batch_id).mkdir(parents=True)
+    cleanup_holds_lock = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+
+    class GatedRepository:
+        def __getattr__(self, name):
+            return getattr(repository, name)
+
+        async def prepare_tombstone(self, claim, *, root_kind, now):
+            if root_kind == "data":
+                cleanup_holds_lock.set()
+                await allow_cleanup.wait()
+            return await repository.prepare_tombstone(
+                claim, root_kind=root_kind, now=now
+            )
+
+    cleanup = asyncio.create_task(
+        RetentionService(GatedRepository(), data_root, artifact_root).delete_task(
+            batch_id, now=NOW, worker_id="cleanup"
+        )
+    )
+    await cleanup_holds_lock.wait()
+
+    async def content():
+        yield _pdf_bytes()
+
+    intake = asyncio.create_task(
+        _intake_service(data_root, repository).ingest_upload(
+            batch_id,
+            IncomingFile("late.pdf", "application/pdf", content()),
+        )
+    )
+    await asyncio.sleep(0)
+    assert intake.done() is False
+    allow_cleanup.set()
+
+    assert await cleanup is True
+    with pytest.raises((FileIntakeFailure, RetentionFailure)):
+        await intake
+    assert not list(data_root.rglob("late.pdf"))
+    assert not list((data_root / batch_id).glob("input/*"))
+
+
+@pytest.mark.asyncio
+async def test_intake_allows_a_canonical_batch_that_has_no_retention_row(
+    tmp_path: Path, retention_repository,
+) -> None:
+    repository, _, _, _ = retention_repository
+    data_root = (tmp_path / "data").absolute()
+    batch_id = str(uuid4())
+
+    async def content():
+        yield _pdf_bytes()
+
+    stored = await _intake_service(data_root, repository).ingest_upload(
+        batch_id,
+        IncomingFile("fresh.pdf", "application/pdf", content()),
+    )
+
+    assert stored.path.exists()
+    assert stored.path.read_bytes() == _pdf_bytes()
+
+
+@pytest.mark.asyncio
+async def test_intake_barrier_wins_first_and_cleanup_waits_then_removes_it(
+    tmp_path: Path, retention_repository,
+) -> None:
+    repository, tasks, _, _ = retention_repository
+    batch_id, _ = await _create_batch(tasks, "intake-wins")
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    artifact_root.joinpath(batch_id).mkdir(parents=True)
+    intake_started = asyncio.Event()
+    allow_intake = asyncio.Event()
+    payload = _pdf_bytes()
+
+    async def content():
+        midpoint = len(payload) // 2
+        yield payload[:midpoint]
+        intake_started.set()
+        await allow_intake.wait()
+        yield payload[midpoint:]
+
+    intake = asyncio.create_task(
+        _intake_service(data_root, repository).ingest_upload(
+            batch_id,
+            IncomingFile("held.pdf", "application/pdf", content()),
+        )
+    )
+    await intake_started.wait()
+    cleanup = asyncio.create_task(
+        RetentionService(repository, data_root, artifact_root).delete_task(
+            batch_id, now=NOW, worker_id="cleanup"
+        )
+    )
+    await asyncio.sleep(0)
+    assert cleanup.done() is False
+
+    allow_intake.set()
+    stored = await intake
+    assert stored.path.exists()
+    assert await cleanup is True
+    assert stored.path.exists() is False
+    retained = [path for path in data_root.rglob("*") if path.is_file()]
+    assert retained
+    assert all(path.read_bytes() in {b"", b"\x01"} for path in retained)
+
+
+def test_owned_root_deletion_rejects_unowned_ids_and_symlinks_but_missing_is_success(tmp_path: Path) -> None:
+    root = (tmp_path / "owned").absolute()
+    root.mkdir()
+    deleter = OwnedBatchRootDeleter()
+
+    for batch_id in ("", "../escape", str(uuid4()).upper()):
+        with pytest.raises(RetentionFailure) as caught:
+            deleter.delete(root, batch_id)
+        assert caught.value.code == RetentionErrorCode.CLEANUP_OWNERSHIP.value
+    deleter.delete((tmp_path / "missing-root").absolute(), str(uuid4()))
+
+    if hasattr(Path, "symlink_to"):
+        batch_id = str(uuid4())
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        planted = root / batch_id
+        try:
+            planted.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            pytest.skip("directory symlinks are unavailable")
+        with pytest.raises(RetentionFailure):
+            deleter.delete(root, batch_id)
+        assert outside.exists()
+
+
+def test_owned_root_deletion_leaks_and_preserves_a_concurrent_name_replacement(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "owned").absolute()
+    batch_id = str(uuid4())
+    batch = root / batch_id
+    batch.mkdir(parents=True)
+    original = batch / "result.zip"
+    original.write_bytes(b"owned-original")
+    moved_paths: list[Path] = []
+
+    class SwapAfterOpen(OwnedBatchRootDeleter):
+        def _scrub_open_regular(
+            self, descriptor, expected, path, *, parent_descriptor, name
+        ):
+            moved = path.with_name("moved-original.zip")
+            __import__("os").rename(path, moved)
+            path.write_bytes(b"replacement")
+            moved_paths.append(moved)
+            return super()._scrub_open_regular(
+                descriptor,
+                expected,
+                path,
+                parent_descriptor=parent_descriptor,
+                name=name,
+            )
+
+    with pytest.raises(RetentionFailure) as caught:
+        SwapAfterOpen().delete(root, batch_id)
+
+    assert caught.value.code == RetentionErrorCode.CLEANUP_OWNERSHIP.value
+    replacements = [path for path in root.rglob("result.zip")]
+    assert len(replacements) == 1
+    assert replacements[0].read_bytes() == b"replacement"
+    assert moved_paths[0].read_bytes() == b"owned-original"
+
+
+@pytest.mark.skipif(__import__("os").name != "nt", reason="Windows parent pinning")
+def test_windows_exclusive_parent_handle_blocks_directory_replacement(
+    tmp_path: Path,
+) -> None:
+    parent = (tmp_path / "parent").absolute()
+    parent.mkdir()
+    handle = FileStorage._windows_open_directory_handle(
+        parent, deny_delete_share=True
+    )
+    try:
+        with pytest.raises(OSError):
+            __import__("os").rename(parent, tmp_path / "replacement-target")
+    finally:
+        FileStorage._windows_close_handle(handle)
+
+
+@pytest.mark.skipif(__import__("os").name != "nt", reason="Windows parent pinning")
+def test_windows_parent_replacement_is_blocked_or_preserved_before_child_scrub(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "owned").absolute()
+    batch_id = str(uuid4())
+    batch = root / batch_id
+    batch.mkdir(parents=True)
+    (batch / "content.bin").write_bytes(b"owned-original")
+    moved_parent = root / "moved-original-parent"
+    replacement_bytes = b"replacement parent bytes must survive"
+    swap_blocked: list[bool] = []
+    replacement_paths: list[Path] = []
+
+    class SwapParentAfterEnumeration(OwnedBatchRootDeleter):
+        def _windows_names(self, path, expected):
+            names = super()._windows_names(path, expected)
+            if path.parent == root and path.name.startswith(".retention-") and not replacement_paths:
+                try:
+                    __import__("os").rename(path, moved_parent)
+                except OSError:
+                    swap_blocked.append(True)
+                else:
+                    path.mkdir()
+                    replacement = path / "content.bin"
+                    replacement.write_bytes(replacement_bytes)
+                    replacement_paths.append(replacement)
+            return names
+
+    try:
+        SwapParentAfterEnumeration().delete(root, batch_id)
+    except RetentionFailure:
+        pass
+
+    if replacement_paths:
+        assert replacement_paths[0].read_bytes() == replacement_bytes
+    else:
+        assert swap_blocked and all(swap_blocked)
+
+
+@pytest.mark.asyncio
+async def test_hardlinked_descendant_is_rejected_without_touching_external_bytes(
+    tmp_path: Path, retention_repository,
+) -> None:
+    repository, tasks, sessions, _ = retention_repository
+    batch_id, file_id = await _create_batch(tasks, "hardlink-confinement")
+    await _insert_artifact(sessions, batch_id, file_id)
+    data_root = (tmp_path / "data").absolute()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    batch = data_root / batch_id
+    batch.mkdir(parents=True)
+    artifact_root.joinpath(batch_id).mkdir(parents=True)
+    external = tmp_path / "external-private.bin"
+    external_bytes = b"external bytes must never be scrubbed"
+    external.write_bytes(external_bytes)
+    try:
+        __import__("os").link(external, batch / "linked.bin")
+    except OSError:
+        pytest.skip("hard links are unavailable")
+
+    result = await RetentionService(repository, data_root, artifact_root).run_once(
+        "cleanup", now=NOW + timedelta(hours=24), lease_seconds=60, limit=1
+    )
+
+    assert result.failed == 1
+    assert external.read_bytes() == external_bytes
+    async with sessions() as session:
+        artifact = await session.get(ArtifactRecord, "artifact-" + "a" * 64)
+        assert artifact.available is True
+
+
+def test_owned_root_deletion_discards_planted_exception_text_and_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "C:/client/private.pdf recognized business text"
+    root = (tmp_path / "owned").absolute()
+    root.mkdir()
+    real_lstat = __import__("os").lstat
+
+    def fail_target(path, *args, **kwargs):
+        if Path(path).parent == root:
+            raise OSError(secret)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr("ocr_mcp_server.services.retention.os.lstat", fail_target)
+    with pytest.raises(RetentionFailure) as caught:
+        OwnedBatchRootDeleter().delete(root, str(uuid4()))
+    assert secret not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_owned_root_deletion_does_not_remove_directory_replaced_at_final_delete(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "owned").absolute()
+    batch_id = str(uuid4())
+    nested = root / batch_id / "nested"
+    nested.mkdir(parents=True)
+    (nested / "original.bin").write_bytes(b"owned")
+    moved_paths: list[Path] = []
+
+    class SwapOpenedDirectory(OwnedBatchRootDeleter):
+        def _open_directory(self, path, **kwargs):
+            pinned = super()._open_directory(path, **kwargs)
+            if path.name == "nested" and not moved_paths:
+                moved = path.with_name("held-original")
+                try:
+                    __import__("os").rename(path, moved)
+                except OSError:
+                    return pinned
+                path.mkdir()
+                (path / "replacement.bin").write_bytes(b"replacement")
+                moved_paths.append(moved)
+            return pinned
+
+    failure = None
+    try:
+        SwapOpenedDirectory().delete(root, batch_id)
+    except RetentionFailure as caught:
+        failure = caught
+    if moved_paths:
+        assert failure is not None
+        assert moved_paths[0].joinpath("original.bin").read_bytes() == b"owned"
+        replacements = list(root.rglob("replacement.bin"))
+        assert len(replacements) == 1
+        assert replacements[0].read_bytes() == b"replacement"
+    else:
+        assert failure is None
+        originals = list(root.rglob("original.bin"))
+        assert len(originals) == 1
+        assert originals[0].read_bytes() == b""
+
+
+def test_owned_root_scrubbing_never_unlinks_or_rmdirs_descendant_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = (tmp_path / "owned").absolute()
+    batch_id = str(uuid4())
+    nested = root / batch_id / "intermediate" / "nested"
+    nested.mkdir(parents=True)
+    (nested / "content.bin").write_bytes(b"private business bytes")
+
+    monkeypatch.setattr(
+        "ocr_mcp_server.services.retention.os.unlink",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unlink forbidden")),
+    )
+    monkeypatch.setattr(
+        "ocr_mcp_server.services.retention.os.rmdir",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("rmdir forbidden")),
+    )
+
+    OwnedBatchRootDeleter().delete(root, batch_id)
+
+    assert not (root / batch_id).exists()
+    remaining_files = [path for path in root.rglob("*") if path.is_file()]
+    assert remaining_files
+    assert all(path.read_bytes() == b"" for path in remaining_files)
+
+
+def test_owned_root_isolation_preserves_root_replacement_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = (tmp_path / "owned").absolute()
+    batch_id = str(uuid4())
+    target = root / batch_id
+    target.mkdir(parents=True)
+    (target / "original.bin").write_bytes(b"owned")
+    moved_original = root / "moved-original"
+    real_rename = __import__("os").rename
+    swapped = False
+
+    def swap_root_before_isolation(source, destination, *args, **kwargs):
+        nonlocal swapped
+        if Path(source) == target and not swapped:
+            swapped = True
+            real_rename(target, moved_original)
+            target.mkdir()
+            (target / "replacement.bin").write_bytes(b"replacement")
+        return real_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "ocr_mcp_server.services.retention.os.rename", swap_root_before_isolation
+    )
+    with pytest.raises(RetentionFailure):
+        OwnedBatchRootDeleter().delete(root, batch_id)
+
+    assert (target / "replacement.bin").read_bytes() == b"replacement"
+    assert (moved_original / "original.bin").read_bytes() == b"owned"
+
+
+def test_retention_settings_include_bounded_cleanup_defaults_and_reject_booleans() -> None:
+    settings = AppSettings().retention
+    assert settings.cleanup_batch_size == 25
+    assert settings.cleanup_lease_seconds == 300
+    assert settings.cleanup_interval_seconds == 300
+    for field in ("cleanup_batch_size", "cleanup_lease_seconds", "cleanup_interval_seconds"):
+        with pytest.raises(ValueError):
+            AppSettings(retention={field: True})
+
+
+def test_example_yaml_documents_cleanup_defaults() -> None:
+    import yaml
+    from ocr_mcp_server.settings import load_settings
+
+    retention = load_settings(config_file=Path("config/example.yaml")).retention
+    documented = yaml.safe_load(Path("config/example.yaml").read_text(encoding="utf-8"))["retention"]
+    assert retention.cleanup_batch_size == 25
+    assert retention.cleanup_lease_seconds == 300
+    assert retention.cleanup_interval_seconds == 300
+    assert documented["cleanup_batch_size"] == 25
+    assert documented["cleanup_lease_seconds"] == 300
+    assert documented["cleanup_interval_seconds"] == 300

@@ -1,0 +1,464 @@
+from __future__ import annotations
+
+from collections.abc import AsyncIterable, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
+from fastapi.testclient import TestClient
+
+from ocr_mcp_server.api.contracts import (
+    ArtifactReference,
+    BatchStatusResponse,
+    FileStatusResponse,
+    OrientationReparseSubmission,
+    ParseSubmission,
+    UploadReceipt,
+)
+from ocr_mcp_server.api.gateway import (
+    GatewayCapacityExceeded,
+    GatewayConflict,
+    GatewayFailure,
+    GatewayNotFound,
+    GatewayOrientationUncertain,
+    GatewayUnavailable,
+)
+from ocr_mcp_server.app import create_app
+from ocr_mcp_server.settings import AppSettings
+
+
+KEY = "a-secure-api-key-0000000000000001"
+AUTH = {"X-API-Key": KEY}
+
+
+def completed_status(batch_id: str) -> BatchStatusResponse:
+    file_id = str(uuid4())
+    return BatchStatusResponse(
+        batch_id=batch_id,
+        status="completed",
+        progress=100,
+        total_files=1,
+        completed_files=1,
+        failed_files=0,
+        files=[
+            FileStatusResponse(
+                file_id=file_id,
+                status="completed",
+                stage="completed",
+                progress=100,
+            )
+        ],
+        artifacts=[
+            ArtifactReference(
+                artifact_id=str(uuid4()),
+                download_url=f"https://api.example.test/v1/tasks/{batch_id}/artifact",
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+        ],
+    )
+
+
+@dataclass
+class FakeGateway:
+    upload_chunks: list[bytes] = field(default_factory=list)
+    parse_request: object | None = None
+    status_id: str | None = None
+    reparse_request: object | None = None
+    failure: Exception | None = None
+    upload_display_name: str | None = None
+    upload_idempotency_key: str | None = None
+    upload_called: bool = False
+
+    async def upload_document(
+        self,
+        content: AsyncIterable[bytes],
+        *,
+        display_name: str,
+        media_type: str,
+        content_length: int | None,
+        idempotency_key: str | None,
+    ) -> UploadReceipt:
+        self.upload_called = True
+        assert not isinstance(content, (bytes, bytearray))
+        self.upload_display_name = display_name
+        self.upload_idempotency_key = idempotency_key
+        async for chunk in content:
+            self.upload_chunks.append(chunk)
+        if self.failure:
+            raise self.failure
+        return UploadReceipt(
+            file_id=str(uuid4()),
+            size_bytes=sum(map(len, self.upload_chunks)),
+            media_type=media_type,
+        )
+
+    async def parse_documents(self, request, *, progress=None) -> ParseSubmission:
+        self.parse_request = request
+        if self.failure:
+            raise self.failure
+        return ParseSubmission(batch_id=str(uuid4()), status="queued")
+
+    async def get_task_status(self, batch_id: str) -> BatchStatusResponse:
+        self.status_id = batch_id
+        if self.failure:
+            raise self.failure
+        return completed_status(batch_id)
+
+    async def reparse_with_page_orientation(
+        self, request, *, progress=None
+    ) -> OrientationReparseSubmission:
+        self.reparse_request = request
+        if self.failure:
+            raise self.failure
+        return OrientationReparseSubmission(batch_id=str(uuid4()), status="queued")
+
+
+@contextmanager
+def client(
+    gateway: object,
+    *,
+    max_size: int = 30 * 1024 * 1024,
+    raise_server_exceptions: bool = False,
+) -> Iterator[TestClient]:
+    settings = AppSettings(
+        auth={"api_keys": [KEY]}, limits={"max_file_size_bytes": max_size}
+    )
+    api = TestClient(
+        create_app(settings, gateway=gateway),
+        raise_server_exceptions=raise_server_exceptions,
+    )
+    try:
+        yield api
+    finally:
+        api.close()
+
+
+def test_route_client_helper_does_not_enter_app_lifespan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = False
+    original_create_app = create_app
+
+    def instrumented_create_app(*args, **kwargs):
+        nonlocal entered
+        app = original_create_app(*args, **kwargs)
+
+        @asynccontextmanager
+        async def observed_lifespan(application):
+            nonlocal entered
+            del application
+            entered = True
+            yield
+
+        app.router.lifespan_context = observed_lifespan
+        return app
+
+    monkeypatch.setattr(f"{__name__}.create_app", instrumented_create_app)
+    with client(FakeGateway()) as api:
+        response = api.get("/health/live")
+
+    assert response.status_code == 200
+    assert entered is False
+
+
+def test_artifact_download_route_is_authenticated_and_streams_resolved_zip(
+    tmp_path,
+) -> None:
+    artifact_id = str(uuid4())
+    archive = tmp_path / "result.zip"
+    archive.write_bytes(b"PK-safe")
+
+    class Downloads:
+        async def resolve(self, value):
+            assert value == artifact_id
+            return SimpleNamespace(path=archive, media_type="application/zip")
+
+    settings = AppSettings(auth={"api_keys": [KEY]})
+    app = create_app(settings, gateway=FakeGateway(), artifact_download=Downloads())
+    with TestClient(app) as api:
+        assert api.get(f"/v1/artifacts/{artifact_id}").status_code == 401
+        response = api.get(
+            f"/v1/artifacts/{artifact_id}", headers={"X-API-Key": KEY}
+        )
+    assert response.status_code == 200
+    assert response.content == b"PK-safe"
+
+
+def test_binary_upload_streams_to_gateway_and_returns_receipt() -> None:
+    gateway = FakeGateway()
+    with client(gateway) as api:
+        response = api.post(
+            "/v1/uploads",
+            headers={
+                **AUTH,
+                "Content-Type": "application/pdf",
+                "X-Document-Name": "statement.pdf",
+                "Idempotency-Key": "upload-1",
+            },
+            content=b"%PDF-safe-test",
+        )
+    assert response.status_code == 201
+    assert b"".join(gateway.upload_chunks) == b"%PDF-safe-test"
+    assert gateway.upload_display_name == "statement.pdf"
+    assert gateway.upload_idempotency_key == "upload-1"
+    assert response.json()["media_type"] == "application/pdf"
+
+
+def test_upload_rejects_unsupported_empty_and_oversized_bodies_before_gateway() -> None:
+    for content, content_type, max_size, expected in (
+        (b"value", "text/plain", 100, 415),
+        (b"", "application/pdf", 100, 422),
+        (b"too-large", "application/pdf", 3, 413),
+    ):
+        gateway = FakeGateway()
+        with client(gateway, max_size=max_size) as api:
+            response = api.post(
+                "/v1/uploads",
+                headers={
+                    **AUTH,
+                    "Content-Type": content_type,
+                    "X-Document-Name": "statement.pdf",
+                },
+                content=content,
+            )
+        assert response.status_code == expected
+        assert response.json()["error"]["code"] in {
+            "unsupported_media_type",
+            "invalid_request",
+            "capacity_exceeded",
+        }
+
+
+def test_upload_rejects_missing_or_path_like_display_names() -> None:
+    for display_name in (
+        None,
+        "C:/private/customer.pdf",
+        "../customer.pdf",
+        "folder\\customer.pdf",
+    ):
+        gateway = FakeGateway()
+        headers = {**AUTH, "Content-Type": "application/pdf"}
+        if display_name is not None:
+            headers["X-Document-Name"] = display_name
+        with client(gateway) as api:
+            response = api.post("/v1/uploads", headers=headers, content=b"%PDF")
+        assert response.status_code == 422
+        assert gateway.upload_chunks == []
+
+
+def test_upload_rejects_duplicate_transport_headers_before_gateway() -> None:
+    for duplicate_name, duplicate_value in (
+        ("X-Document-Name", "statement.pdf"),
+        ("Idempotency-Key", "upload-1"),
+        ("Content-Type", "application/pdf"),
+    ):
+        gateway = FakeGateway()
+        headers = [
+            ("X-API-Key", KEY),
+            ("X-Document-Name", "statement.pdf"),
+            ("Idempotency-Key", "upload-1"),
+            ("Content-Type", "application/pdf"),
+            (duplicate_name, duplicate_value),
+        ]
+        with client(gateway) as api:
+            response = api.post("/v1/uploads", headers=headers, content=b"%PDF")
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "invalid_request"
+        assert gateway.upload_called is False
+
+
+def test_upload_rejects_duplicate_content_length_before_gateway() -> None:
+    gateway = FakeGateway()
+    headers = [
+        ("X-API-Key", KEY),
+        ("X-Document-Name", "statement.pdf"),
+        ("Content-Type", "application/pdf"),
+        ("Content-Length", "4"),
+        ("Content-Length", "4"),
+    ]
+    with client(gateway) as api:
+        response = api.post("/v1/uploads", headers=headers, content=b"%PDF")
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert gateway.upload_called is False
+
+
+def test_rest_workflow_uses_strict_contracts_and_explicit_operation_ids() -> None:
+    gateway = FakeGateway()
+    file_id = str(uuid4())
+    with client(gateway) as api:
+        parse = api.post(
+            "/v1/tasks",
+            headers=AUTH,
+            json={"sources": [{"file_id": file_id}], "idempotency_key": "request-1"},
+        )
+        batch_id = parse.json()["batch_id"]
+        status = api.get(f"/v1/tasks/{batch_id}", headers=AUTH)
+        reparse = api.post(
+            "/v1/orientation-reparse",
+            headers=AUTH,
+            json={"recovery_token": "opaque-token_123", "pages": [2, 4]},
+        )
+        schema = api.get("/openapi.json", headers=AUTH).json()
+    assert parse.status_code == 202
+    assert status.status_code == 200
+    assert reparse.status_code == 202
+    assert gateway.parse_request.sources[0].file_id == file_id
+    assert gateway.status_id == batch_id
+    assert gateway.reparse_request.pages == [2, 4]
+    operation_ids = {
+        operation["operationId"]
+        for path in schema["paths"].values()
+        for operation in path.values()
+    }
+    assert {
+        "uploadDocument",
+        "parseDocuments",
+        "getTaskStatus",
+        "reparseWithPageOrientation",
+        "liveness",
+    } <= operation_ids
+    recovery_contract = schema["components"]["schemas"]["OrientationReparseRequest"]
+    assert set(recovery_contract["properties"]) == {"recovery_token", "pages"}
+    assert recovery_contract["additionalProperties"] is False
+    serialized_schema = str(schema)
+    for forbidden in ("engine", "backend", "device", "angle", "server_url"):
+        assert forbidden not in serialized_schema
+
+
+def test_validation_errors_are_content_free_and_do_not_reach_gateway() -> None:
+    sensitive = "https://files.example.test/customer-secret-name.pdf"
+    gateway = FakeGateway()
+    with client(gateway) as api:
+        response = api.post(
+            "/v1/tasks",
+            headers=AUTH,
+            json={"sources": [{"url": sensitive, "path": "C:/private/customer.pdf"}]},
+        )
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {"code": "invalid_request", "message": "The request is invalid."}
+    }
+    assert sensitive not in response.text
+    assert gateway.parse_request is None
+
+
+def test_task_status_rejects_noncanonical_identifier_before_gateway() -> None:
+    for batch_id in ("not-a-uuid", "x" * 36, str(uuid4()).upper()):
+        gateway = FakeGateway()
+        with client(gateway) as api:
+            response = api.get(f"/v1/tasks/{batch_id}", headers=AUTH)
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "invalid_request"
+        assert gateway.status_id is None
+
+
+def test_gateway_failures_map_to_stable_safe_http_errors() -> None:
+    cases = [
+        (GatewayNotFound(), 404, "not_found"),
+        (GatewayConflict(), 409, "conflict"),
+        (GatewayOrientationUncertain(), 409, "orientation_uncertain"),
+        (GatewayCapacityExceeded(), 429, "capacity_exceeded"),
+        (GatewayUnavailable(), 503, "service_unavailable"),
+        (GatewayFailure(), 500, "internal_error"),
+        (RuntimeError("recognized private business text"), 500, "internal_error"),
+    ]
+    for failure, expected_status, expected_code in cases:
+        with client(FakeGateway(failure=failure)) as api:
+            response = api.get(f"/v1/tasks/{uuid4()}", headers=AUTH)
+        assert response.status_code == expected_status
+        assert response.json()["error"]["code"] == expected_code
+        assert "recognized private business text" not in response.text
+
+
+def test_unexpected_gateway_exception_is_contained_at_the_route_boundary() -> None:
+    gateway = FakeGateway(failure=RuntimeError("recognized private business text"))
+    with client(gateway, raise_server_exceptions=True) as api:
+        response = api.get(f"/v1/tasks/{uuid4()}", headers=AUTH)
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    assert "recognized private business text" not in response.text
+
+
+def test_gateway_response_validation_is_contained_before_fastapi_serialization() -> None:
+    class LeakyGateway(FakeGateway):
+        async def get_task_status(self, batch_id: str):
+            return {
+                "batch_id": batch_id,
+                "status": "completed",
+                "progress": 100,
+                "total_files": 1,
+                "completed_files": 1,
+                "failed_files": 0,
+                "files": [],
+                "artifacts": [],
+                "recognized_text": "SENSITIVE_GATEWAY_OUTPUT",
+            }
+
+    with client(LeakyGateway(), raise_server_exceptions=True) as api:
+        response = api.get(f"/v1/tasks/{uuid4()}", headers=AUTH)
+    assert response.status_code == 500
+    assert response.json()["error"] == {
+        "code": "internal_error",
+        "message": "The request could not be completed.",
+    }
+    assert "SENSITIVE_GATEWAY_OUTPUT" not in response.text
+
+
+@pytest.mark.parametrize("page", [True, 1.0, "1"])
+def test_rest_reparse_rejects_non_integer_page_types_before_gateway(
+    page: object,
+) -> None:
+    gateway = FakeGateway()
+    with client(gateway) as api:
+        response = api.post(
+            "/v1/orientation-reparse",
+            headers=AUTH,
+            json={"recovery_token": "opaque-token_123", "pages": [page]},
+        )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert gateway.reparse_request is None
+
+
+def test_one_real_lifespan_handles_many_representative_rest_requests() -> None:
+    gateway = FakeGateway()
+    settings = AppSettings(auth={"api_keys": [KEY]})
+
+    with TestClient(
+        create_app(settings, gateway=gateway),
+        raise_server_exceptions=False,
+    ) as api:
+        for index in range(25):
+            file_id = str(uuid4())
+            responses = (
+                api.post(
+                    "/v1/uploads",
+                    headers={
+                        **AUTH,
+                        "Content-Type": "application/pdf",
+                        "X-Document-Name": f"statement-{index}.pdf",
+                    },
+                    content=b"%PDF-safe-test",
+                ),
+                api.post(
+                    "/v1/tasks",
+                    headers=AUTH,
+                    json={"sources": [{"file_id": file_id}]},
+                ),
+                api.get(f"/v1/tasks/{uuid4()}", headers=AUTH),
+                api.post(
+                    "/v1/orientation-reparse",
+                    headers=AUTH,
+                    json={"recovery_token": "opaque-token_123", "pages": [1]},
+                ),
+            )
+            assert tuple(response.status_code for response in responses) == (
+                201,
+                202,
+                200,
+                202,
+            )

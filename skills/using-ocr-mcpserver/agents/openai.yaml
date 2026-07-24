@@ -1,0 +1,4 @@
+interface:
+  display_name: "OCR MCP 文档处理"
+  short_description: "上传本地文档并通过 OCR MCP 解析、跟踪和下载结果"
+  default_prompt: "使用 $using-ocr-mcpserver 处理这些文档，持续汇报进度并下载解压结果。"
