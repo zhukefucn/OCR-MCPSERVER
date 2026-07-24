@@ -248,3 +248,16 @@ Skill 名称使用 `using-ocr-mcpserver`，避免与服务器实现 Skill 或通
 - 新任务可用 `batch_id` 恢复。
 - 任何输出和日志都不包含 API Key 或识别正文。
 - Skill 结构验证、脚本测试和真实端到端前向测试全部通过。
+
+## 安全验证记录
+
+2026-07-24T21:18:35+08:00 完成全局安装和真实前向验证：
+
+- Skill 源提交：`cd225c35721edd6352b823acc6fdd077f0176291`。
+- 安装目标：`C:\Users\jiang_ren_1291992796\.codex\skills\using-ocr-mcpserver`；源目录与安装目录共 3 个文件，逐文件 SHA-256 一致，且两端均通过 UTF-8 模式的 `quick_validate.py`。
+- 完整测试：使用短 `basetemp` 运行到 100%，退出码为 0。
+- 测试文件 SHA-256：`6b9710a2b0b1e3cdda06a1c81d098a59f8ac41091140f58984bac3f8c5d69082`。
+- 前向批次：`cdfd7134-5375-40c5-8cf2-e4371f3c8725`，终态为 `completed`，进度为 100。
+- 产物结构：1 个 ZIP、3 个解压目录、1 个解压后的 `final.md`；ZIP 内共 99 个条目，其中 1 个 `final.md`，不安全路径条目为 0。
+- 服务器核验：正式容器为 `healthy`，镜像 ID 为 `sha256:56d0f319f6e986a02d787b145bdc1cd76711abf396b7ecd99770b0912b048d9e`。
+- 隐私与清理：未读取或记录 OCR 正文、API Key、签名下载链接或完整 Codex 日志；临时目录 `D:\codex-workspace\ocrzhengli\.skill-e2e` 经绝对路径和精确目标校验后删除，全局 Skill 保留。
