@@ -305,7 +305,19 @@ def render_markdown(
                         _fail(ArtifactErrorCode.UNSAFE_IMAGE)
                     block = f"![]({logical})"
                 elif node_type == "table":
-                    block = validate_table_html(content.get("html"), limits)
+                    try:
+                        block = validate_table_html(content.get("html"), limits)
+                    except StructuredContentInvalid:
+                        image_source = content.get("image_source")
+                        raw_path = (
+                            image_source.get("path")
+                            if isinstance(image_source, Mapping)
+                            else None
+                        )
+                        if raw_path != "images/":
+                            raise
+                        warned = True
+                        block = None
                 elif node_type == "equation_interline":
                     if content.get("math_type") != "latex":
                         _fail(ArtifactErrorCode.INVALID_INPUT)

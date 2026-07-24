@@ -251,12 +251,79 @@ def _replace_task7_file(
     return replace(publication, **{field: sha256(content).hexdigest()})
 
 
+def test_markdown_omits_invalid_table_with_exact_empty_image_reference() -> None:
+    rendered = render_markdown(
+        [
+            [
+                {"type": "text", "content": {"text": "before"}},
+                {
+                    "type": "table",
+                    "content": {
+                        "html": "<table></table>",
+                        "image_source": {"path": "images/"},
+                    },
+                },
+                {"type": "text", "content": {"text": "after"}},
+            ]
+        ],
+        image_names={},
+        max_bytes=10_000,
+    )
+
+    assert rendered.content == b"before\n\nafter\n"
+    assert rendered.warning_codes == (
+        ArtifactErrorCode.UNSUPPORTED_NODE.value,
+    )
+
+
+def test_markdown_renders_valid_table_with_exact_empty_image_reference() -> None:
+    rendered = render_markdown(
+        [
+            [
+                {
+                    "type": "table",
+                    "content": {
+                        "html": "<table><tr><td>kept</td></tr></table>",
+                        "image_source": {"path": "images/"},
+                    },
+                }
+            ]
+        ],
+        image_names={},
+        max_bytes=10_000,
+    )
+
+    assert b"<table><tr><td>kept</td></tr></table>" in rendered.content
+    assert rendered.warning_codes == ()
+
+
+def test_markdown_rejects_invalid_table_without_exact_empty_reference() -> None:
+    with pytest.raises(ArtifactFailure) as caught:
+        render_markdown(
+            [
+                [
+                    {
+                        "type": "table",
+                        "content": {
+                            "html": "<table></table>",
+                            "image_source": {"path": "images/used.png"},
+                        },
+                    }
+                ]
+            ],
+            image_names={"images/used.png": "images/000000.png"},
+            max_bytes=10_000,
+        )
+
+    assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
+
+
 def test_zip_ignores_exact_mineru_empty_image_reference(tmp_path: Path) -> None:
     result, publication, _, _ = _inputs(tmp_path)
     empty_reference = {
         "type": "table",
         "content": {
-            "html": "<table><tr><td>kept</td></tr></table>",
+            "html": "<table></table>",
             "image_source": {"path": "images/"},
         },
     }
@@ -292,6 +359,12 @@ def test_zip_ignores_exact_mineru_empty_image_reference(tmp_path: Path) -> None:
     with zipfile.ZipFile(bundle.path) as archive:
         assert "images/000000.png" in archive.namelist()
         assert archive.namelist().count("images/000000.png") == 1
+        final = json.loads(archive.read("content_list_v2.json"))
+        manifest = json.loads(archive.read("artifact_manifest.json"))
+        assert final[0][-1]["content"]["image_source"]["path"] == "images/"
+        assert manifest["warning_codes"] == [
+            ArtifactErrorCode.UNSUPPORTED_NODE.value
+        ]
 
 
 def test_artifact_settings_have_positive_mvp_defaults_and_reject_booleans() -> None:
