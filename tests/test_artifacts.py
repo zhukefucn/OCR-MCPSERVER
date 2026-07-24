@@ -251,6 +251,49 @@ def _replace_task7_file(
     return replace(publication, **{field: sha256(content).hexdigest()})
 
 
+def test_zip_ignores_exact_mineru_empty_image_reference(tmp_path: Path) -> None:
+    result, publication, _, _ = _inputs(tmp_path)
+    empty_reference = {
+        "type": "table",
+        "content": {
+            "html": "<table><tr><td>kept</td></tr></table>",
+            "image_source": {"path": "images/"},
+        },
+    }
+    original = json.loads(publication.original_snapshot_path.read_bytes())
+    final = json.loads(publication.manifest_path.read_bytes())
+    original[0].append(empty_reference)
+    final[0].append(empty_reference)
+    original_bytes = _canonical(original)
+    final_bytes = _canonical(final)
+    result.content_list_v2_path.write_bytes(original_bytes)
+    publication = _replace_task7_file(
+        publication,
+        "original_content_list_v2.json",
+        original_bytes,
+    )
+    publication = _replace_task7_file(
+        publication,
+        "content_list_v2.json",
+        final_bytes,
+    )
+
+    bundle = ArtifactBundler(
+        ArtifactLimits(1_000_000, 100_000, 20, 100_000)
+    ).publish(
+        result,
+        publication,
+        artifact_root=(tmp_path / "artifacts").absolute(),
+        batch_id=BATCH_ID,
+        created_at=NOW,
+        expires_at=NOW + timedelta(hours=24),
+    )
+
+    with zipfile.ZipFile(bundle.path) as archive:
+        assert "images/000000.png" in archive.namelist()
+        assert archive.namelist().count("images/000000.png") == 1
+
+
 def test_artifact_settings_have_positive_mvp_defaults_and_reject_booleans() -> None:
     settings = ArtifactSettings()
     assert settings.max_artifact_bytes == 1024**3

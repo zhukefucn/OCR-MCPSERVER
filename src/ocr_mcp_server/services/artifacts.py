@@ -1079,6 +1079,8 @@ def _extract_image_references(
                 if source is None:
                     continue
                 raw = source.get("path") if isinstance(source, Mapping) else None
+                if raw == "images/":
+                    continue
                 if _safe_logical_path(raw) is None:
                     _fail(ArtifactErrorCode.UNSAFE_IMAGE)
                 reference = (raw, f"/{page_index}/{node_index}")
