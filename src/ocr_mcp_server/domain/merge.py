@@ -21,6 +21,9 @@ class ReplacementDecision(StrEnum):
 class ReplacementReason(StrEnum):
     REPLACED_TABLE = "replaced_table"
     REPLACED_FORMULA = "replaced_formula"
+    REPLACED_TEXT_IMAGE = "replaced_text_image"
+    AUGMENTED_IMAGE_TEXT = "augmented_image_text"
+    AUGMENTED_UNSTRUCTURED_FALLBACK = "augmented_unstructured_fallback"
     OTHER_IMAGE = "other_image"
     UNCERTAIN = "uncertain"
     FAILED = "failed"

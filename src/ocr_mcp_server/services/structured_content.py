@@ -139,6 +139,31 @@ def _validate_text(value: object, limits: StructuredContentLimits, *, allow_empt
     return selected
 
 
+def validate_plain_text(
+    value: object,
+    limits: StructuredContentLimits,
+) -> str:
+    if not isinstance(value, str):
+        raise StructuredContentInvalid() from None
+    selected = value.strip()
+    try:
+        encoded = selected.encode("utf-8", errors="strict")
+    except UnicodeError:
+        raise StructuredContentInvalid() from None
+    if (
+        not selected
+        or len(selected) > limits.max_characters
+        or len(encoded) > limits.max_utf8_bytes
+        or any(
+            character != "\n"
+            and unicodedata.category(character) in {"Cc", "Cf", "Cs"}
+            for character in selected
+        )
+    ):
+        raise StructuredContentInvalid() from None
+    return selected
+
+
 class _TableParser(HTMLParser):
     def __init__(self, limits: StructuredContentLimits) -> None:
         super().__init__(convert_charrefs=True)

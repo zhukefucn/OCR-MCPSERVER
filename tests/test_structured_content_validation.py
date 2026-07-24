@@ -6,6 +6,7 @@ from ocr_mcp_server.services.structured_content import (
     StructuredContentInvalid,
     StructuredContentLimits,
     validate_formula_latex,
+    validate_plain_text,
     validate_table_html,
 )
 
@@ -119,6 +120,51 @@ def test_table_limits_are_enforced(limits):
 )
 def test_valid_formula_is_returned_trimmed(value, limits):
     assert validate_formula_latex(f" {value}\n", limits) == value
+
+
+def test_valid_plain_text_preserves_newlines_and_trims_edges(limits):
+    assert (
+        validate_plain_text(" \nBalance Sheet\nUnit: CNY\n ", limits)
+        == "Balance Sheet\nUnit: CNY"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "   ",
+        "x\x00",
+        "x\ry",
+        "x\ty",
+        "x\u202ey",
+        "x\ud800",
+    ],
+)
+def test_invalid_plain_text_is_rejected_without_echo(value, limits):
+    with pytest.raises(StructuredContentInvalid) as raised:
+        validate_plain_text(value, limits)
+    if value:
+        assert value not in str(raised.value)
+    assert raised.value.__cause__ is None
+
+
+def test_plain_text_character_and_utf8_byte_limits_are_enforced(limits):
+    character_limits = replace(
+        limits,
+        max_characters=4,
+        max_utf8_bytes=20,
+    )
+    with pytest.raises(StructuredContentInvalid):
+        validate_plain_text("abcde", character_limits)
+
+    byte_limits = replace(
+        limits,
+        max_characters=2,
+        max_utf8_bytes=5,
+    )
+    with pytest.raises(StructuredContentInvalid):
+        validate_plain_text("银行", byte_limits)
 
 
 @pytest.mark.parametrize(

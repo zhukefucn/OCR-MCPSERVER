@@ -34,6 +34,7 @@ from ..domain import (
     SecondaryOcrResult,
     SecondaryResultKind,
     SecondaryResultState,
+    SecondaryTextOrigin,
 )
 from ..infra.mineru_archive import publish_directory_no_replace
 from .candidate_collection import _open_candidate
@@ -41,6 +42,7 @@ from .structured_content import (
     StructuredContentInvalid,
     StructuredContentLimits,
     validate_formula_latex,
+    validate_plain_text,
     validate_table_html,
 )
 
@@ -189,6 +191,19 @@ def _read_source_manifest(
         if not isinstance(page, list) or any(not isinstance(node, dict) for node in page):
             _fail(MergeErrorCode.INVALID_SOURCE_MANIFEST)
     return value
+
+
+def _reject_reserved_secondary_text_fields(
+    manifest: list[list[dict]],
+) -> None:
+    for page in manifest:
+        for node in page:
+            content = node.get("content")
+            if isinstance(content, dict) and (
+                "secondary_text" in content
+                or "secondary_text_mode" in content
+            ):
+                _fail(MergeErrorCode.INVALID_SOURCE_MANIFEST)
 
 
 def _verify_candidate_inputs(
@@ -370,6 +385,44 @@ def _replace_node(node: dict, recognized: SecondaryOcrResult, limits: Structured
             replacement["content"]["math_content"] = validated
             replacement["content"]["math_type"] = "latex"
             return replacement, ReplacementReason.REPLACED_FORMULA
+        if (
+            recognized.kind
+            in {
+                SecondaryResultKind.TEXT,
+                SecondaryResultKind.IMAGE_WITH_TEXT,
+            }
+            and recognized.content_format
+            is SecondaryContentFormat.PLAIN_TEXT
+        ):
+            if node.get("type") != "image":
+                return None, ReplacementReason.INVALID_CONTENT
+            content = node.get("content")
+            if not isinstance(content, dict):
+                return None, ReplacementReason.INVALID_CONTENT
+            validated = validate_plain_text(recognized.content, limits)
+            lines = [
+                {"type": "text", "content": line}
+                for line in validated.split("\n")
+                if line
+            ]
+            if not lines:
+                return None, ReplacementReason.INVALID_CONTENT
+            replacement = deepcopy(node)
+            replacement["content"]["secondary_text"] = lines
+            if recognized.kind is SecondaryResultKind.TEXT:
+                replacement["content"]["secondary_text_mode"] = "replace_image"
+                reason = ReplacementReason.REPLACED_TEXT_IMAGE
+            else:
+                replacement["content"]["secondary_text_mode"] = (
+                    "append_after_image"
+                )
+                reason = (
+                    ReplacementReason.AUGMENTED_UNSTRUCTURED_FALLBACK
+                    if recognized.text_origin
+                    is SecondaryTextOrigin.UNSTRUCTURED_FALLBACK
+                    else ReplacementReason.AUGMENTED_IMAGE_TEXT
+                )
+            return replacement, reason
     except StructuredContentInvalid:
         return None, ReplacementReason.INVALID_CONTENT
     return None, ReplacementReason.INVALID_RESULT
@@ -1091,6 +1144,7 @@ def _merge_and_publish_impl(
         result.result_root,
         limits.max_artifact_bytes,
     )
+    _reject_reserved_secondary_text_fields(manifest)
     _verify_candidate_inputs(result, collection)
     final, records = _merge_manifest(result, collection, bound, manifest, output_version, timestamp, limits)
     original_bytes = _canonical_json(manifest)

@@ -29,6 +29,7 @@ from ocr_mcp_server.domain import (
     SecondaryProcessingRecord,
     SecondaryResultKind,
     SecondaryResultState,
+    SecondaryTextOrigin,
 )
 from ocr_mcp_server.services.merge_publication import (
     _write_file_anchored,
@@ -111,16 +112,49 @@ def _setup(tmp_path: Path, nodes: list[dict], *, references=None):
     return result, collection, candidate, manifest_path.read_bytes()
 
 
-def _ocr(kind=SecondaryResultKind.TABLE, content="<table><tr><td>识别</td></tr></table>", *, state=SecondaryResultState.VALID):
+def _ocr(
+    kind=SecondaryResultKind.TABLE,
+    content="<table><tr><td>识别</td></tr></table>",
+    *,
+    state=SecondaryResultState.VALID,
+    text_origin=None,
+):
+    if state is not SecondaryResultState.VALID:
+        kind = SecondaryResultKind.UNCERTAIN
+        content = None
+        content_format = None
+        text_origin = None
+    elif kind is SecondaryResultKind.TABLE:
+        content_format = SecondaryContentFormat.HTML
+        text_origin = None
+    elif kind is SecondaryResultKind.FORMULA:
+        content_format = SecondaryContentFormat.LATEX
+        text_origin = None
+    elif kind in {
+        SecondaryResultKind.TEXT,
+        SecondaryResultKind.IMAGE_WITH_TEXT,
+    }:
+        content_format = SecondaryContentFormat.PLAIN_TEXT
+        if text_origin is None:
+            text_origin = (
+                SecondaryTextOrigin.TEXT_DOMINANT
+                if kind is SecondaryResultKind.TEXT
+                else SecondaryTextOrigin.MIXED_VISUAL
+            )
+    else:
+        content = None
+        content_format = None
+        text_origin = None
     return SecondaryOcrResult(
         kind=kind,
         angle=OrthogonalAngle.DEG_90,
-        content=content if kind in {SecondaryResultKind.TABLE, SecondaryResultKind.FORMULA} else None,
-        content_format=(SecondaryContentFormat.HTML if kind is SecondaryResultKind.TABLE else SecondaryContentFormat.LATEX if kind is SecondaryResultKind.FORMULA else None),
+        content=content,
+        content_format=content_format,
         confidence=0.98,
         engine=SecondaryOCREngine.PP_STRUCTURE_V3,
         model_versions={"pipeline": "trusted-v1"},
         state=state,
+        text_origin=text_origin,
     )
 
 
@@ -158,6 +192,257 @@ def test_formula_replacement_preserves_fields(tmp_path, limits):
     changed = json.loads(publication.manifest_path.read_text(encoding="utf-8"))[0][0]
     assert changed == {"type": "equation_interline", "content": {"image_source": {"path": "images/a.png"}, "math_content": r"x_{i}", "math_type": "latex"}, "keep": 7}
     assert publication.records[0].reason is ReplacementReason.REPLACED_FORMULA
+
+
+def test_text_image_replacement_preserves_source_and_safe_image_fields(
+    tmp_path,
+    limits,
+):
+    original_node = {
+        "type": "image",
+        "bbox": [1, 2, 3, 4],
+        "content": {
+            "image_source": {"path": "images/a.png"},
+            "image_caption": [{"type": "text", "content": "caption"}],
+            "image_footnote": [{"type": "text", "content": "footnote"}],
+            "note": "safe",
+        },
+        "unknown_safe": 7,
+    }
+    result, collection, candidate, source_bytes = _setup(
+        tmp_path,
+        [original_node],
+    )
+
+    publication = merge_and_publish(
+        result,
+        collection,
+        {
+            candidate.candidate_id: _ocr(
+                SecondaryResultKind.TEXT,
+                "Balance Sheet\nUnit: CNY",
+            )
+        },
+        publication_root=tmp_path / "published",
+        output_version=2,
+        timestamp=NOW,
+        limits=limits,
+    )
+
+    changed = json.loads(
+        publication.manifest_path.read_text(encoding="utf-8")
+    )[0][0]
+    assert changed["type"] == "image"
+    assert changed["bbox"] == original_node["bbox"]
+    assert changed["unknown_safe"] == 7
+    assert changed["content"]["image_source"] == {"path": "images/a.png"}
+    assert changed["content"]["image_caption"] == [
+        {"type": "text", "content": "caption"}
+    ]
+    assert changed["content"]["image_footnote"] == [
+        {"type": "text", "content": "footnote"}
+    ]
+    assert changed["content"]["note"] == "safe"
+    assert changed["content"]["secondary_text"] == [
+        {"type": "text", "content": "Balance Sheet"},
+        {"type": "text", "content": "Unit: CNY"},
+    ]
+    assert changed["content"]["secondary_text_mode"] == "replace_image"
+    assert publication.records[0].reason is ReplacementReason.REPLACED_TEXT_IMAGE
+    assert publication.records[0].decision is ReplacementDecision.REPLACED
+    assert result.content_list_v2_path.read_bytes() == source_bytes
+
+
+@pytest.mark.parametrize(
+    ("origin", "reason"),
+    [
+        (
+            SecondaryTextOrigin.MIXED_VISUAL,
+            "augmented_image_text",
+        ),
+        (
+            SecondaryTextOrigin.UNSTRUCTURED_FALLBACK,
+            "augmented_unstructured_fallback",
+        ),
+    ],
+)
+def test_image_text_augmentation_uses_origin_specific_audit_reason(
+    tmp_path,
+    limits,
+    origin,
+    reason,
+):
+    node = {
+        "type": "image",
+        "content": {"image_source": {"path": "images/a.png"}},
+    }
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    publication = merge_and_publish(
+        result,
+        collection,
+        {
+            candidate.candidate_id: _ocr(
+                SecondaryResultKind.IMAGE_WITH_TEXT,
+                "Visible title",
+                text_origin=origin,
+            )
+        },
+        publication_root=tmp_path / "published",
+        output_version=2,
+        timestamp=NOW,
+        limits=limits,
+    )
+
+    changed = json.loads(
+        publication.manifest_path.read_text(encoding="utf-8")
+    )[0][0]
+    assert changed["content"]["secondary_text"] == [
+        {"type": "text", "content": "Visible title"}
+    ]
+    assert changed["content"]["secondary_text_mode"] == "append_after_image"
+    assert publication.records[0].reason.value == reason
+
+
+@pytest.mark.parametrize(
+    ("node", "recognized"),
+    [
+        (
+            {
+                "type": "chart",
+                "content": {"image_source": {"path": "images/a.png"}},
+            },
+            _ocr(SecondaryResultKind.TEXT, "Visible title"),
+        ),
+        (
+            {
+                "type": "image",
+                "content": {"image_source": {"path": "images/a.png"}},
+            },
+            _ocr(SecondaryResultKind.TEXT, "unsafe\x00text"),
+        ),
+        (
+            {
+                "type": "image",
+                "content": {"image_source": {"path": "images/a.png"}},
+            },
+            _ocr(SecondaryResultKind.TEXT, "x" * 10_001),
+        ),
+    ],
+)
+def test_text_image_invalid_content_retains_original_node(
+    tmp_path,
+    limits,
+    node,
+    recognized,
+):
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    publication = merge_and_publish(
+        result,
+        collection,
+        {candidate.candidate_id: recognized},
+        publication_root=tmp_path / "published",
+        output_version=2,
+        timestamp=NOW,
+        limits=limits,
+    )
+
+    assert json.loads(
+        publication.manifest_path.read_text(encoding="utf-8")
+    )[0][0] == node
+    assert publication.records[0].reason is ReplacementReason.INVALID_CONTENT
+
+
+def test_text_image_updates_every_real_image_reference(tmp_path, limits):
+    nodes = [
+        {
+            "type": "image",
+            "content": {"image_source": {"path": "images/a.png"}},
+            "slot": 1,
+        },
+        {
+            "type": "image",
+            "content": {"image_source": {"path": "images/a.png"}},
+            "slot": 2,
+        },
+    ]
+    references = (
+        CandidateReference(
+            source_kind=CandidateSourceKind.MINERU_NODE,
+            page_index=0,
+            node_index=0,
+            json_pointer="/0/0",
+            original_node_type="image",
+        ),
+        CandidateReference(
+            source_kind=CandidateSourceKind.MINERU_NODE,
+            page_index=0,
+            node_index=1,
+            json_pointer="/0/1",
+            original_node_type="image",
+        ),
+    )
+    result, collection, candidate, _ = _setup(
+        tmp_path,
+        nodes,
+        references=references,
+    )
+    publication = merge_and_publish(
+        result,
+        collection,
+        {
+            candidate.candidate_id: _ocr(
+                SecondaryResultKind.TEXT,
+                "Title",
+            )
+        },
+        publication_root=tmp_path / "published",
+        output_version=2,
+        timestamp=NOW,
+        limits=limits,
+    )
+
+    final = json.loads(
+        publication.manifest_path.read_text(encoding="utf-8")
+    )[0]
+    assert [
+        node["content"]["secondary_text_mode"] for node in final
+    ] == ["replace_image", "replace_image"]
+    assert publication.replacement_count == 2
+
+
+@pytest.mark.parametrize(
+    "reserved",
+    ["secondary_text", "secondary_text_mode"],
+)
+def test_image_text_reserved_source_fields_are_rejected_before_publication(
+    tmp_path,
+    limits,
+    reserved,
+):
+    content = {"image_source": {"path": "images/a.png"}}
+    content[reserved] = [] if reserved == "secondary_text" else "replace_image"
+    node = {"type": "image", "content": content}
+    result, collection, candidate, _ = _setup(tmp_path, [node])
+    publication_root = tmp_path / "published"
+
+    with pytest.raises(MergeFailure) as caught:
+        merge_and_publish(
+            result,
+            collection,
+            {
+                candidate.candidate_id: _ocr(
+                    SecondaryResultKind.TEXT,
+                    "Title",
+                )
+            },
+            publication_root=publication_root,
+            output_version=2,
+            timestamp=NOW,
+            limits=limits,
+        )
+
+    assert caught.value.code == MergeErrorCode.INVALID_SOURCE_MANIFEST.value
+    assert not publication_root.exists()
 
 
 @pytest.mark.parametrize(
