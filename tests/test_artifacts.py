@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import errno
@@ -249,6 +250,64 @@ def _replace_task7_file(
         "secondary_ocr_audit.json": "audit_sha256",
     }[name]
     return replace(publication, **{field: sha256(content).hexdigest()})
+
+
+def _text_image_inputs(
+    tmp_path: Path,
+    *,
+    kind: SecondaryResultKind = SecondaryResultKind.TEXT,
+    reason: ReplacementReason = ReplacementReason.REPLACED_TEXT_IMAGE,
+    mode: str = "replace_image",
+    lines: tuple[str, ...] = ("Balance Sheet", "Unit: CNY"),
+):
+    result, publication, _, base_record = _inputs(tmp_path)
+    original = json.loads(
+        publication.original_snapshot_path.read_text(encoding="utf-8")
+    )
+    original_node = original[0][1]
+    replacement_node = deepcopy(original_node)
+    replacement_node["content"]["secondary_text"] = [
+        {"type": "text", "content": line} for line in lines
+    ]
+    replacement_node["content"]["secondary_text_mode"] = mode
+    final = deepcopy(original)
+    final[0][1] = replacement_node
+    audit_id = "audit-" + sha256(
+        (
+            "merge-audit\0file-a\0"
+            f"{1}\0{2}\0{base_record.candidate_id}\0{0}\0{reason.value}"
+        ).encode()
+    ).hexdigest()
+    record = replace(
+        base_record,
+        audit_id=audit_id,
+        kind=kind,
+        reason=reason,
+        original_node_snapshot=json.dumps(
+            original_node,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        replacement_node_snapshot=json.dumps(
+            replacement_node,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+    publication = replace(publication, records=(record,))
+    publication = _replace_task7_file(
+        publication,
+        "content_list_v2.json",
+        _canonical(final),
+    )
+    publication = _replace_task7_file(
+        publication,
+        "secondary_ocr_audit.json",
+        _canonical(_audit_document(record)),
+    )
+    return result, publication, original, final, record
 
 
 def test_markdown_omits_invalid_table_with_exact_empty_image_reference() -> None:
@@ -682,6 +741,134 @@ def test_markdown_renderer_ignores_empty_caption_and_footnote_lists() -> None:
     assert rendered.warning_codes == ()
 
 
+def test_markdown_renderer_replaces_text_image_and_escapes_ocr_text() -> None:
+    rendered = render_markdown(
+        [[{
+            "type": "image",
+            "content": {
+                "image_caption": [{"type": "text", "content": "Caption"}],
+                "image_source": {"path": "images/a.png"},
+                "secondary_text": [
+                    {
+                        "type": "text",
+                        "content": "<script>[link](...)*&",
+                    }
+                ],
+                "secondary_text_mode": "replace_image",
+                "image_footnote": [
+                    {"type": "text", "content": "Footnote"}
+                ],
+            },
+        }]],
+        image_names={"images/a.png": "images/000000.png"},
+        max_bytes=10_000,
+    )
+
+    assert rendered.content == (
+        "Caption\n\n"
+        "&lt;script&gt;\\[link\\]\\(\\.\\.\\.\\)\\*&amp;\n\n"
+        "Footnote\n"
+    ).encode()
+    assert b"![](images/000000.png)" not in rendered.content
+
+
+def test_markdown_renderer_appends_text_after_mixed_image() -> None:
+    rendered = render_markdown(
+        [[{
+            "type": "image",
+            "content": {
+                "image_caption": [{"type": "text", "content": "Caption"}],
+                "image_source": {"path": "images/a.png"},
+                "secondary_text": [
+                    {"type": "text", "content": "Visible title"}
+                ],
+                "secondary_text_mode": "append_after_image",
+                "image_footnote": [
+                    {"type": "text", "content": "Footnote"}
+                ],
+            },
+        }]],
+        image_names={"images/a.png": "images/000000.png"},
+        max_bytes=10_000,
+    )
+
+    assert rendered.content == (
+        "Caption\n\n"
+        "![](images/000000.png)\n\n"
+        "Visible title\n\n"
+        "Footnote\n"
+    ).encode()
+
+
+@pytest.mark.parametrize(
+    "secondary",
+    [
+        {"secondary_text": [{"type": "text", "content": "x"}]},
+        {"secondary_text_mode": "replace_image"},
+        {
+            "secondary_text": [{"type": "text", "content": "x"}],
+            "secondary_text_mode": "unknown",
+        },
+        {"secondary_text": [], "secondary_text_mode": "replace_image"},
+        {
+            "secondary_text": [
+                {"type": "equation_inline", "content": r"\input{x}"}
+            ],
+            "secondary_text_mode": "replace_image",
+        },
+        {
+            "secondary_text": [{"type": "text", "content": ""}],
+            "secondary_text_mode": "replace_image",
+        },
+        {
+            "secondary_text": [{"type": "text", "content": "x\ny"}],
+            "secondary_text_mode": "replace_image",
+        },
+        {
+            "secondary_text": [
+                {"type": "text", "content": "x", "unexpected": True}
+            ],
+            "secondary_text_mode": "replace_image",
+        },
+    ],
+)
+def test_markdown_renderer_rejects_malformed_secondary_text(
+    secondary,
+) -> None:
+    content = {
+        "image_source": {"path": "images/a.png"},
+        **secondary,
+    }
+    with pytest.raises(ArtifactFailure) as caught:
+        render_markdown(
+            [[{"type": "image", "content": content}]],
+            image_names={"images/a.png": "images/000000.png"},
+            max_bytes=10_000,
+        )
+
+    assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
+
+
+def test_markdown_renderer_still_validates_replaced_image_path() -> None:
+    with pytest.raises(ArtifactFailure) as caught:
+        render_markdown(
+            [[{
+                "type": "image",
+                "content": {
+                    "image_source": {"path": "../unsafe.png"},
+                    "secondary_text": [
+                        {"type": "text", "content": "Visible title"}
+                    ],
+                    "secondary_text_mode": "replace_image",
+                },
+            }]],
+            image_names={},
+            max_bytes=10_000,
+        )
+
+    assert caught.value.code == ArtifactErrorCode.UNSAFE_IMAGE.value
+
+
 @pytest.mark.parametrize(
     "manifest",
     [
@@ -754,6 +941,224 @@ def test_zip_is_deterministic_safe_and_contains_only_verified_explicit_inputs(tm
         assert manifest["warning_codes"] == [ArtifactErrorCode.UNSUPPORTED_NODE.value]
         assert manifest["archive_sha256_binding"] == "sqlite_artifact_index"
         assert [entry["name"] for entry in manifest["entries"]] == names[:-1]
+
+
+@pytest.mark.parametrize(
+    ("kind", "reason", "mode", "expects_image_reference"),
+    [
+        (
+            SecondaryResultKind.TEXT,
+            ReplacementReason.REPLACED_TEXT_IMAGE,
+            "replace_image",
+            False,
+        ),
+        (
+            SecondaryResultKind.IMAGE_WITH_TEXT,
+            ReplacementReason.AUGMENTED_IMAGE_TEXT,
+            "append_after_image",
+            True,
+        ),
+        (
+            SecondaryResultKind.IMAGE_WITH_TEXT,
+            ReplacementReason.AUGMENTED_UNSTRUCTURED_FALLBACK,
+            "append_after_image",
+            True,
+        ),
+    ],
+)
+def test_zip_accepts_audited_secondary_text_and_always_keeps_source_image(
+    tmp_path: Path,
+    kind: SecondaryResultKind,
+    reason: ReplacementReason,
+    mode: str,
+    expects_image_reference: bool,
+) -> None:
+    result, publication, _, _, _ = _text_image_inputs(
+        tmp_path,
+        kind=kind,
+        reason=reason,
+        mode=mode,
+    )
+
+    bundle = ArtifactBundler(
+        ArtifactLimits(1_000_000, 100_000, 20, 100_000)
+    ).publish(
+        result,
+        publication,
+        artifact_root=(tmp_path / "artifacts").absolute(),
+        batch_id=BATCH_ID,
+        created_at=NOW,
+        expires_at=NOW + timedelta(hours=24),
+    )
+
+    with zipfile.ZipFile(bundle.path) as archive:
+        names = archive.namelist()
+        markdown = archive.read("final.md")
+        assert "images/000000.png" in names
+        assert archive.read("images/000000.png") == b"used-image"
+        assert b"Balance Sheet" in markdown
+        assert (b"![](images/000000.png)" in markdown) is expects_image_reference
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["text", "mode", "original_field"],
+)
+def test_zip_rejects_tampered_secondary_text_node(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    result, publication, _, final, _ = _text_image_inputs(tmp_path)
+    if mutation == "text":
+        final[0][1]["content"]["secondary_text"][0]["content"] = "tampered"
+    elif mutation == "mode":
+        final[0][1]["content"]["secondary_text_mode"] = "append_after_image"
+    else:
+        final[0][1]["bbox"] = [9, 9, 9, 9]
+    publication = _replace_task7_file(
+        publication,
+        "content_list_v2.json",
+        _canonical(final),
+    )
+
+    with pytest.raises(ArtifactFailure) as caught:
+        ArtifactBundler(
+            ArtifactLimits(1_000_000, 100_000, 20, 100_000)
+        ).publish(
+            result,
+            publication,
+            artifact_root=(tmp_path / "artifacts").absolute(),
+            batch_id=BATCH_ID,
+            created_at=NOW,
+            expires_at=NOW + timedelta(hours=24),
+        )
+
+    assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
+
+
+@pytest.mark.parametrize(
+    ("kind", "reason"),
+    [
+        (
+            SecondaryResultKind.FORMULA,
+            ReplacementReason.REPLACED_TEXT_IMAGE,
+        ),
+        (
+            SecondaryResultKind.TEXT,
+            ReplacementReason.AUGMENTED_IMAGE_TEXT,
+        ),
+    ],
+)
+def test_zip_rejects_secondary_text_audit_kind_or_reason_mismatch(
+    tmp_path: Path,
+    kind: SecondaryResultKind,
+    reason: ReplacementReason,
+) -> None:
+    result, publication, _, _, record = _text_image_inputs(tmp_path)
+    audit_id = "audit-" + sha256(
+        (
+            "merge-audit\0file-a\0"
+            f"{1}\0{2}\0{record.candidate_id}\0{0}\0{reason.value}"
+        ).encode()
+    ).hexdigest()
+    forged = replace(
+        record,
+        audit_id=audit_id,
+        kind=kind,
+        reason=reason,
+    )
+    publication = replace(publication, records=(forged,))
+    publication = _replace_task7_file(
+        publication,
+        "secondary_ocr_audit.json",
+        _canonical(_audit_document(forged)),
+    )
+
+    with pytest.raises(ArtifactFailure) as caught:
+        ArtifactBundler(
+            ArtifactLimits(1_000_000, 100_000, 20, 100_000)
+        ).publish(
+            result,
+            publication,
+            artifact_root=(tmp_path / "artifacts").absolute(),
+            batch_id=BATCH_ID,
+            created_at=NOW,
+            expires_at=NOW + timedelta(hours=24),
+        )
+
+    assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
+
+
+def test_zip_rejects_reserved_secondary_text_in_original_retained_snapshot(
+    tmp_path: Path,
+) -> None:
+    result, publication, _, base_record = _inputs(tmp_path)
+    original = json.loads(
+        publication.original_snapshot_path.read_text(encoding="utf-8")
+    )
+    original[0][1]["content"]["secondary_text"] = [
+        {"type": "text", "content": "forged"}
+    ]
+    original[0][1]["content"]["secondary_text_mode"] = "replace_image"
+    original_bytes = _canonical(original)
+    result.content_list_v2_path.write_bytes(original_bytes)
+    original_node = original[0][1]
+    reason = ReplacementReason.OTHER_IMAGE
+    audit_id = "audit-" + sha256(
+        (
+            "merge-audit\0file-a\0"
+            f"{1}\0{2}\0{base_record.candidate_id}\0{0}\0{reason.value}"
+        ).encode()
+    ).hexdigest()
+    retained = replace(
+        base_record,
+        audit_id=audit_id,
+        kind=SecondaryResultKind.OTHER,
+        decision=ReplacementDecision.RETAINED,
+        reason=reason,
+        original_node_snapshot=json.dumps(
+            original_node,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        replacement_node_snapshot=None,
+    )
+    publication = replace(
+        publication,
+        records=(retained,),
+        replacement_count=0,
+        retained_count=1,
+    )
+    publication = _replace_task7_file(
+        publication,
+        "original_content_list_v2.json",
+        original_bytes,
+    )
+    publication = _replace_task7_file(
+        publication,
+        "content_list_v2.json",
+        original_bytes,
+    )
+    publication = _replace_task7_file(
+        publication,
+        "secondary_ocr_audit.json",
+        _canonical(_audit_document(retained)),
+    )
+
+    with pytest.raises(ArtifactFailure) as caught:
+        ArtifactBundler(
+            ArtifactLimits(1_000_000, 100_000, 20, 100_000)
+        ).publish(
+            result,
+            publication,
+            artifact_root=(tmp_path / "artifacts").absolute(),
+            batch_id=BATCH_ID,
+            created_at=NOW,
+            expires_at=NOW + timedelta(hours=24),
+        )
+
+    assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
 
 
 def test_zip_accepts_semantically_identical_pretty_printed_mineru_source(

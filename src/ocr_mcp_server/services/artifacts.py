@@ -47,6 +47,7 @@ from .structured_content import (
     StructuredContentInvalid,
     StructuredContentLimits,
     validate_formula_latex,
+    validate_plain_text,
     validate_table_html,
 )
 
@@ -279,6 +280,44 @@ def _typed_v2_auxiliary_markdown(
     return ("\n".join(lines) if lines else None), warned
 
 
+def _typed_secondary_text_markdown(
+    content: Mapping[str, object],
+    limits: StructuredContentLimits,
+) -> tuple[str | None, str | None]:
+    if (
+        "secondary_text" not in content
+        and "secondary_text_mode" not in content
+    ):
+        return None, None
+    spans = content.get("secondary_text")
+    mode = content.get("secondary_text_mode")
+    if mode not in {"replace_image", "append_after_image"}:
+        _fail(ArtifactErrorCode.INVALID_INPUT)
+    if not isinstance(spans, list) or not spans:
+        _fail(ArtifactErrorCode.INVALID_INPUT)
+    lines: list[str] = []
+    for span in spans:
+        if (
+            not isinstance(span, Mapping)
+            or set(span) != {"type", "content"}
+            or span.get("type") != "text"
+            or not isinstance(span.get("content"), str)
+        ):
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        value = span["content"]
+        if not value or value != value.strip() or "\n" in value:
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        lines.append(value)
+    validated = validate_plain_text("\n".join(lines), limits)
+    return (
+        "\n".join(
+            _markdown_escape(line)
+            for line in validated.split("\n")
+        ),
+        mode,
+    )
+
+
 def _structured_limits(max_bytes: int) -> StructuredContentLimits:
     utf8 = min(40_000_000, max_bytes)
     characters = min(10_000_000, utf8)
@@ -378,15 +417,28 @@ def render_markdown(
                     logical = image_names[raw_path]
                     if _safe_logical_path(logical) is None or not logical.startswith("images/"):
                         _fail(ArtifactErrorCode.UNSAFE_IMAGE)
+                    secondary_text, secondary_text_mode = (
+                        _typed_secondary_text_markdown(content, limits)
+                    )
                     footnote, footnote_warning = _typed_v2_auxiliary_markdown(
                         content,
                         "image_footnote",
                         limits,
                     )
                     warned = warned or caption_warning or footnote_warning
+                    image_markdown = (
+                        None
+                        if secondary_text_mode == "replace_image"
+                        else f"![]({logical})"
+                    )
                     block = "\n\n".join(
                         part
-                        for part in (caption, f"![]({logical})", footnote)
+                        for part in (
+                            caption,
+                            image_markdown,
+                            secondary_text,
+                            footnote,
+                        )
                         if part is not None
                     )
                 elif node_type == "table":
@@ -1401,6 +1453,54 @@ def _expected_node_for_audit(
             _fail(ArtifactErrorCode.INVALID_INPUT)
         return replacement_node
 
+    text_reasons = {
+        ReplacementReason.REPLACED_TEXT_IMAGE: (
+            SecondaryResultKind.TEXT,
+            "replace_image",
+        ),
+        ReplacementReason.AUGMENTED_IMAGE_TEXT: (
+            SecondaryResultKind.IMAGE_WITH_TEXT,
+            "append_after_image",
+        ),
+        ReplacementReason.AUGMENTED_UNSTRUCTURED_FALLBACK: (
+            SecondaryResultKind.IMAGE_WITH_TEXT,
+            "append_after_image",
+        ),
+    }
+    if record.reason in text_reasons:
+        if (
+            record.decision is not ReplacementDecision.REPLACED
+            or replacement_node is None
+            or structured
+            or original_node.get("type") != "image"
+        ):
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        original_content = original_node.get("content")
+        replacement_content = replacement_node.get("content")
+        if (
+            not isinstance(original_content, dict)
+            or not isinstance(replacement_content, dict)
+            or "secondary_text" in original_content
+            or "secondary_text_mode" in original_content
+        ):
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        expected_kind, expected_mode = text_reasons[record.reason]
+        _rendered_text, mode = _typed_secondary_text_markdown(
+            replacement_content,
+            limits,
+        )
+        if record.kind is not expected_kind or mode != expected_mode:
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        expected = deepcopy(original_node)
+        expected_content = expected["content"]
+        expected_content["secondary_text"] = deepcopy(
+            replacement_content["secondary_text"]
+        )
+        expected_content["secondary_text_mode"] = mode
+        if replacement_node != expected:
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        return replacement_node
+
     if record.decision is not ReplacementDecision.RETAINED or replacement_node is not None:
         _fail(ArtifactErrorCode.INVALID_INPUT)
     if record.reason is ReplacementReason.ALREADY_STRUCTURED:
@@ -1419,6 +1519,8 @@ def _expected_node_for_audit(
         if record.kind not in {
             SecondaryResultKind.TABLE,
             SecondaryResultKind.FORMULA,
+            SecondaryResultKind.TEXT,
+            SecondaryResultKind.IMAGE_WITH_TEXT,
         }:
             _fail(ArtifactErrorCode.INVALID_INPUT)
         return original_node
@@ -1438,6 +1540,18 @@ def _reconstruct_audited_final(
 ) -> object:
     if not isinstance(original, list):
         _fail(ArtifactErrorCode.INVALID_INPUT)
+    for page in original:
+        if not isinstance(page, list):
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        for node in page:
+            if not isinstance(node, dict):
+                _fail(ArtifactErrorCode.INVALID_INPUT)
+            content = node.get("content")
+            if isinstance(content, Mapping) and (
+                "secondary_text" in content
+                or "secondary_text_mode" in content
+            ):
+                _fail(ArtifactErrorCode.INVALID_INPUT)
     expected_pointers = {
         pointer for _raw, pointer in _extract_image_references((original,))
     }
