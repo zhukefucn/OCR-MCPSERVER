@@ -191,6 +191,13 @@ class SecondaryOCRSettings(_SettingsSection):
     device: Literal["cpu", "gpu", "gpu:0"] = "cpu"
     queue_capacity: int = Field(default=8, ge=1, le=1024)
     classification_threshold: float = Field(default=0.8, gt=0, le=1)
+    text_recognition_threshold: float = Field(default=0.8, gt=0, le=1)
+    text_min_characters: int = Field(default=4, ge=1, le=10_000)
+    mixed_text_min_lines: int = Field(default=2, ge=1, le=10_000)
+    mixed_text_min_characters: int = Field(default=8, ge=1, le=100_000)
+    text_max_lines: int = Field(default=2_000, ge=1, le=20_000)
+    text_max_characters: int = Field(default=200_000, ge=1, le=1_000_000)
+    text_max_utf8_bytes: int = Field(default=800_000, ge=1, le=4_000_000)
     paddlex_config: Path | None = None
     formula_model_name: str = "PP-FormulaNet_plus-S"
     orientation_model_dir: Path | None = None
@@ -201,6 +208,13 @@ class SecondaryOCRSettings(_SettingsSection):
     @field_validator(
         "queue_capacity",
         "classification_threshold",
+        "text_recognition_threshold",
+        "text_min_characters",
+        "mixed_text_min_lines",
+        "mixed_text_min_characters",
+        "text_max_lines",
+        "text_max_characters",
+        "text_max_utf8_bytes",
         "orientation_assessment_timeout_seconds",
         "orientation_assessment_lease_seconds",
         mode="before",
@@ -229,6 +243,13 @@ class SecondaryOCRSettings(_SettingsSection):
             raise ValueError(
                 "orientation assessment timeout must be shorter than its lease"
             )
+        if (
+            self.text_min_characters > self.text_max_characters
+            or self.mixed_text_min_lines > self.text_max_lines
+            or self.mixed_text_min_characters > self.text_max_characters
+            or self.text_max_characters > self.text_max_utf8_bytes
+        ):
+            raise ValueError("secondary OCR text limits are contradictory")
         return self
 
 

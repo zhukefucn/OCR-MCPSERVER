@@ -131,6 +131,84 @@ def test_secondary_result_is_immutable_and_expresses_all_decision_states() -> No
         assert result.state is state
 
 
+def test_valid_secondary_text_result_records_dominant_text_origin() -> None:
+    from ocr_mcp_server.domain import (
+        OrthogonalAngle,
+        SecondaryContentFormat,
+        SecondaryOCREngine,
+        SecondaryOcrResult,
+        SecondaryResultKind,
+        SecondaryResultState,
+        SecondaryTextOrigin,
+    )
+
+    valid_text = SecondaryOcrResult(
+        kind=SecondaryResultKind.TEXT,
+        angle=OrthogonalAngle.DEG_0,
+        content="Balance Sheet",
+        content_format=SecondaryContentFormat.PLAIN_TEXT,
+        confidence=0.93,
+        engine=SecondaryOCREngine.PP_STRUCTURE_V3,
+        model_versions={"pipeline": "PP-StructureV3"},
+        state=SecondaryResultState.VALID,
+        text_origin=SecondaryTextOrigin.TEXT_DOMINANT,
+    )
+
+    assert valid_text.text_origin is SecondaryTextOrigin.TEXT_DOMINANT
+
+
+@pytest.mark.parametrize(
+    ("kind", "content_format", "origin", "state", "content"),
+    [
+        ("text", "plain_text", "mixed_visual", "valid", "title"),
+        ("text", "plain_text", None, "valid", "title"),
+        ("image_with_text", "plain_text", "text_dominant", "valid", "title"),
+        ("table", "html", "mixed_visual", "valid", "<table></table>"),
+        ("formula", "latex", "text_dominant", "valid", "x"),
+        ("other", None, "mixed_visual", "valid", None),
+        ("table", "plain_text", None, "valid", "title"),
+        ("formula", "plain_text", None, "valid", "title"),
+        ("uncertain", "plain_text", "text_dominant", "uncertain", "title"),
+        ("uncertain", None, "text_dominant", "failed", None),
+    ],
+)
+def test_secondary_text_result_rejects_mismatched_contracts(
+    kind: str,
+    content_format: str | None,
+    origin: str | None,
+    state: str,
+    content: str | None,
+) -> None:
+    from ocr_mcp_server.domain import (
+        OrthogonalAngle,
+        SecondaryContentFormat,
+        SecondaryOCREngine,
+        SecondaryOcrResult,
+        SecondaryResultKind,
+        SecondaryResultState,
+        SecondaryTextOrigin,
+    )
+
+    with pytest.raises(ValueError):
+        SecondaryOcrResult(
+            kind=SecondaryResultKind(kind),
+            angle=OrthogonalAngle.DEG_0,
+            content=content,
+            content_format=(
+                SecondaryContentFormat(content_format)
+                if content_format is not None
+                else None
+            ),
+            confidence=0.8,
+            engine=SecondaryOCREngine.PP_STRUCTURE_V3,
+            model_versions={"pipeline": "PP-StructureV3"},
+            state=SecondaryResultState(state),
+            text_origin=(
+                SecondaryTextOrigin(origin) if origin is not None else None
+            ),
+        )
+
+
 def test_provider_protocol_fixes_engine_on_instance_and_has_one_candidate_argument() -> None:
     import inspect
 

@@ -72,6 +72,13 @@ secondary_ocr:
   device: cpu
   queue_capacity: 8
   classification_threshold: 0.8
+  text_recognition_threshold: 0.8
+  text_min_characters: 4
+  mixed_text_min_lines: 2
+  mixed_text_min_characters: 8
+  text_max_lines: 2000
+  text_max_characters: 200000
+  text_max_utf8_bytes: 800000
   paddlex_config: null
   formula_model_name: PP-FormulaNet_plus-S
   orientation_model_dir: null

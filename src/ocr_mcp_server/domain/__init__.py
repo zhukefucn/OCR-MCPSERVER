@@ -96,6 +96,7 @@ from .secondary_ocr import (
     SecondaryProcessingStatus,
     SecondaryResultKind,
     SecondaryResultState,
+    SecondaryTextOrigin,
 )
 
 __all__ = [
@@ -173,6 +174,7 @@ __all__ = [
     "SecondaryProcessingStatus",
     "SecondaryResultKind",
     "SecondaryResultState",
+    "SecondaryTextOrigin",
     "StateTransitionError",
     "StageEventSnapshot",
     "StoredFile",

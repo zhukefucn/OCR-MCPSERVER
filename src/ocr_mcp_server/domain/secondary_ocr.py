@@ -36,6 +36,8 @@ class SecondaryProcessingStatus(StrEnum):
 class SecondaryResultKind(StrEnum):
     TABLE = "table"
     FORMULA = "formula"
+    TEXT = "text"
+    IMAGE_WITH_TEXT = "image_with_text"
     OTHER = "other"
     UNCERTAIN = "uncertain"
 
@@ -50,6 +52,13 @@ class OrthogonalAngle(IntEnum):
 class SecondaryContentFormat(StrEnum):
     HTML = "html"
     LATEX = "latex"
+    PLAIN_TEXT = "plain_text"
+
+
+class SecondaryTextOrigin(StrEnum):
+    TEXT_DOMINANT = "text_dominant"
+    MIXED_VISUAL = "mixed_visual"
+    UNSTRUCTURED_FALLBACK = "unstructured_fallback"
 
 
 class SecondaryResultState(StrEnum):
@@ -204,6 +213,7 @@ class SecondaryOcrResult:
     engine: SecondaryOCREngine
     model_versions: Mapping[str, str]
     state: SecondaryResultState
+    text_origin: SecondaryTextOrigin | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -215,6 +225,10 @@ class SecondaryOcrResult:
             or (
                 self.content_format is not None
                 and not isinstance(self.content_format, SecondaryContentFormat)
+            )
+            or (
+                self.text_origin is not None
+                and not isinstance(self.text_origin, SecondaryTextOrigin)
             )
         ):
             raise ValueError("invalid secondary OCR result contract")
@@ -240,8 +254,41 @@ class SecondaryOcrResult:
                 or self.content_format is not SecondaryContentFormat.LATEX
             ):
                 raise ValueError("valid formula results require LaTeX content")
+            if self.kind is SecondaryResultKind.TEXT:
+                if (
+                    self.content is None
+                    or self.content_format is not SecondaryContentFormat.PLAIN_TEXT
+                    or self.text_origin is not SecondaryTextOrigin.TEXT_DOMINANT
+                ):
+                    raise ValueError(
+                        "valid text results require dominant plain text"
+                    )
+            elif self.kind is SecondaryResultKind.IMAGE_WITH_TEXT:
+                if (
+                    self.content is None
+                    or self.content_format is not SecondaryContentFormat.PLAIN_TEXT
+                    or self.text_origin
+                    not in {
+                        SecondaryTextOrigin.MIXED_VISUAL,
+                        SecondaryTextOrigin.UNSTRUCTURED_FALLBACK,
+                    }
+                ):
+                    raise ValueError(
+                        "valid mixed results require appendable plain text"
+                    )
+            elif self.text_origin is not None:
+                raise ValueError("non-text results cannot carry a text origin")
             if self.kind is SecondaryResultKind.OTHER and self.content is not None:
                 raise ValueError("valid other results cannot replace content")
+        elif (
+            self.kind is not SecondaryResultKind.UNCERTAIN
+            or self.content is not None
+            or self.content_format is not None
+            or self.text_origin is not None
+        ):
+            raise ValueError(
+                "non-valid results must be content-free and uncertain"
+            )
         versions = dict(self.model_versions)
         if any(
             not isinstance(key, str)

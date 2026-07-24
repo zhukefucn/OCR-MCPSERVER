@@ -42,6 +42,13 @@ def test_settings_defaults_match_domain_constraints() -> None:
     assert settings.secondary_ocr.device == "cpu"
     assert settings.secondary_ocr.queue_capacity == 8
     assert settings.secondary_ocr.classification_threshold == 0.8
+    assert settings.secondary_ocr.text_recognition_threshold == 0.8
+    assert settings.secondary_ocr.text_min_characters == 4
+    assert settings.secondary_ocr.mixed_text_min_lines == 2
+    assert settings.secondary_ocr.mixed_text_min_characters == 8
+    assert settings.secondary_ocr.text_max_lines == 2_000
+    assert settings.secondary_ocr.text_max_characters == 200_000
+    assert settings.secondary_ocr.text_max_utf8_bytes == 800_000
     assert settings.secondary_ocr.paddlex_config is None
     assert settings.secondary_ocr.formula_model_name == "PP-FormulaNet_plus-S"
     assert settings.secondary_ocr.orientation_model_dir is None
@@ -382,6 +389,17 @@ def test_secondary_ocr_settings_accept_explicit_first_gpu() -> None:
         ("classification_threshold", True),
         ("classification_threshold", 1.01),
         ("classification_threshold", float("nan")),
+        ("text_recognition_threshold", 0),
+        ("text_recognition_threshold", True),
+        ("text_recognition_threshold", 1.01),
+        ("text_recognition_threshold", float("nan")),
+        ("text_min_characters", 0),
+        ("text_min_characters", True),
+        ("mixed_text_min_lines", 0),
+        ("mixed_text_min_characters", 0),
+        ("text_max_lines", 0),
+        ("text_max_characters", 0),
+        ("text_max_utf8_bytes", 0),
         ("formula_model_name", ""),
         ("orientation_model_name", ""),
         ("orientation_assessment_timeout_seconds", 0),
@@ -403,12 +421,35 @@ def test_example_yaml_documents_secondary_ocr_deployment_defaults() -> None:
     assert settings.device == "cpu"
     assert settings.queue_capacity == 8
     assert settings.classification_threshold == 0.8
+    assert settings.text_recognition_threshold == 0.8
+    assert settings.text_min_characters == 4
+    assert settings.mixed_text_min_lines == 2
+    assert settings.mixed_text_min_characters == 8
+    assert settings.text_max_lines == 2_000
+    assert settings.text_max_characters == 200_000
+    assert settings.text_max_utf8_bytes == 800_000
     assert settings.paddlex_config is None
     assert settings.formula_model_name == "PP-FormulaNet_plus-S"
     assert settings.orientation_model_dir is None
     assert settings.orientation_model_name == "PP-LCNet_x1_0_doc_ori"
     assert settings.orientation_assessment_timeout_seconds == 90
     assert settings.orientation_assessment_lease_seconds == 100
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"text_min_characters": 5, "text_max_characters": 4},
+        {"mixed_text_min_lines": 3, "text_max_lines": 2},
+        {"mixed_text_min_characters": 9, "text_max_characters": 8},
+        {"text_max_characters": 5, "text_max_utf8_bytes": 4},
+    ],
+)
+def test_secondary_ocr_text_bounds_must_be_consistent(
+    values: dict[str, int],
+) -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(secondary_ocr=values)
 
 
 def test_orientation_assessment_timeout_lease_and_task_lease_are_ordered() -> None:
