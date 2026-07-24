@@ -17,6 +17,7 @@ from ocr_mcp_server.domain import (
     SecondaryOCREngine,
     SecondaryResultKind,
     SecondaryResultState,
+    SecondaryTextOrigin,
 )
 from ocr_mcp_server.domain.secondary_ocr import OrientationClassificationResult
 from ocr_mcp_server.settings import SecondaryOCRSettings
@@ -49,7 +50,14 @@ def _candidate(tmp_path: Path, hint: str = "image") -> ImageCandidate:
     )
 
 
-def _response(*, angle=0, boxes=None, tables=None, formulas=None):
+def _response(
+    *,
+    angle=0,
+    boxes=None,
+    tables=None,
+    formulas=None,
+    overall_ocr=None,
+):
     return [
         {
             "res": {
@@ -57,6 +65,11 @@ def _response(*, angle=0, boxes=None, tables=None, formulas=None):
                 "layout_det_res": {"boxes": boxes if boxes is not None else []},
                 "table_res_list": tables if tables is not None else [],
                 "formula_res_list": formulas if formulas is not None else [],
+                "overall_ocr_res": overall_ocr or {
+                    "rec_texts": [],
+                    "rec_scores": [],
+                    "rec_boxes": [],
+                },
             }
         }
     ]
@@ -470,6 +483,223 @@ def test_normalization_decisions(
 
 
 @pytest.mark.parametrize(
+    ("response", "kind", "origin", "content", "confidence"),
+    [
+        (
+            _response(
+                boxes=[{"label": "doc_title", "score": 0.95}],
+                overall_ocr={
+                    "rec_texts": ["Balance Sheet"],
+                    "rec_scores": [0.96],
+                    "rec_boxes": [[1, 2, 100, 20]],
+                },
+            ),
+            SecondaryResultKind.TEXT,
+            SecondaryTextOrigin.TEXT_DOMINANT,
+            "Balance Sheet",
+            0.95,
+        ),
+        (
+            _response(
+                boxes=[{"label": "image", "score": 0.94}],
+                overall_ocr={
+                    "rec_texts": ["A", "B"],
+                    "rec_scores": [0.96, 0.93],
+                    "rec_boxes": [[1, 2, 100, 20], [1, 25, 100, 45]],
+                },
+            ),
+            SecondaryResultKind.IMAGE_WITH_TEXT,
+            SecondaryTextOrigin.MIXED_VISUAL,
+            "A\nB",
+            0.93,
+        ),
+        (
+            _response(
+                boxes=[{"label": "seal", "score": 0.95}],
+                overall_ocr={
+                    "rec_texts": ["印"],
+                    "rec_scores": [0.96],
+                    "rec_boxes": [[1, 2, 20, 20]],
+                },
+            ),
+            SecondaryResultKind.OTHER,
+            None,
+            None,
+            0.95,
+        ),
+        (
+            _response(
+                boxes=[{"label": "table", "score": 0.93}],
+                overall_ocr={
+                    "rec_texts": ["Balance Sheet"],
+                    "rec_scores": [0.96],
+                    "rec_boxes": [[1, 2, 100, 20]],
+                },
+            ),
+            SecondaryResultKind.IMAGE_WITH_TEXT,
+            SecondaryTextOrigin.UNSTRUCTURED_FALLBACK,
+            "Balance Sheet",
+            0.93,
+        ),
+        (
+            _response(
+                boxes=[{"label": "mystery", "score": 0.97}],
+                overall_ocr={
+                    "rec_texts": ["Balance Sheet"],
+                    "rec_scores": [0.96],
+                    "rec_boxes": [[1, 2, 100, 20]],
+                },
+            ),
+            SecondaryResultKind.UNCERTAIN,
+            None,
+            None,
+            0.97,
+        ),
+    ],
+)
+def test_normalizer_classifies_plain_and_mixed_image_text(
+    response,
+    kind,
+    origin,
+    content,
+    confidence,
+) -> None:
+    from ocr_mcp_server.infra.pp_structure_v3 import (
+        normalize_pp_structure_v3_result,
+    )
+
+    result = normalize_pp_structure_v3_result(
+        response,
+        threshold=0.8,
+        model_versions={"pipeline": "PP-StructureV3"},
+    )
+
+    assert result.kind is kind
+    assert result.text_origin is origin
+    assert result.content == content
+    assert result.confidence == confidence
+
+
+def test_valid_table_result_precedes_malformed_plain_ocr() -> None:
+    from ocr_mcp_server.infra.pp_structure_v3 import (
+        normalize_pp_structure_v3_result,
+    )
+
+    result = normalize_pp_structure_v3_result(
+        _response(
+            boxes=[{"label": "table", "score": 0.93}],
+            tables=[{"pred_html": "<table></table>"}],
+            overall_ocr={
+                "rec_texts": ["ignored"],
+                "rec_scores": [],
+                "rec_boxes": [],
+            },
+        ),
+        threshold=0.8,
+        model_versions={"pipeline": "PP-StructureV3"},
+    )
+
+    assert result.kind is SecondaryResultKind.TABLE
+    assert result.state is SecondaryResultState.VALID
+
+
+@pytest.mark.parametrize(
+    "overall_ocr",
+    [
+        {
+            "rec_texts": ["x"],
+            "rec_scores": [],
+            "rec_boxes": [[0, 0, 1, 1]],
+        },
+        {
+            "rec_texts": ["x"],
+            "rec_scores": [float("nan")],
+            "rec_boxes": [[0, 0, 1, 1]],
+        },
+        {
+            "rec_texts": ["x"],
+            "rec_scores": [0.9],
+            "rec_boxes": [[-1, 0, 1, 1]],
+        },
+        {
+            "rec_texts": ["x"],
+            "rec_scores": [0.9],
+            "rec_boxes": [[2, 0, 1, 1]],
+        },
+        {
+            "rec_texts": ["\ud800"],
+            "rec_scores": [0.9],
+            "rec_boxes": [[0, 0, 1, 1]],
+        },
+    ],
+)
+def test_malformed_plain_ocr_returns_content_free_invalid_result(
+    overall_ocr,
+) -> None:
+    from ocr_mcp_server.infra.pp_structure_v3 import (
+        normalize_pp_structure_v3_result,
+    )
+
+    result = normalize_pp_structure_v3_result(
+        _response(
+            boxes=[{"label": "text", "score": 0.9}],
+            overall_ocr=overall_ocr,
+        ),
+        threshold=0.8,
+        model_versions={"pipeline": "PP-StructureV3"},
+    )
+
+    assert result.kind is SecondaryResultKind.UNCERTAIN
+    assert result.state is SecondaryResultState.INVALID
+    assert result.content is None
+    assert result.text_origin is None
+
+
+@pytest.mark.parametrize(
+    "overall_ocr",
+    [
+        {
+            "rec_texts": ["a", "b", "c"],
+            "rec_scores": [0.9, 0.9, 0.9],
+            "rec_boxes": [[0, 0, 1, 1]] * 3,
+        },
+        {
+            "rec_texts": ["abcdef"],
+            "rec_scores": [0.9],
+            "rec_boxes": [[0, 0, 1, 1]],
+        },
+    ],
+)
+def test_plain_ocr_limits_fail_closed(overall_ocr) -> None:
+    from ocr_mcp_server.infra.pp_structure_v3 import (
+        _TextRecognitionPolicy,
+        normalize_pp_structure_v3_result,
+    )
+
+    result = normalize_pp_structure_v3_result(
+        _response(
+            boxes=[{"label": "text", "score": 0.9}],
+            overall_ocr=overall_ocr,
+        ),
+        threshold=0.8,
+        text_policy=_TextRecognitionPolicy(
+            recognition_threshold=0.8,
+            min_characters=1,
+            mixed_min_lines=1,
+            mixed_min_characters=1,
+            max_lines=2,
+            max_characters=5,
+            max_utf8_bytes=5,
+        ),
+        model_versions={"pipeline": "PP-StructureV3"},
+    )
+
+    assert result.kind is SecondaryResultKind.UNCERTAIN
+    assert result.state is SecondaryResultState.INVALID
+    assert result.content is None
+
+
+@pytest.mark.parametrize(
     "response",
     [
         None,
@@ -530,6 +760,11 @@ def test_malformed_response_returns_content_free_invalid_result(response) -> Non
                 "doc_preprocessor_res": {"angle": 0},
                 "layout_det_res": {
                     "boxes": [{"label": "figure", "score": 0.9}]
+                },
+                "overall_ocr_res": {
+                    "rec_texts": [],
+                    "rec_scores": [],
+                    "rec_boxes": [],
                 },
             },
             SecondaryResultKind.OTHER,

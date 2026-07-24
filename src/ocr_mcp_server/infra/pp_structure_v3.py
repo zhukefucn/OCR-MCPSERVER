@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import math
+from dataclasses import dataclass
 from typing import Any, Mapping
 
 from ..domain import (
@@ -17,6 +18,7 @@ from ..domain import (
     SecondaryOcrResult,
     SecondaryResultKind,
     SecondaryResultState,
+    SecondaryTextOrigin,
 )
 from ..settings import SecondaryOCRSettings
 from .secondary_ocr import SingleOwnerSecondaryOcrWorker
@@ -32,6 +34,63 @@ _FIXED_FEATURES = {
     "use_chart_recognition": False,
     "use_region_detection": False,
 }
+_TEXT_LAYOUT_LABELS = frozenset({
+    "paragraph_title",
+    "text",
+    "number",
+    "abstract",
+    "content",
+    "figure_title",
+    "reference",
+    "doc_title",
+    "footnote",
+    "header",
+    "algorithm",
+    "footer",
+    "formula_number",
+    "aside_text",
+    "reference_content",
+})
+_STRUCTURED_LAYOUT_LABELS = frozenset({"table", "formula"})
+_VISUAL_LAYOUT_LABELS = frozenset({"image", "seal", "chart"})
+
+
+@dataclass(frozen=True, slots=True)
+class _TextRecognitionPolicy:
+    recognition_threshold: float
+    min_characters: int
+    mixed_min_lines: int
+    mixed_min_characters: int
+    max_lines: int
+    max_characters: int
+    max_utf8_bytes: int
+
+    @classmethod
+    def from_settings(
+        cls,
+        settings: SecondaryOCRSettings,
+    ) -> _TextRecognitionPolicy:
+        return cls(
+            settings.text_recognition_threshold,
+            settings.text_min_characters,
+            settings.mixed_text_min_lines,
+            settings.mixed_text_min_characters,
+            settings.text_max_lines,
+            settings.text_max_characters,
+            settings.text_max_utf8_bytes,
+        )
+
+    @classmethod
+    def defaults(cls) -> _TextRecognitionPolicy:
+        return cls(
+            recognition_threshold=0.8,
+            min_characters=4,
+            mixed_min_lines=2,
+            mixed_min_characters=8,
+            max_lines=2_000,
+            max_characters=200_000,
+            max_utf8_bytes=800_000,
+        )
 
 
 class PPStructureV3Backend:
@@ -43,6 +102,7 @@ class PPStructureV3Backend:
                 SecondaryOcrErrorCode.INITIALIZATION_UNAVAILABLE
             )
         self._threshold = settings.classification_threshold
+        self._text_policy = _TextRecognitionPolicy.from_settings(settings)
         self._model_versions = {
             "pipeline": "PP-StructureV3",
             "formula": settings.formula_model_name,
@@ -108,6 +168,7 @@ class PPStructureV3Backend:
         return normalize_pp_structure_v3_result(
             raw_result,
             threshold=self._threshold,
+            text_policy=self._text_policy,
             model_versions=self._model_versions,
         )
 
@@ -163,6 +224,7 @@ def normalize_pp_structure_v3_result(
     raw_result: object,
     *,
     threshold: float,
+    text_policy: _TextRecognitionPolicy | None = None,
     model_versions: Mapping[str, str],
 ) -> SecondaryOcrResult:
     """Normalize only the documented JSON-safe PP-Structure response fields."""
@@ -183,6 +245,7 @@ def normalize_pp_structure_v3_result(
         if not isinstance(response, Mapping):
             raise ValueError
 
+        policy = text_policy or _TextRecognitionPolicy.defaults()
         preprocessor = response.get("doc_preprocessor_res")
         layout = response.get("layout_det_res")
         tables = response.get("table_res_list", [])
@@ -215,7 +278,9 @@ def normalize_pp_structure_v3_result(
         table_contents = _recognized_values(tables, "pred_html")
         formula_contents = _recognized_values(formulas, "rec_formula")
         confidence = max((score for _, score in evidence), default=0.0)
-        target_boxes = [item for item in evidence if item[0] in {"table", "formula"}]
+        target_boxes = [
+            item for item in evidence if item[0] in _STRUCTURED_LAYOUT_LABELS
+        ]
         target_result_count = len(table_contents) + len(formula_contents)
         raw_target_result_count = len(tables) + len(formulas)
 
@@ -255,14 +320,97 @@ def normalize_pp_structure_v3_result(
                     state=SecondaryResultState.VALID,
                 )
 
-        if target_boxes or raw_target_result_count:
+        plain_text, line_count, char_count, text_confidence = (
+            _recognized_plain_text(response.get("overall_ocr_res"), policy)
+        )
+        high_confidence = [
+            (label, score)
+            for label, score in evidence
+            if score >= threshold
+        ]
+        text_labels = {
+            label
+            for label, _ in high_confidence
+            if label in _TEXT_LAYOUT_LABELS
+        }
+        visual_labels = {
+            label
+            for label, _ in high_confidence
+            if label in _VISUAL_LAYOUT_LABELS
+        }
+        structured_evidence = [
+            (label, score)
+            for label, score in evidence
+            if label in _STRUCTURED_LAYOUT_LABELS
+        ]
+        structured_confidence = max(
+            (score for _, score in structured_evidence),
+            default=0.0,
+        )
+        other_labels = {
+            label
+            for label, _ in high_confidence
+            if label
+            not in (
+                _TEXT_LAYOUT_LABELS
+                | _VISUAL_LAYOUT_LABELS
+                | _STRUCTURED_LAYOUT_LABELS
+            )
+        }
+
+        if structured_evidence or raw_target_result_count:
+            if (
+                structured_evidence
+                and plain_text is not None
+                and char_count >= policy.min_characters
+            ):
+                return _plain_text_result(
+                    kind=SecondaryResultKind.IMAGE_WITH_TEXT,
+                    origin=SecondaryTextOrigin.UNSTRUCTURED_FALLBACK,
+                    angle=angle,
+                    content=plain_text,
+                    confidence=min(
+                        structured_confidence,
+                        text_confidence,
+                    ),
+                    model_versions=model_versions,
+                )
+            return _safe_result(
+                state=SecondaryResultState.UNCERTAIN,
+                angle=angle,
+                confidence=max(confidence, structured_confidence),
+                model_versions=model_versions,
+            )
+
+        if (
+            text_labels
+            and not visual_labels
+            and plain_text is not None
+            and char_count >= policy.min_characters
+        ):
+            kind = SecondaryResultKind.TEXT
+            origin = SecondaryTextOrigin.TEXT_DOMINANT
+        elif visual_labels and plain_text is not None and (
+            line_count >= policy.mixed_min_lines
+            or char_count >= policy.mixed_min_characters
+        ):
+            kind = SecondaryResultKind.IMAGE_WITH_TEXT
+            origin = SecondaryTextOrigin.MIXED_VISUAL
+        elif visual_labels:
+            kind = SecondaryResultKind.OTHER
+            origin = None
+        elif plain_text is None and other_labels:
+            kind = SecondaryResultKind.OTHER
+            origin = None
+        else:
             return _safe_result(
                 state=SecondaryResultState.UNCERTAIN,
                 angle=angle,
                 confidence=confidence,
                 model_versions=model_versions,
             )
-        if confidence >= threshold:
+
+        if kind is SecondaryResultKind.OTHER:
             return SecondaryOcrResult(
                 kind=SecondaryResultKind.OTHER,
                 angle=angle,
@@ -272,11 +420,22 @@ def normalize_pp_structure_v3_result(
                 engine=SecondaryOCREngine.PP_STRUCTURE_V3,
                 model_versions=model_versions,
                 state=SecondaryResultState.VALID,
+                text_origin=None,
             )
-        return _safe_result(
-            state=SecondaryResultState.UNCERTAIN,
+        assert plain_text is not None
+        assert origin is not None
+        return _plain_text_result(
+            kind=kind,
+            origin=origin,
             angle=angle,
-            confidence=confidence,
+            content=plain_text,
+            confidence=min(
+                max(
+                    (score for _, score in high_confidence),
+                    default=0.0,
+                ),
+                text_confidence,
+            ),
             model_versions=model_versions,
         )
     except BaseException:
@@ -299,6 +458,96 @@ def _recognized_values(results: list[object], field: str) -> list[str]:
         if value.strip():
             values.append(value)
     return values
+
+
+def _recognized_plain_text(
+    overall_ocr: object,
+    policy: _TextRecognitionPolicy,
+) -> tuple[str | None, int, int, float]:
+    if not isinstance(overall_ocr, Mapping):
+        raise ValueError
+    texts = overall_ocr.get("rec_texts")
+    scores = overall_ocr.get("rec_scores")
+    boxes = overall_ocr.get("rec_boxes")
+    if (
+        not isinstance(texts, list)
+        or not isinstance(scores, list)
+        or not isinstance(boxes, list)
+        or len(texts) != len(scores)
+        or len(texts) != len(boxes)
+        or len(texts) > policy.max_lines
+    ):
+        raise ValueError
+
+    retained_lines: list[str] = []
+    retained_scores: list[float] = []
+    for raw_text, raw_score, raw_box in zip(
+        texts,
+        scores,
+        boxes,
+        strict=True,
+    ):
+        if not isinstance(raw_text, str) or not _finite_score(raw_score):
+            raise ValueError
+        raw_text.encode("utf-8", errors="strict")
+        if (
+            not isinstance(raw_box, list)
+            or len(raw_box) != 4
+            or any(not _finite_coordinate(value) for value in raw_box)
+        ):
+            raise ValueError
+        x0, y0, x1, y1 = (float(value) for value in raw_box)
+        if x0 > x1 or y0 > y1:
+            raise ValueError
+
+        line = raw_text.strip()
+        score = float(raw_score)
+        if not line or score < policy.recognition_threshold:
+            continue
+        retained_lines.append(line)
+        retained_scores.append(score)
+
+    if not retained_lines:
+        return None, 0, 0, 0.0
+    text = "\n".join(retained_lines)
+    encoded = text.encode("utf-8", errors="strict")
+    if (
+        len(retained_lines) > policy.max_lines
+        or len(text) > policy.max_characters
+        or len(encoded) > policy.max_utf8_bytes
+    ):
+        raise ValueError
+    character_count = sum(
+        1 for character in text if not character.isspace()
+    )
+    return (
+        text,
+        len(retained_lines),
+        character_count,
+        min(retained_scores),
+    )
+
+
+def _plain_text_result(
+    *,
+    kind: SecondaryResultKind,
+    origin: SecondaryTextOrigin,
+    angle: OrthogonalAngle,
+    content: str,
+    confidence: float,
+    model_versions: Mapping[str, str],
+) -> SecondaryOcrResult:
+    return SecondaryOcrResult(
+        kind=kind,
+        angle=angle,
+        content=content,
+        content_format=SecondaryContentFormat.PLAIN_TEXT,
+        confidence=confidence,
+        engine=SecondaryOCREngine.PP_STRUCTURE_V3,
+        model_versions=model_versions,
+        state=SecondaryResultState.VALID,
+        text_origin=origin,
+    )
 
 
 def normalize_doc_orientation_result(
@@ -352,6 +601,15 @@ def _finite_score(value: object) -> bool:
     )
 
 
+def _finite_coordinate(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
 def _safe_result(
     *,
     state: SecondaryResultState,
@@ -368,6 +626,7 @@ def _safe_result(
         engine=SecondaryOCREngine.PP_STRUCTURE_V3,
         model_versions=model_versions,
         state=state,
+        text_origin=None,
     )
 
 
