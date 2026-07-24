@@ -1,0 +1,1 @@
+使用 ocr-mcpserver 解析 C:\test-data\document.pdf。不要让我手工上传；持续汇报进度，完成后下载并解压结果。
