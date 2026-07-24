@@ -18,7 +18,7 @@ def test_settings_defaults_match_domain_constraints() -> None:
     assert settings.server.port == 8000
     assert settings.data_root == Path("data")
     assert settings.limits.max_files == 20
-    assert settings.limits.max_file_size_bytes == 30 * 1024 * 1024
+    assert settings.limits.max_file_size_bytes == 60 * 1024 * 1024
     assert settings.limits.max_pages == 500
     assert settings.limits.max_batch_size_bytes == 1024**3
     assert settings.retention.input_hours == 24

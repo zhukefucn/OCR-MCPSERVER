@@ -52,7 +52,8 @@ def test_proxy_has_fixed_loopback_upstream_and_bounded_content_contract() -> Non
     proxy = _load_proxy()
 
     assert proxy.UPSTREAM_BASE_URL == "http://127.0.0.1:8001"
-    assert proxy.MAX_REQUEST_BYTES == 32 * 1024**2
+    assert proxy.MAX_FILE_SIZE_BYTES == 60 * 1024**2
+    assert proxy.MAX_REQUEST_BYTES == 62 * 1024**2
     assert 0 < proxy.MAX_RESPONSE_BYTES <= 1024**3
     assert 0 < proxy.UPSTREAM_TIMEOUT_SECONDS <= 900
     assert proxy.allowed_response_headers(
@@ -259,7 +260,13 @@ async def test_upstream_wait_fails_immediately_when_child_exits() -> None:
 
 @pytest.mark.parametrize(
     "outcome",
-    ("success", "upstream_error", "policy_rejection", "size_rejection"),
+    (
+        "success",
+        "boundary_success",
+        "upstream_error",
+        "policy_rejection",
+        "size_rejection",
+    ),
 )
 @pytest.mark.asyncio
 async def test_submit_task_closes_form_upload_on_every_exit(
@@ -285,7 +292,10 @@ async def test_submit_task_closes_form_upload_on_every_exit(
         def tell(self) -> int:
             return self.logical_position
 
-    logical_size = 30 * 1024**2 + 1 if outcome == "size_rejection" else 9
+    logical_size = {
+        "boundary_success": 60 * 1024**2,
+        "size_rejection": 60 * 1024**2 + 1,
+    }.get(outcome, 9)
     upload = UploadFile(LogicalFile(logical_size), filename="statement.pdf")
     backend = "pipeline" if outcome == "policy_rejection" else "vlm-http-client"
     form = FormData(
@@ -309,7 +319,7 @@ async def test_submit_task_closes_form_upload_on_every_exit(
         return Response(status_code=202)
 
     monkeypatch.setattr(proxy, "_request_upstream", upstream)
-    if outcome == "success":
+    if outcome in {"success", "boundary_success"}:
         response = await proxy.submit_task(FakeRequest())
         assert response.status_code == 202
     else:

@@ -25,7 +25,7 @@ health:
 
 limits:
   max_files: 20
-  max_file_size_bytes: 31457280
+  max_file_size_bytes: 62914560
   max_pages: 500
   max_batch_size_bytes: 1073741824
 

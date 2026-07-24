@@ -20,7 +20,8 @@ FIXED_BACKEND = os.getenv("MINERU_FIXED_BACKEND", "vlm-http-client")
 FIXED_VLM_URL = os.getenv("MINERU_FIXED_VLM_URL", "http://mineru-vlm:30000")
 UPSTREAM_BASE_URL = os.getenv("MINERU_UPSTREAM_URL", "http://127.0.0.1:8001")
 PUBLIC_HOST = "mineru-api:8000"
-MAX_REQUEST_BYTES = 32 * 1024**2
+MAX_FILE_SIZE_BYTES = 60 * 1024**2
+MAX_REQUEST_BYTES = 62 * 1024**2
 MAX_RESPONSE_BYTES = 1024**3
 UPSTREAM_TIMEOUT_SECONDS = 900
 HOP_BY_HOP_HEADERS = {
@@ -249,7 +250,7 @@ async def submit_task(request: Request) -> Response:
                 value.file.seek(0, 2)
                 size = value.file.tell()
                 value.file.seek(0)
-                if size > 30 * 1024 * 1024:
+                if size > MAX_FILE_SIZE_BYTES:
                     raise HTTPException(status_code=413, detail="file_too_large")
                 total_file_bytes += size
                 try:

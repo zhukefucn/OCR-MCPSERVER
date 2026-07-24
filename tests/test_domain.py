@@ -40,7 +40,7 @@ from ocr_mcp_server.domain.models import (
 def test_default_constraints_match_the_service_contract() -> None:
     assert SUPPORTED_EXTENSIONS == frozenset({".pdf", ".png", ".jpg", ".jpeg"})
     assert DEFAULT_MAX_FILES == 20
-    assert DEFAULT_MAX_FILE_SIZE_BYTES == 30 * 1024 * 1024
+    assert DEFAULT_MAX_FILE_SIZE_BYTES == 60 * 1024 * 1024
     assert DEFAULT_MAX_PAGES == 500
     assert DEFAULT_MAX_BATCH_SIZE_BYTES == 1024**3
     assert DEFAULT_INPUT_RETENTION_HOURS == 24
