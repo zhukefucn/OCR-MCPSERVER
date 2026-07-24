@@ -120,8 +120,16 @@
 
 - `PLAIN_TEXT`
 
-两类有效结果必须携带非空纯文本和 `PLAIN_TEXT` 格式。`OTHER` 继续禁止携带可替换
-内容。领域对象必须拒绝不匹配的 kind、format、state 组合。
+`SecondaryTextOrigin` 新增：
+
+- `TEXT_DOMINANT`
+- `MIXED_VISUAL`
+- `UNSTRUCTURED_FALLBACK`
+
+两类有效结果必须携带非空纯文本、`PLAIN_TEXT` 格式和匹配的文字来源：
+`TEXT` 只能使用 `TEXT_DOMINANT`；`IMAGE_WITH_TEXT` 只能使用 `MIXED_VISUAL` 或
+`UNSTRUCTURED_FALLBACK`。表格、公式、`OTHER` 和非有效结果不得携带文字来源。
+领域对象必须拒绝不匹配的 kind、format、state、origin 组合。
 
 ### 合并后的 V2 节点
 
