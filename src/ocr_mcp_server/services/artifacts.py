@@ -216,6 +216,39 @@ def _typed_inline_markdown(
     return None, False
 
 
+def _typed_v2_list_markdown(
+    content: object,
+    limits: StructuredContentLimits,
+) -> tuple[str | None, bool]:
+    if not isinstance(content, Mapping) or "list_items" not in content:
+        return None, False
+    items = content.get("list_items")
+    if (
+        content.get("list_type") not in {"text_list", "reference_list"}
+        or not isinstance(items, list)
+        or not items
+    ):
+        _fail(ArtifactErrorCode.INVALID_INPUT)
+    lines: list[str] = []
+    warned = False
+    for item in items:
+        if not isinstance(item, Mapping) or item.get("item_type") != "text":
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        spans = item.get("item_content")
+        if not isinstance(spans, list) or not spans:
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        value, item_warning = _typed_inline_markdown(
+            item,
+            ("item_content",),
+            limits,
+        )
+        if value is None:
+            _fail(ArtifactErrorCode.INVALID_INPUT)
+        lines.append("- " + value)
+        warned = warned or item_warning
+    return "\n".join(lines), warned
+
+
 def _structured_limits(max_bytes: int) -> StructuredContentLimits:
     utf8 = min(40_000_000, max_bytes)
     characters = min(10_000_000, utf8)
@@ -286,10 +319,17 @@ def render_markdown(
                     warned = warned or inline_warning
                     block = value
                 elif node_type in _LIST_TYPES:
-                    value = _typed_string(content, ("text", "text_content"))
+                    value, inline_warning = _typed_v2_list_markdown(
+                        content,
+                        limits,
+                    )
                     if value is None:
-                        _fail(ArtifactErrorCode.INVALID_INPUT)
-                    block = "- " + _markdown_escape(value)
+                        legacy = _typed_string(content, ("text", "text_content"))
+                        if legacy is None:
+                            _fail(ArtifactErrorCode.INVALID_INPUT)
+                        value = "- " + _markdown_escape(legacy)
+                    warned = warned or inline_warning
+                    block = value
                 elif node_type in _CODE_TYPES:
                     value = _typed_string(content, ("code", "text", "text_content"))
                     if value is None:

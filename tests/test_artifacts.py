@@ -482,6 +482,97 @@ def test_markdown_renderer_accepts_mineru_v2_paragraph_spans() -> None:
     assert rendered.warning_codes == ()
 
 
+def test_markdown_renderer_accepts_real_mineru_v2_list_shape() -> None:
+    rendered = render_markdown(
+        [[
+            {
+                "type": "list",
+                "content": {
+                    "list_type": "text_list",
+                    "list_items": [
+                        {
+                            "item_type": "text",
+                            "item_content": [
+                                {"type": "text", "content": "A&B"},
+                                {"type": "equation_inline", "content": "x_i"},
+                            ],
+                        },
+                        {
+                            "item_type": "text",
+                            "item_content": [
+                                {"type": "text", "content": "second"}
+                            ],
+                        },
+                    ],
+                },
+            },
+            {
+                "type": "list",
+                "content": {
+                    "list_type": "reference_list",
+                    "list_items": [
+                        {
+                            "item_type": "text",
+                            "item_content": [
+                                {"type": "text", "content": "reference"}
+                            ],
+                        }
+                    ],
+                },
+            },
+        ]],
+        image_names={},
+        max_bytes=1_000,
+    )
+
+    assert rendered.content == b"- A&amp;B$x_i$\n- second\n\n- reference\n"
+    assert rendered.warning_codes == ()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        {
+            "list_type": "unsupported",
+            "list_items": [
+                {
+                    "item_type": "text",
+                    "item_content": [{"type": "text", "content": "x"}],
+                }
+            ],
+        },
+        {"list_type": "text_list", "list_items": []},
+        {
+            "list_type": "text_list",
+            "list_items": [
+                {
+                    "item_type": "table",
+                    "item_content": [{"type": "text", "content": "x"}],
+                }
+            ],
+        },
+        {
+            "list_type": "text_list",
+            "list_items": [{"item_type": "text", "item_content": []}],
+        },
+        {
+            "list_type": "text_list",
+            "list_items": [{"item_type": "text", "item_content": [1]}],
+        },
+    ],
+)
+def test_markdown_renderer_rejects_malformed_mineru_v2_list(content) -> None:
+    with pytest.raises(ArtifactFailure) as caught:
+        render_markdown(
+            [[{"type": "list", "content": content}]],
+            image_names={},
+            max_bytes=1_000,
+        )
+
+    assert caught.value.code == ArtifactErrorCode.INVALID_INPUT.value
+    assert caught.value.__cause__ is None
+
+
 @pytest.mark.parametrize(
     "manifest",
     [
